@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 13 — Spring Testing — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 13</div>
+  <h1>Chapter 13 — Spring Testing</h1>
+  <p class="lede">The whole chapter rehearses one thing: how a test gets its <em>context</em> and its
+  <em>lifecycle</em>. Twenty recipe modules exercise a single bank domain shipped in
+  <code>ch13/recipe_13_bank</code>, starting from an assertion on a plain object and ending with a real
+  PostgreSQL container. Almost every recipe ships twice — once on JUnit&nbsp;5 with
+  <code>SpringExtension</code>, once on TestNG with a Spring base class — so you can see exactly which
+  behaviour belongs to the runner and which belongs to the TestContext framework.</p>
+  <div class="chip-row">
+    <span class="chip">21 modules: 20 recipes + recipe_13_bank</span>
+    <span class="chip">Spring Framework 6.0.3 — no Spring Boot</span>
+    <span class="chip">JUnit Jupiter 5.9.1 and TestNG 7.6.1</span>
+    <span class="chip">Mockito 4.10.0</span>
+    <span class="chip">Testcontainers 1.17.6 + postgres:14.5 (Docker)</span>
+    <span class="chip">H2 2.1.214 in-memory</span>
+    <span class="chip">@ContextConfiguration, @Sql, @WebAppConfiguration, MockMvc</span>
+    <span class="chip">./gradlew :ch13:recipe_13_5_i:test</span>
+    <span class="chip">Java 19 toolchain, --enable-preview</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch12/index.html">&larr; Chapter 12 — Spring Integration</a>
+    <a href="../ch14/index.html">Chapter 14 — Caching &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc">
+    <h2>On this page</h2>
+    <ol>
+      <li><a href="#overview">Overview and module map</a></li>
+      <li><a href="#plain">Testing without a container</a></li>
+      <li><a href="#bootstrap">Getting a context into the test</a></li>
+      <li><a href="#cache">What the TestContext framework caches</a></li>
+      <li><a href="#db">Schema, data, rollback</a></li>
+      <li><a href="#web">MockMvc against a real web context</a></li>
+      <li><a href="#client">Stubbing an outbound HTTP client</a></li>
+      <li><a href="#containers">Testcontainers and dynamic properties</a></li>
+      <li><a href="#running">Building and running these tests</a></li>
+    </ol>
+  </aside>
+  <article>
+
+    <section id="overview">
+      <h2>Overview and module map</h2>
+      <p>The domain under test is deliberately tiny so that the test plumbing is the interesting part.
+      <code>ch13/recipe_13_bank/src/main/java/com/apress/spring6recipes/bank/</code> holds
+      <code>Account</code>, the <code>AccountDao</code> interface with a <code>InMemoryAccountDao</code> and a
+      <code>JdbcAccountDao</code>, <code>SimpleAccountService</code> annotated
+      <code>@Service&nbsp;@Transactional</code>, a web layer with <code>DepositController</code> plus
+      <code>BankWebConfiguration</code>, and an outbound client
+      <code>OpenIBANValidationClient extends RestGatewaySupport</code>. Configuration is
+      <code>BankConfiguration</code> with two <code>@Profile</code>d nested classes: <code>jdbc</code> selects
+      <code>JdbcBankConfiguration</code> (DataSource, <code>DataSourceTransactionManager</code>,
+      <code>JdbcTemplate</code>, <code>JdbcAccountDao</code>) and anything else selects
+      <code>InMemoryBankConfiguration</code>.</p>
+      <p>Recipes 13.1 and 13.2 need none of that plumbing. From 13.3 onward the chapter is a steady climb of
+      context complexity: bean lookup, then injection, then a database, then a servlet context, then a real
+      database engine. The variant suffix is a convention, not a sequence: <code>_i</code> is the JUnit&nbsp;5
+      form, <code>_ii</code> the TestNG port of the same recipe (13.1 uses <code>_i</code>/<code>_ii</code> for
+      JUnit and <code>_iii</code>/<code>_iv</code> for TestNG because each runner gets two variants).</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The recipe ladder, and which runner each variant uses</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    r131["13.1 assert on a plain SimpleInterestCalculator"]
+    r132["13.2 a collaborator is needed"]
+    r133["13.3 a Spring container is needed"]
+    r134["13.4 inject the bean, stop calling getBean"]
+    r135["13.5 SQL scripts plus rollback on H2"]
+    r136["13.6 MockMvc over a WebApplicationContext"]
+    r137["13.7 stub an outbound RestTemplate call"]
+    r138["13.8 replace H2 with a real PostgreSQL container"]
+
+    r131 --&gt; r132 --&gt; r133 --&gt; r134 --&gt; r135 --&gt; r136
+    r136 --&gt; r137
+    r135 --&gt; r138
+
+    r132 --&gt; v1["13.2_i DAO only"]
+    r132 --&gt; v2["13.2_ii hand written AccountDaoStub"]
+    r132 --&gt; v3["13.2_iii Mockito.mock in BeforeEach"]
+    r132 --&gt; v4["13.2_iv MockitoExtension with Mock and InjectMocks"]
+    r132 --&gt; v5["13.2_v all four approaches in one module"]
+
+    r131 -."13.1_i and 13.1_ii JUnit 5, 13.1_iii and 13.1_iv TestNG".-&gt; lane["every recipe from 13.3 on has a TestNG port"]
+    r133 -."13.3_ii, 13.4_ii, 13.5_ii, 13.6_ii, 13.8_ii".-&gt; lane
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Each arrow adds exactly one dependency that the
+      TestContext framework must now manage. Up to <code>13.2</code> the test constructs its own objects
+      (<code>new SimpleAccountService(accountDao)</code>), so JUnit 5's <code>@BeforeEach</code> or TestNG's
+      <code>@BeforeMethod</code> is the whole story. At <code>13.3</code> the test asks
+      <code>applicationContext.getBean(AccountService.class)</code>, so a context has to be booted.
+      <code>13.4</code> replaces that lookup with an <code>@Autowired</code> field, which means injection is now
+      the framework's job. <code>13.5</code> adds <code>@Sql</code> and <code>@Transactional</code>, so listeners
+      must start and roll back a transaction around each method. <code>13.6</code> adds
+      <code>@WebAppConfiguration</code>, which changes the <em>kind</em> of context that gets created.
+      <code>13.7</code> is the odd branch: it needs no context at all, because
+      <code>MockRestServiceServer</code> wraps the client object itself. <code>13.8</code> keeps the 13.5
+      lifecycle and only swaps the DataSource provider for a container.</p>
+
+      <h3>Module map</h3>
+      <table>
+        <thead>
+        <tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr>
+        </thead>
+        <tbody>
+        <tr>
+          <td class="num">13.1</td>
+          <td><code>recipe_13_1_i</code>, <code>_ii</code> (JUnit&nbsp;5), <code>_iii</code>, <code>_iv</code> (TestNG)</td>
+          <td>Assertions and parameterised cases against a POJO. <code>_ii</code> uses
+          <code>@ParameterizedTest</code> with <code>@MethodSource</code> returning a stream of
+          <code>Arguments</code>; <code>_iv</code> does the same with TestNG <code>@DataProvider</code> and
+          <code>expectedExceptions</code>.</td>
+          <td><code>SimpleInterestCalculatorTests</code>, <code>InterestCalculator</code>,
+          <code>SimpleInterestCalculator</code></td>
+        </tr>
+        <tr>
+          <td class="num">13.2</td>
+          <td><code>recipe_13_2_i</code> … <code>_v</code> (all JUnit&nbsp;5)</td>
+          <td>Four answers to "the class under test has a collaborator": test the DAO directly, hand-write a
+          stub, call <code>Mockito.mock</code> yourself, or let <code>MockitoExtension</code> build
+          <code>@Mock</code>/<code>@InjectMocks</code>. <code>_v</code> keeps all of them side by side plus a
+          full-stack test against <code>InMemoryAccountDao</code>.</td>
+          <td><code>InMemoryAccountDaoTests</code>, <code>SimpleAccountServiceStubTests</code> with inner
+          <code>AccountDaoStub</code>, <code>SimpleAccountServiceMockTests</code>,
+          <code>SimpleAccountServiceTests</code></td>
+        </tr>
+        <tr>
+          <td class="num">13.3</td>
+          <td><code>recipe_13_3_i</code> (JUnit&nbsp;5), <code>recipe_13_3_ii</code> (TestNG)</td>
+          <td>First contact with the TestContext framework: <code>@ExtendWith(SpringExtension.class)</code> plus
+          <code>@ContextConfiguration</code>, or the TestNG base class
+          <code>AbstractTestNGSpringContextTests</code> that already holds the <code>applicationContext</code>
+          field. Also a controller test with <code>@Mock</code>/<code>@InjectMocks</code>.</td>
+          <td><code>AccountServiceContextTests</code>, test-local <code>BankConfiguration</code>,
+          <code>DepositControllerTests</code>, <code>SimpleAccountServiceMockTests</code></td>
+        </tr>
+        <tr>
+          <td class="num">13.4</td>
+          <td><code>recipe_13_4_i</code>, <code>recipe_13_4_ii</code></td>
+          <td>Field injection instead of <code>getBean</code>, and a minimal test-only configuration instead of
+          the application's. <code>_ii</code>'s config adds <code>@ComponentScan</code>, <code>_i</code>'s does
+          not.</td>
+          <td><code>AccountServiceContextTests</code>, test-local <code>BankConfiguration</code> with
+          <code>accountDao()</code></td>
+        </tr>
+        <tr>
+          <td class="num">13.5</td>
+          <td><code>recipe_13_5_i</code>, <code>recipe_13_5_ii</code></td>
+          <td>JDBC against <code>jdbc:h2:mem:bank-testing</code> with <code>@Sql</code> to create the
+          <code>ACCOUNT</code> table and a test-managed transaction to undo everything. JUnit puts
+          <code>@Transactional</code> on the class; TestNG inherits it from
+          <code>AbstractTransactionalTestNGSpringContextTests</code>. The manual <code>@AfterEach</code> cleanup
+          of 13.3/13.4 disappears.</td>
+          <td><code>AccountServiceContextTests</code>, test-local <code>BankConfiguration</code>
+          (<code>SimpleDriverDataSource</code>, <code>@EnableTransactionManagement</code>)</td>
+        </tr>
+        <tr>
+          <td class="num">13.6</td>
+          <td><code>recipe_13_6_i</code>, <code>recipe_13_6_ii</code></td>
+          <td><code>@WebAppConfiguration</code> plus <code>MockMvcBuilders.webAppContextSetup</code>: a real
+          <code>DispatcherServlet</code>, real handler mapping, real view resolution, no server.</td>
+          <td><code>DepositControllerContextTests</code>, <code>BankWebConfiguration</code>, shared
+          <code>BankConfiguration</code>, <code>DepositController</code></td>
+        </tr>
+        <tr>
+          <td class="num">13.7</td>
+          <td><code>recipe_13_7_i</code></td>
+          <td>Testing an HTTP client with <code>MockRestServiceServer</code> and canned JSON fixtures; no
+          context, no network.</td>
+          <td><code>OpenIBANValidationClientTest</code>, <code>OpenIBANValidationClient</code>,
+          <code>IBANValidationResult</code>, <code>NL87TRIO0396451440-result.json</code>,
+          <code>NL28XXXX389242218-result.json</code></td>
+        </tr>
+        <tr>
+          <td class="num">13.8</td>
+          <td><code>recipe_13_8_i</code> (JUnit&nbsp;5), <code>recipe_13_8_ii</code> (TestNG)</td>
+          <td>The application's own <code>@Profile("jdbc")</code> configuration, driven against a
+          <code>PostgreSQLContainer</code> whose coordinates are injected with
+          <code>@DynamicPropertySource</code>. <code>_i</code> lets <code>@Testcontainers</code> plus
+          <code>@Container</code> manage the lifecycle; <code>_ii</code> has no JUnit container extension, so it
+          starts and stops the container in <code>@BeforeSuite</code>/<code>@AfterSuite</code>.</td>
+          <td><code>AccountServiceContextTests</code>, <code>PostgreSQLContainer</code>, shared
+          <code>BankConfiguration</code>, <code>application.properties</code></td>
+        </tr>
+        <tr>
+          <td class="num">support</td>
+          <td><code>recipe_13_bank</code></td>
+          <td>The code under test, plus <code>src/main/resources/bank.sql</code> and
+          <code>src/main/resources/application.properties</code>, both of which land on every recipe module's
+          test classpath.</td>
+          <td><code>Account</code>, <code>AccountDao</code>, <code>InMemoryAccountDao</code>,
+          <code>JdbcAccountDao</code>, <code>SimpleAccountService</code>, <code>DepositController</code>,
+          <code>OpenIBANValidationClient</code>, <code>BankConfiguration</code>,
+          <code>BankWebConfiguration</code></td>
+        </tr>
+        </tbody>
+      </table>
+
+      <div class="callout info">
+        <h4>There is no Spring Boot in this chapter</h4>
+        <p><code>ch13/build.gradle</code> declares <code>spring-webmvc</code>, <code>spring-jdbc</code>,
+        <code>spring-test</code>, <code>junit-jupiter</code>, <code>mockito-core</code>, <code>testng</code> and
+        <code>org.testcontainers:*</code> — and the root build's platform pins
+        <code>spring-framework-bom:6.0.3</code>. No module references <code>spring-boot-starter-test</code>, so
+        none of the Boot vocabulary exists here: there is no <code>@SpringBootTest</code>, no
+        <code>@WebMvcTest</code>, no <code>@DataJpaTest</code>, and <em>neither</em> <code>@MockBean</code>
+        <em>nor</em> <code>@MockitoBean</code> (the latter is a Spring Framework 6.2 addition anyway). The
+        equivalent of a "slice" in this chapter is a small <code>@Configuration</code> class written in
+        <code>src/test/java</code> — see <a href="#bootstrap">13.4 and 13.5</a>. Mocking is plain Mockito:
+        <code>@Mock</code> and <code>@InjectMocks</code> with
+        <code>@ExtendWith(MockitoExtension.class)</code> in the JUnit modules
+        (<code>recipe_13_2_iv</code>, <code>recipe_13_2_v</code>, <code>recipe_13_3_i</code>,
+        <code>recipe_13_4_i</code>, <code>recipe_13_5_i</code>), and <code>Mockito.mock(...)</code> inside
+        <code>@BeforeMethod</code> in the TestNG modules (<code>recipe_13_3_ii</code>,
+        <code>recipe_13_4_ii</code>, <code>recipe_13_5_ii</code>), because
+        <code>MockitoExtension</code> is a JUnit&nbsp;5 extension with no TestNG counterpart.</p>
+      </div>
+    </section>
+
+    <section id="plain">
+      <h2>Testing without a container</h2>
+      <p>Recipes 13.1 and 13.2 never touch Spring. <code>SimpleInterestCalculatorTests</code> news up
+      <code>SimpleInterestCalculator</code> in <code>@BeforeEach</code>/<code>@BeforeMethod</code> and asserts on
+      <code>calculate</code>, with <code>assertThrows(IllegalArgumentException.class, …)</code> in JUnit and
+      <code>@Test(expectedExceptions = …)</code> in TestNG. The interesting material starts in 13.2, where
+      <code>SimpleAccountService</code> needs an <code>AccountDao</code> and the chapter shows four ways to give
+      it one.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The bank object graph and the four doubles that impersonate <code>AccountDao</code></span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Account {
+        String accountNo
+        double balance
+        getBalance() double
+    }
+    class AccountDao {
+        createAccount(Account account)
+        updateAccount(Account account)
+        removeAccount(Account account)
+        findAccount(String accountNo) Account
+    }
+    class InMemoryAccountDao["InMemoryAccountDao, package private"] {
+        accountExists(String accountNo) boolean
+    }
+    class JdbcAccountDao["JdbcAccountDao, package private"]
+    class AccountDaoStub["AccountDaoStub, private static inner class"]
+    class MockAccountDao["Mockito mock of AccountDao"]
+    class AccountService
+    class SimpleAccountService {
+        deposit(String accountNo, double amount)
+        withdraw(String accountNo, double amount)
+        getBalance(String accountNo) double
+    }
+    class DepositController {
+        deposit(String accountNo, double amount, Model model) String
+    }
+    InMemoryAccountDao ..|&gt; AccountDao : ConcurrentHashMap in recipe_13_bank
+    JdbcAccountDao ..|&gt; AccountDao : uses JdbcTemplate
+    AccountDaoStub ..|&gt; AccountDao : find and update only, create and remove empty
+    MockAccountDao ..|&gt; AccountDao : when then return, verify times
+    SimpleAccountService ..|&gt; AccountService : Service and Transactional
+    SimpleAccountService o-- AccountDao : constructor injection
+    DepositController o-- AccountService : constructor injection
+    InMemoryAccountDao o-- Account : keyed by accountNo
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the graph.</strong> Everything on the left is production code in
+      <code>ch13/recipe_13_bank/src/main/java</code>; the two right-hand implementations
+      (<code>AccountDaoStub</code>, <code>MockAccountDao</code>) exist only inside test sources. Note the
+      stereotype trap: <code>InMemoryAccountDao</code> and <code>JdbcAccountDao</code> carry <em>no</em>
+      <code>@Repository</code>, so they can only enter a context through a <code>@Bean</code> method — that single
+      fact drives every configuration class in recipes 13.3 to 13.5. Both classes are package-private, which is
+      why <code>InMemoryAccountDaoTests</code> must sit in
+      <code>src/test/java/com/apress/spring6recipes/bank/</code>: same package, different Gradle module, and
+      package-private access still works because the runtime package is what matters. The stub in
+      <code>recipe_13_2_ii</code> implements only <code>findAccount</code> and <code>updateAccount</code> and
+      leaves <code>createAccount</code>/<code>removeAccount</code> as empty bodies — enough to drive
+      <code>deposit</code>, and the assertion then reads the stub's own <code>balance</code> field back.
+      <code>recipe_13_2_iii</code> replaces that hand-written state with <code>mock(AccountDao.class)</code> plus
+      <code>when(...).thenReturn(account)</code> and asserts on <em>interactions</em> with
+      <code>verify(accountDao, times(1)).updateAccount(account)</code>. <code>recipe_13_2_iv</code> is the same
+      test with the boilerplate removed: <code>@Mock AccountDao</code> and
+      <code>@InjectMocks SimpleAccountService</code>, populated by <code>MockitoExtension</code> before
+      <code>@BeforeEach</code> runs.</p>
+
+      <div class="note">
+        <p><strong>Package-private is a test design decision here.</strong>
+        <code>recipe_13_2_iii/src/test/java/com/apress/spring6recipes/bank/SimpleAccountServiceMockTests.java</code>
+        and most other JUnit classes in 13.1/13.2 are <em>not</em> <code>public</code>: JUnit&nbsp;5 instantiates
+        package-private test classes happily (two leftovers, <code>SimpleAccountServiceStubTests</code> in
+        <code>recipe_13_2_ii</code> and <code>SimpleAccountServiceTests</code> in <code>recipe_13_2_v</code>, are
+        still declared <code>public</code>). Every TestNG port is <code>public class</code> with
+        <code>public</code> methods, because TestNG's runner only selects public <code>@Test</code> methods.</p>
+      </div>
+    </section>
+
+    <section id="bootstrap">
+      <h2>Getting a context into the test</h2>
+      <p>Recipes 13.3 and 13.4 are the same lesson told twice, once per runner. 13.3 fetches its collaborator by
+      hand — <code>accountService = applicationContext.getBean(AccountService.class)</code> in
+      <code>@BeforeEach</code> (<code>ch13/recipe_13_3_i/src/test/java/.../AccountServiceContextTests.java</code>)
+      — and in the TestNG port that <code>applicationContext</code> field is not even declared by the test: it is
+      inherited from <code>AbstractTestNGSpringContextTests</code>. 13.4 drops the lookup for an
+      <code>@Autowired AccountService</code> field, and replaces the application configuration with a test-local
+      one.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">TestNG inherits a base class; JUnit composes an extension</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class AbstractTestNGSpringContextTests {
+        applicationContext
+    }
+    class AbstractTransactionalTestNGSpringContextTests
+    AbstractTransactionalTestNGSpringContextTests --|&gt; AbstractTestNGSpringContextTests : one transaction per method, rolled back
+    class T13_3_ii["13_3_ii AccountServiceContextTests"]
+    class T13_4_ii["13_4_ii AccountServiceContextTests"]
+    class W13_6_ii["13_6_ii DepositControllerContextTests"]
+    T13_3_ii --|&gt; AbstractTestNGSpringContextTests : getBean on inherited field
+    T13_4_ii --|&gt; AbstractTestNGSpringContextTests : Autowired field
+    W13_6_ii --|&gt; AbstractTestNGSpringContextTests : plus WebAppConfiguration
+    class T13_5_ii["13_5_ii AccountServiceContextTests"]
+    class T13_8_ii["13_8_ii AccountServiceContextTests"]
+    T13_5_ii --|&gt; AbstractTransactionalTestNGSpringContextTests : plus Sql on H2
+    T13_8_ii --|&gt; AbstractTransactionalTestNGSpringContextTests : plus ActiveProfiles jdbc
+    class SpringExtension
+    class TestContextManager
+    SpringExtension o-- TestContextManager : one manager per test class
+    class J13_3_i["13_3_i AccountServiceContextTests"]
+    class J13_4_i["13_4_i AccountServiceContextTests"]
+    class J13_5_i["13_5_i AccountServiceContextTests"]
+    class J13_6_i["13_6_i DepositControllerContextTests"]
+    class J13_8_i["13_8_i AccountServiceContextTests"]
+    J13_3_i ..&gt; SpringExtension : ExtendWith only, no base class
+    J13_4_i ..&gt; SpringExtension
+    J13_5_i ..&gt; SpringExtension : Transactional and Sql as plain annotations
+    J13_6_i ..&gt; SpringExtension
+    J13_8_i ..&gt; SpringExtension
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the hierarchy.</strong> On the TestNG side the framework is reached by
+      <em>inheritance</em>: <code>AbstractTestNGSpringContextTests</code> exposes
+      <code>applicationContext</code> (which is why <code>recipe_13_3_ii</code> can call
+      <code>applicationContext.getBean(...)</code> without declaring the field) and hooks
+      <code>@BeforeClass</code>-style callbacks to bootstrap the context. Its subclass
+      <code>AbstractTransactionalTestNGSpringContextTests</code> adds the transaction, which is exactly what
+      <code>recipe_13_5_ii</code> and <code>recipe_13_8_ii</code> need — neither of them writes
+      <code>@Transactional</code> on the class, because the base class supplies that behaviour. On the JUnit side
+      there is no base class at all: <code>@ExtendWith(SpringExtension.class)</code> delegates every callback to
+      <code>TestContextManager</code>, and the same effects are requested with plain annotations —
+      <code>recipe_13_5_i</code> writes <code>@Transactional</code> itself, and
+      <code>recipe_13_5_i</code>/<code>recipe_13_8_i</code> keep their <code>@Sql</code>. Read the two halves of
+      the diagram as one table: the <code>_i</code> node and its <code>_ii</code> twin do the same job through
+      opposite mechanisms. That asymmetry is the reason TestNG ports exist in this chapter — you can see which
+      annotations are TestContext framework features and which are JUnit plumbing.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">TestContext lifecycle for <code>recipe_13_5_i</code>: context, injection, transaction, script, rollback</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant J as JUnit Jupiter engine
+    participant X as SpringExtension
+    participant M as TestContextManager
+    participant I as DependencyInjectionTestExecutionListener
+    participant G as DefaultCacheAwareContextLoaderDelegate
+    participant D as DelegatingSmartContextLoader
+    participant T as TransactionalTestExecutionListener
+    participant Q as SqlScriptsTestExecutionListener
+    participant C as AccountServiceContextTests 13_5_i
+    J-&gt;&gt;X: beforeAll
+    X-&gt;&gt;M: new TestContextManager(testClass), notify beforeTestClass
+    J-&gt;&gt;X: postProcessTestInstance
+    X-&gt;&gt;M: prepareTestInstance
+    M-&gt;&gt;I: prepareTestInstance(testInstance)
+    I-&gt;&gt;G: getApplicationContext, look up by MergedContextConfiguration
+    alt cache miss
+        G-&gt;&gt;D: load
+        D--&gt;&gt;G: refreshed context with SimpleAccountService and JdbcAccountDao
+    else cache hit
+        G--&gt;&gt;I: the same context instance
+    end
+    I--&gt;&gt;M: accountService field assigned by Autowired
+    J-&gt;&gt;X: beforeEach
+    X-&gt;&gt;M: beforeEach(testInstance)
+    J-&gt;&gt;X: beforeTestExecution
+    X-&gt;&gt;M: beforeTestMethod
+    M-&gt;&gt;T: beforeTestMethod, begin a transaction on transactionManager
+    M-&gt;&gt;Q: beforeTestMethod, run classpath bank.sql inside that transaction
+    J-&gt;&gt;C: init, createAccount then deposit 100
+    J-&gt;&gt;C: deposit or withDraw body, assertEquals on getBalance
+    C--&gt;&gt;J: pass
+    J-&gt;&gt;X: afterTestExecution
+    X-&gt;&gt;M: afterTestMethod
+    M-&gt;&gt;Q: after phase, no scripts declared
+    M-&gt;&gt;T: rollback, so the ACCOUNT table and its row vanish
+    J-&gt;&gt;X: afterEach, then afterAll
+    X-&gt;&gt;M: afterTestClass, the context stays in the cache
+        </pre>
+      </figure>
+      <p class="reading"><strong>Walking the arrows.</strong> Order is the whole point. Jupiter calls
+      <code>SpringExtension.beforeAll</code> first, which builds the <code>TestContext</code> from the class's
+      annotations (<code>@ContextConfiguration(classes = BankConfiguration.class)</code>,
+      <code>@Transactional</code>, <code>@Sql(scripts = "classpath:/bank.sql")</code>) — this is where the merged
+      configuration key is computed. Only then is a test instance created, and
+      <code>postProcessTestInstance</code> triggers <code>prepareTestInstance</code>;
+      <code>DependencyInjectionTestExecutionListener</code> asks
+      <code>DefaultCacheAwareContextLoaderDelegate</code> for the context, which either returns a cached one or
+      lets <code>DelegatingSmartContextLoader</code> build an <code>AnnotationConfig</code>-driven context. The
+      transaction is opened <em>after</em> injection and <em>before</em> <code>@BeforeEach</code>, so
+      <code>init()</code>'s <code>createAccount</code> and <code>deposit</code> are already inside it, and
+      <code>@Sql</code> runs in the same transaction — that is why <code>bank.sql</code>'s
+      <code>CREATE TABLE ACCOUNT</code> does not collide with the next test method. Finally
+      <code>afterTestMethod</code> rolls back and nothing closes the context: with
+      <code>@DirtiesContext</code> absent, the context survives until the JVM ends. Compare
+      <code>recipe_13_5_ii</code>: the identical sequence, except TestNG's base class supplies the transaction and
+      the <code>@BeforeMethod</code> hook.</p>
+
+      <div class="callout danger">
+        <h4>Two source-level traps I found while reading 13.3 and 13.4</h4>
+        <p><strong>1. A shadowed <code>BankConfiguration</code>.</strong>
+        <code>com.apress.spring6recipes.bank.BankConfiguration</code> exists <em>twice</em> on the test classpath of
+        <code>recipe_13_3_i</code>, <code>recipe_13_3_ii</code>, <code>recipe_13_4_i</code> and
+        <code>recipe_13_4_ii</code>: once in <code>recipe_13_bank/src/main/java</code> (profiles, DAO beans) and
+        once in the module's own <code>src/test/java</code>. Gradle puts a module's own test output ahead of its
+        dependencies, so <code>@ContextConfiguration(classes = BankConfiguration.class)</code> binds to the local
+        copy. And <code>recipe_13_4_i</code>'s copy declares only <code>@Bean InMemoryAccountDao accountDao()</code>
+        with no <code>@ComponentScan</code>, while <code>recipe_13_3_i</code>'s copy declares
+        <code>@ComponentScan</code> and no beans — since neither <code>InMemoryAccountDao</code> nor
+        <code>JdbcAccountDao</code> is annotated, one module is missing an <code>AccountService</code> candidate and
+        the other is missing an <code>AccountDao</code>. <code>recipe_13_4_ii</code> is the self-consistent pair
+        (<code>@ComponentScan</code> plus <code>accountDao()</code>), and 13.5, 13.6 and 13.8 are consistent too.
+        Expect a <code>Failed to load ApplicationContext</code> or an unsatisfied <code>@Autowired</code> in 13.3_i
+        and 13.4_i; I inspected the sources and did not run the build, so treat this as "run it and see".</p>
+        <p><strong>2. An assertion that cannot fail.</strong> In
+        <code>ch13/recipe_13_3_i/src/test/java/com/apress/spring6recipes/bank/AccountServiceContextTests.java</code>
+        the <code>withDraw</code> test reads <code>assertEquals(50, accountService.getBalance(TEST_ACCOUNT_NO), 50)</code>
+        — that third argument is JUnit's <em>delta</em>, so anything between 0 and 100 passes. The <code>_ii</code>
+        port and the other modules use <code>0</code>.</p>
+      </div>
+    </section>
+
+    <section id="cache">
+      <h2>What the TestContext framework caches</h2>
+      <p>Context creation is the expensive part of a Spring test, so the framework keeps an
+      <code>ApplicationContext</code> per <em>merged configuration</em>, not per test class. Every one of the ten
+      <code>*ContextTests</code> classes in this chapter declares a configuration that differs from its neighbours,
+      and each lives in its own module — so the chapter demonstrates ten context boots and zero cache hits, which
+      is worth knowing before you try to "optimise" it.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Ten context tests, ten cache keys, ten JVMs</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph jvm["Gradle forks one test JVM per module, so each has its own cache"]
+        c33["13_3_i and 13_3_ii"] --&gt; k33["key: classes equal the module local BankConfiguration with ComponentScan"]
+        c34["13_4_i and 13_4_ii"] --&gt; k34["key: classes equal a different local BankConfiguration, one or two beans"]
+        c55["13_5_i and 13_5_ii"] --&gt; k55["key: classes equal the H2 BankConfiguration, EnableTransactionManagement"]
+        c66["13_6_i and 13_6_ii"] --&gt; k66["key: BankWebConfiguration plus shared BankConfiguration, WebAppConfiguration"]
+        c88["13_8_i and 13_8_ii"] --&gt; k88["key: shared BankConfiguration plus ActiveProfiles jdbc"]
+        k33 --&gt; s1["slot 1, GenericApplicationContext"]
+        k34 --&gt; s2["slot 2, GenericApplicationContext"]
+        k55 --&gt; s3["slot 3, GenericApplicationContext"]
+        k66 --&gt; s4["slot 4, GenericWebApplicationContext plus MockServletContext"]
+        k88 --&gt; s5["slot 5, GenericApplicationContext with JdbcBankConfiguration beans"]
+    end
+    c33 -."a different Class object is a different key".-&gt; c34
+    c55 -."adding a profile forks the cache".-&gt; c88
+    c34 -."adding a web resource base dir forks the cache".-&gt; c66
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the topology.</strong> The key that <code>TestContextManager</code>
+      computes for a test class is built from the context loader plus the <code>@ContextConfiguration</code>
+      attributes (<em>locations or classes</em>), the initializer list, the <code>@ActiveProfiles</code> set and the
+      declared property sources. Three edges at the bottom name the three ways this chapter changes that key. First,
+      13.3 and 13.4 declare <code>BankConfiguration</code> as <em>different Class objects</em> in different source
+      sets, so even an identical annotation would not share a slot. Second, 13.8 adds
+      <code>@ActiveProfiles("jdbc")</code> where 13.5 relies on the default, and the active profile is part of the
+      key — so 13.8's slot holds
+      <code>JdbcBankConfiguration</code>'s <code>dataSource</code>, <code>transactionManager</code>,
+      <code>jdbcTemplate</code> and <code>accountDao</code> instead of an in-memory map. Third, 13.6's
+      <code>@WebAppConfiguration</code> changes the loader itself, which is why its slot is a
+      <code>GenericWebApplicationContext</code> over a <code>MockServletContext</code> rather than a plain context.
+      Practical consequence: the diagram pairs each <code>_i</code> with its <code>_ii</code> twin by annotation
+      <em>shape</em> only, and because Gradle runs <code>:ch13:recipe_13_5_i:test</code> and
+      <code>:ch13:recipe_13_5_ii:test</code> in separate JVMs they never share an instance. Two context test classes
+      inside the <em>same</em> module with the same annotations would share one context, and that is the
+      optimisation the framework offers.</p>
+
+      <div class="note">
+        <p><strong>Test-class scope matters as much as the key.</strong>
+        <code>recipe_13_5_i</code>'s <code>@Transactional</code> and <code>@Sql</code> are class-level, but the
+        transaction they create is per <em>method</em>: the two methods <code>deposit</code> and
+        <code>withDraw</code> each get a fresh transaction, a fresh <code>CREATE TABLE ACCOUNT</code> and a fresh
+        rollback. That is why no module in 13.5 or 13.8 has an <code>@AfterEach</code> cleanup method, while
+        13.3 and 13.4 do.</p>
+      </div>
+    </section>
+
+    <section id="db">
+      <h2>Schema, data, rollback</h2>
+      <p>Recipe 13.5 is where the chapter becomes useful in real projects. The test-local
+      <code>BankConfiguration</code> in <code>ch13/recipe_13_5_i/src/test/java/.../BankConfiguration.java</code>
+      builds a <code>SimpleDriverDataSource</code> on <code>jdbc:h2:mem:bank-testing</code>, a
+      <code>DataSourceTransactionManager</code> named <code>transactionManager</code>, a
+      <code>JdbcTemplate</code>, <code>JdbcAccountDao</code> as the <code>AccountDao</code>, and
+      <code>@EnableTransactionManagement @ComponentScan</code> so that <code>SimpleAccountService</code>'s
+      <code>@Transactional</code> gets a proxy. The <code>@Sql</code> script is not copied into the module:
+      <code>classpath:/bank.sql</code> resolves to
+      <code>ch13/recipe_13_bank/src/main/resources/bank.sql</code>, on the test classpath because of
+      <code>implementation project(':ch13:recipe_13_bank')</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">State</span>
+          <span class="dtitle">Database state across the two methods of <code>recipe_13_5_i</code></span></figcaption>
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --&gt; ContextReady : cached GenericApplicationContext, H2 mem bank-testing
+    ContextReady --&gt; TxOpen : TransactionalTestExecutionListener beforeTestMethod
+    TxOpen --&gt; TableCreated : SqlScriptsTestExecutionListener runs bank.sql CREATE TABLE ACCOUNT
+    TableCreated --&gt; Seeded : init calls createAccount then deposit 100
+    Seeded --&gt; Asserted : test body, balance now 150 or 50
+    Asserted --&gt; RolledBack : afterTestMethod rollback
+    RolledBack --&gt; TxOpen : second test method, table absent again
+    RolledBack --&gt; [*] : class finished, context still cached
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the transitions.</strong> The edge worth internalising is
+      <code>Asserted --&gt; RolledBack</code>. Because the test's transaction is the <em>outer</em> one, the
+      <code>@Transactional</code> proxy on <code>SimpleAccountService</code> (propagation <code>REQUIRED</code>)
+      joins it rather than starting a second transaction, and the <code>CREATE TABLE ACCOUNT</code> that
+      <code>SqlScriptsTestExecutionListener</code> runs is itself transactional DDL on both H2 and PostgreSQL. So
+      the rollback at the end of method one removes the <em>table</em>, letting method two re-create it — the loop
+      back to <code>TxOpen</code> is only possible while <code>@Transactional</code> is on the test. Delete that
+      annotation from <code>recipe_13_5_i</code> and the second method fails on an already-existing table, which is
+      the fastest way to feel what the annotation buys. The TestNG variant
+      <code>recipe_13_5_ii</code> reaches the same states by extending
+      <code>AbstractTransactionalTestNGSpringContextTests</code> instead of writing <code>@Transactional</code>;
+      in both cases the <code>transactionManager</code> bean from the test configuration is what the listener
+      drives.</p>
+    </section>
+
+    <section id="web">
+      <h2>MockMvc against a real web context</h2>
+      <p>Recipe 13.6 keeps the production web configuration
+      (<code>ch13/recipe_13_bank/src/main/java/com/apress/spring6recipes/bank/web/config/BankWebConfiguration.java</code>,
+      with <code>@EnableWebMvc</code> and an <code>InternalResourceViewResolver</code> prefixing
+      <code>/WEB-INF/views/</code> and suffixing <code>.jsp</code>) and adds
+      <code>@ContextConfiguration(classes = { BankWebConfiguration.class, BankConfiguration.class })</code> plus
+      <code>@WebAppConfiguration</code>. Here <code>BankConfiguration</code> is the <em>shared</em> one — 13.6 has no
+      test-local copy — so with no active profile the <code>@Profile("!jdbc")</code> branch supplies
+      <code>InMemoryAccountDao</code>. The test then seeds data by injecting the DAO directly, builds
+      <code>MockMvcBuilders.webAppContextSetup(webApplicationContext).build()</code> in <code>@BeforeEach</code>, and
+      asserts on the forward and status.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">A POST /deposit through the mocked servlet layer</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant C as DepositControllerContextTests 13_6_i
+    participant M as MockMvc
+    participant S as TestDispatcherServlet
+    participant H as RequestMappingHandlerMapping
+    participant D as DepositController
+    participant A as InMemoryAccountDao
+    C-&gt;&gt;A: init, createAccount(new Account("1234", 100))
+    C-&gt;&gt;M: perform post /deposit, params accountNo and amount
+    M-&gt;&gt;S: service(MockHttpServletRequest, MockHttpServletResponse)
+    S-&gt;&gt;H: getHandler(request)
+    H--&gt;&gt;S: DepositController.deposit, matched on PostMapping
+    S-&gt;&gt;D: invoke with RequestParam values, accountNo 1234, amount 50.0
+    D-&gt;&gt;A: deposit via SimpleAccountService, findAccount then updateAccount
+    A--&gt;&gt;D: balance now 150
+    D--&gt;&gt;S: view name success, model holds accountNo and balance
+    S--&gt;&gt;M: InternalResourceView forward, response carries forwardedUrl
+    M--&gt;&gt;C: MvcResult
+    C-&gt;&gt;C: expect forwardedUrl /WEB-INF/views/success.jsp and status isOk
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the hops.</strong> Nothing here is faked except the servlet API. The
+      <code>MockHttpServletRequest</code> built by <code>perform(post("/deposit"))</code> carries the form
+      parameters, <code>TestDispatcherServlet</code> consults the
+      <code>RequestMappingHandlerMapping</code> that <code>@EnableWebMvc</code> registered, and
+      <code>DepositController.deposit</code> is invoked by the annotation-based handler adapter with
+      <code>@RequestParam</code> conversion from the string <code>"50.0"</code> to <code>double</code>. The
+      controller calls <code>accountService.deposit(...)</code> then
+      <code>accountService.getBalance(...)</code>, and returns the literal view name <code>success</code>; the
+      resolver turns that into a forward to <code>/WEB-INF/views/success.jsp</code>, which MockMvc records on the
+      mock response instead of rendering — so the JSP file never has to exist. Two mechanism notes from the
+      configuration: no <code>@EnableTransactionManagement</code> is registered in this pair of contexts, so
+      <code>SimpleAccountService</code>'s <code>@Transactional</code> creates no proxy and the DAO calls are plain
+      method calls; and <code>@WebAppConfiguration</code> with its default value expects
+      <code>src/main/webapp</code>, which does not exist in <code>recipe_13_6_i</code> or
+      <code>recipe_13_6_ii</code> — if the context fails to load with "Resource base path … does not exist or is not
+      a directory", that is the cause, and giving the annotation an existing directory fixes it.
+      <code>recipe_13_6_ii</code> additionally posts to <code>/deposito</code>, a typo that maps to no handler, so
+      its <code>forwardedUrl</code> assertion cannot hold.</p>
+    </section>
+
+    <section id="client">
+      <h2>Stubbing an outbound HTTP client</h2>
+      <p>Recipe 13.7 answers "how do I test a class that calls someone else's API" without a container, without
+      Mockito, and without a network. <code>OpenIBANValidationClient</code> extends
+      <code>RestGatewaySupport</code> and calls
+      <code>getRestTemplate().getForObject(URL_TEMPLATE, IBANValidationResult.class, iban)</code>; the test in
+      <code>ch13/recipe_13_7_i/src/test/java/com/apress/spring6recipes/bank/web/OpenIBANValidationClientTest.java</code>
+      instantiates that package-private class directly (same package trick again) and hands it to
+      <code>MockRestServiceServer.createServer(client)</code> — the overload that takes a
+      <code>RestGatewaySupport</code>, which I confirmed from the compiled test class.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">The client believes it is calling openiban.com</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant T as OpenIBANValidationClientTest
+    participant B as MockRestServiceServer
+    participant C as OpenIBANValidationClient
+    participant R as RestTemplate inside RestGatewaySupport
+    participant F as mock request factory
+    T-&gt;&gt;B: createServer(client), wrap the gateway RestTemplate
+    T-&gt;&gt;B: expect(requestTo(expectedUri))
+    B--&gt;&gt;T: ResponseActions
+    T-&gt;&gt;B: andRespond(withSuccess(ClassPathResource NL87TRIO json, APPLICATION_JSON))
+    T-&gt;&gt;C: validate("NL87TRIO0396451440")
+    C-&gt;&gt;R: getForObject(urlTemplate, IBANValidationResult.class, iban)
+    R-&gt;&gt;F: createRequest with the expanded URI
+    F-&gt;&gt;B: match the recorded expectation, no socket opened
+    B--&gt;&gt;F: canned body, 200, application/json
+    F--&gt;&gt;R: MockClientHttpResponse
+    R--&gt;&gt;C: Jackson maps json onto the IBANValidationResult record
+    C--&gt;&gt;T: result
+    T-&gt;&gt;T: assertTrue on result.valid
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the interception.</strong> The only Spring mechanism in play is the
+      <code>ClientHttpRequestFactory</code> swap: after <code>createServer(client)</code>, the RestTemplate owned
+      by <code>RestGatewaySupport</code> no longer produces real connections, it produces mock requests that
+      <code>MockRestServiceServer</code> matches against the recorded <code>requestTo</code> expectation. The URI
+      must match exactly, including the query string from
+      <code>URL_TEMPLATE</code> (<code>?getBIC=true</code> and <code>validateBankCode=true</code>), which is why the
+      test hard-codes the full <code>expectedUri</code>. The response body comes from
+      <code>src/test/resources/NL87TRIO0396451440-result.json</code> (or the invalid
+      <code>NL28XXXX389242218-result.json</code>) and is deserialised into the
+      <code>IBANValidationResult</code> record by Jackson — which explains the otherwise odd
+      <code>testImplementation 'org.hamcrest:hamcrest'</code> and <code>jackson-databind</code> lines in
+      <code>ch13/build.gradle</code> for this module. One caveat you should copy carefully: neither test method
+      calls <code>mockRestServiceServer.verify()</code>, so an assertion holds only because a wrong URI throws when
+      the request arrives; a method that made <em>no</em> request at all would still pass.</p>
+    </section>
+
+    <section id="containers">
+      <h2>Testcontainers and dynamic properties</h2>
+      <p>Recipe 13.8 is the payoff: the same <code>AccountServiceContextTests</code> body, but now the JDBC beans
+      come from the application's own <code>@Profile("jdbc")</code> configuration and the database is a real
+      PostgreSQL server in a container. The trick that makes it work without editing
+      <code>application.properties</code> is <code>@DynamicPropertySource</code>. Note where that annotation comes
+      from: the import is <code>org.springframework.test.context.DynamicPropertySource</code>, and inspecting the
+      compiled test class shows the registry type resolving to <code>org/springframework/test/context/</code> — that
+      is <code>spring-test</code> 6.0.3, not Spring Boot, which is not on this chapter's classpath at all.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Container coordinates arriving as Spring properties</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    P["PostgreSQLContainer with image postgres:14.5, static field POSTGRES"] --&gt;|"start by TestcontainersExtension, or by BeforeSuite in 13_8_ii"| S["running container, random mapped host port"]
+    S --&gt; REG["DynamicPropertyRegistry, registerPgProperties"]
+    REG --&gt;|"suppliers for jdbc.driver, url, username, password"| ENV["Environment of the context being loaded"]
+    FILE["classpath application.properties via PropertySource on JdbcBankConfiguration"] --&gt;|same four keys| ENV
+    A["@ActiveProfiles jdbc on the test class"] --&gt; SEL["profile match, JdbcBankConfiguration selected"]
+    ENV --&gt; DS["dataSource bean, DriverManagerDataSource"]
+    SEL --&gt; DS
+    DS --&gt; JT["jdbcTemplate bean"]
+    DS --&gt; TX["transactionManager, DataSourceTransactionManager"]
+    JT --&gt; DAO["accountDao, JdbcAccountDao"]
+    SCAN["ComponentScan of the bank package"] --&gt; SVC["SimpleAccountService"]
+    DAO --&gt; SVC
+    SVC --&gt; TEST["AccountServiceContextTests, Sql runs bank.sql inside the test transaction"]
+    TX --&gt; TEST
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the resolution chain.</strong> <code>@ActiveProfiles("jdbc")</code> is
+      what selects <code>BankConfiguration.JdbcBankConfiguration</code> instead of the in-memory branch; the nested
+      configuration's constructor takes <code>Environment</code> and calls
+      <code>env.getRequiredProperty("jdbc.url")</code> and friends while the <code>dataSource()</code> bean is being
+      created. Those four lookups are the collision point: <code>@PropertySource("classpath:/application.properties")</code>
+      supplies <code>jdbc.url=jdbc:h2:mem:bank</code> with the H2 driver, while <code>registerPgProperties</code>
+      supplies the container's URL and driver — and the container values are the ones that must win, because
+      <code>org.testcontainers:postgresql</code> and <code>org.postgresql:postgresql</code> are the only JDBC
+      dependencies in <code>ch13/build.gradle</code> for <code>recipe_13_8_i</code> and <code>_ii</code>;
+      <code>com.h2database:h2</code> is not on their classpath at all, so the file's values could not produce a
+      working <code>DataSource</code>. The registry hands over <code>Supplier</code> lambdas
+      (<code>POSTGRES::getJdbcUrl</code>) rather than strings, which is what lets the value be read <em>after</em>
+      Docker has allocated a port. From there the chain is ordinary: <code>dataSource</code> feeds
+      <code>jdbcTemplate</code> and <code>DataSourceTransactionManager</code>, <code>JdbcAccountDao</code> becomes the
+      <code>AccountDao</code>, component scanning supplies <code>SimpleAccountService</code>, and
+      <code>@Sql(scripts = "classpath:/bank.sql")</code> creates the same <code>ACCOUNT</code> table on
+      PostgreSQL as it did on H2. Lifecycle difference to keep straight: <code>recipe_13_8_i</code> is annotated
+      <code>@Testcontainers</code> with a <code>@Container static final</code> field, so the JUnit extension starts
+      and stops it; <code>recipe_13_8_i</code>'s TestNG twin declares the same static field but has no JUnit
+      extension available, so it starts and stops the container explicitly in
+      <code>@BeforeSuite</code>/<code>@AfterSuite</code> — and its module omits
+      <code>org.testcontainers:junit-jupiter</code> from the dependencies accordingly.</p>
+
+      <div class="note">
+        <p><strong>A dependency oddity worth copying.</strong> Both 13.8 modules declare
+        <code>io.quarkus:quarkus-junit4-mock:2.11.2.Final</code>, with the build comment "Some empty JUnit4 classes
+        as Testcontainers has a hard dependency on them". The root build excludes
+        <code>junit:junit</code> and <code>junit-vintage-engine</code> from every configuration, so
+        Testcontainers 1.17.6 would fail to load its JUnit 4 base classes without that stub.</p>
+      </div>
+    </section>
+
+    <section id="running">
+      <h2>Building and running these tests</h2>
+      <p>Module paths in Gradle are colon-qualified by directory, so chapter 13's tasks are
+      <code>:ch13:recipe_13_N_M:test</code>. Nothing here needs a running server, a browser or a database you
+      provision yourself — except 13.8.</p>
+      <pre>
+# one recipe, JUnit 5 module (prints passed, skipped, failed per test)
+./gradlew :ch13:recipe_13_5_i:test --tests "*AccountServiceContextTests"
+
+# the TestNG port of the same recipe (module switches to useTestNG in ch13/build.gradle)
+./gradlew :ch13:recipe_13_5_ii:test
+
+# the whole chapter
+./gradlew :ch13:recipe_13_1_i:test :ch13:recipe_13_1_ii:test :ch13:recipe_13_1_iii:test \
+          :ch13:recipe_13_1_iv:test  :ch13:recipe_13_2_i:test  :ch13:recipe_13_2_ii:test \
+          :ch13:recipe_13_2_iii:test :ch13:recipe_13_2_iv:test :ch13:recipe_13_2_v:test  \
+          :ch13:recipe_13_3_i:test   :ch13:recipe_13_3_ii:test :ch13:recipe_13_4_i:test  \
+          :ch13:recipe_13_4_ii:test  :ch13:recipe_13_5_i:test  :ch13:recipe_13_5_ii:test \
+          :ch13:recipe_13_6_i:test   :ch13:recipe_13_6_ii:test :ch13:recipe_13_7_i:test
+
+# needs Docker running; pulls postgres:14.5 on first use
+./gradlew :ch13:recipe_13_8_i:test
+./gradlew :ch13:recipe_13_8_ii:test
+      </pre>
+      <p>Report output lands in <code>ch13/recipe_13_N_M/build/reports/tests/test/index.html</code>; the repository
+      already contains such a report for <code>recipe_13_2_iv</code>, which is proof those tests were run at some
+      point. Prerequisites and gotchas, all read out of the build files:</p>
+      <ul>
+        <li><strong>JDK 19.</strong> The root <code>build.gradle</code> pins
+        <code>java.toolchain.languageVersion = 19</code> and adds <code>--enable-preview</code> to
+        <code>JavaCompile</code>, <code>Test</code> and <code>JavaExec</code> JVM args, while the checked-in
+        <code>gradle.properties</code> sets <code>org.gradle.java.home</code> to a JDK 17 path on the author's
+        machine. Point that at a JDK 19 you actually have (or drop the line and let the toolchain resolve) before
+        expecting a compile.</li>
+        <li><strong>Gradle 7.6</strong> via the wrapper, and dependency management from
+        <code>spring-6-recipes-dependencies</code>: Spring Framework 6.0.3, JUnit 5.9.1, Mockito 4.10.0,
+        Testcontainers 1.17.6, TestNG 7.6.1, H2 2.1.214, PostgreSQL driver 42.4.1, Jackson 2.14.1.</li>
+        <li><strong>Docker for 13.8 only.</strong> The container is created from the
+        image string <code>postgres:14.5</code>; no port or credentials are configured because the container exposes
+        them through <code>@DynamicPropertySource</code>. Everything else runs in-process.</li>
+        <li><strong>No profiles or property overrides to set by hand.</strong> 13.5 supplies its own H2 URLs
+        (<code>jdbc:h2:mem:bank-testing</code>) in the test configuration, and the shared
+        <code>application.properties</code> (<code>jdbc:h2:mem:bank</code>, user <code>sa</code>, empty password) is
+        only consulted by the <code>jdbc</code> profile in 13.8 — where it is superseded as described above.</li>
+        <li><strong>Runner mismatch is expected.</strong> The root build forces
+        <code>useJUnitPlatform()</code> on every <code>Test</code> task and <code>ch13/build.gradle</code> selects
+        <code>useTestNG()</code> for <code>recipe_13_1_iii</code>, <code>_iv</code>, and the <code>_ii</code> modules.
+        A module that has JUnit tests but a TestNG task (or the reverse) will report zero tests, so check the
+        module's block in <code>ch13/build.gradle</code> before concluding a test "did not exist".</li>
+        <li><strong>Expect the four problems flagged above</strong> in <code>recipe_13_3_i</code>,
+        <code>recipe_13_4_i</code> (shadowed <code>BankConfiguration</code> and its missing beans),
+        <code>recipe_13_6_i</code>/<code>_ii</code> (<code>@WebAppConfiguration</code> base directory absent, plus
+        the <code>/deposito</code> typo). The unit-test recipes 13.1 and 13.2, the 13.5 pair, and 13.7 are
+        self-consistent on inspection.</li>
+      </ul>
+      <p>What I could not establish from the source alone: whether any of the four suspect modules currently pass.
+      Verifying that requires executing Gradle, which is outside what I did here.</p>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch13/</code> — Spring 6 Recipes, Chapter 13: Spring Testing.
+  <a href="../index.html">Back to all chapters</a>
+</footer>
+</body>
+</html>

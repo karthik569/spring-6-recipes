@@ -1,0 +1,936 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 14 — Caching — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 14</div>
+  <h1>Chapter 14 — Caching</h1>
+  <p class="lede">
+    This chapter starts from a computation that deliberately sleeps for 500&nbsp;milliseconds and asks how to stop
+    paying for it twice. It caches by hand first, then caches with Spring's <code>Cache</code> API by hand, and
+    finally deletes the cache code entirely in favour of <code>@Cacheable</code>, <code>@CachePut</code> and
+    <code>@CacheEvict</code>. The model that has to stick: the caller never touches the cache — a proxy created under
+    <code>@EnableCaching</code> intercepts the call, asks a <code>CacheManager</code>, and either returns a stored
+    value or lets the real method run and stores what comes back.
+  </p>
+  <div class="chip-row">
+    <span class="chip">15 modules / 7 recipes</span>
+    <span class="chip">@EnableCaching</span>
+    <span class="chip">@Cacheable / @CachePut / @CacheEvict</span>
+    <span class="chip">CacheManager</span>
+    <span class="chip">providers confirmed: Caffeine, ConcurrentMap, Redis (Jedis)</span>
+    <span class="chip">Spring 6.0.3 &middot; Caffeine 3.1.2 &middot; Jedis 4.3.1 &middot; H2 2.1.214</span>
+    <span class="chip">./gradlew :ch14:recipe_14_5_iv:build</span>
+    <span class="chip">14_7_i requires Redis on localhost:6379</span>
+    <span class="chip">14_3_ii requires -javaagent:aspectjweaver.jar</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch13/index.html">&larr; Chapter 13 — Spring Testing</a>
+    <a href="../index.html">All chapters &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc"><h2>On this page</h2><ol>
+    <li><a href="#overview">Overview and module map</a></li>
+    <li><a href="#escalation">The escalation ladder</a></li>
+    <li><a href="#proxy">Proxy interception, hit and miss</a></li>
+    <li><a href="#paths">Read, write and evict paths</a></li>
+    <li><a href="#keys">Key resolution</a></li>
+    <li><a href="#domain">Cached domain types</a></li>
+    <li><a href="#tx">Caching inside a transaction</a></li>
+    <li><a href="#weaving">Proxy mode versus AspectJ mode</a></li>
+    <li><a href="#providers">Providers, caches and eviction policy</a></li>
+    <li><a href="#running">Building and running</a></li>
+  </ol></aside>
+  <article>
+
+    <section id="overview">
+      <span class="kicker">Mental model</span>
+      <h2>Overview and module map</h2>
+      <p>
+        Two domain examples carry the chapter. Recipes 14.1 to 14.4 use
+        <code>CalculationService.heavyCalculation(BigDecimal base, int power)</code>, a method that sleeps 500&nbsp;ms
+        through <code>com.apress.spring6recipes.utils.Utils.sleep</code> (from <code>shared-resources</code>) and then
+        returns <code>base.pow(power)</code>. Because <code>Main</code> repeats the same arguments five times, the
+        per-call elapsed time is a direct readout of whether caching happened. Recipes 14.5 to 14.7 switch to
+        <code>CustomerRepository</code> and <code>record Customer(long id, String name)</code>, where the interesting
+        problem is no longer speed but <em>coherence</em>: what a cached entry does while the underlying data is
+        created, updated and deleted underneath it.
+      </p>
+      <p>
+        The teaching order is deliberate. <strong>14.1</strong> caches without Spring. <strong>14.2</strong> caches
+        <em>with</em> Spring's cache abstraction but still writes the code by hand. <strong>14.3</strong> deletes that
+        code and annotates the method. <strong>14.4</strong> customises the key. <strong>14.5</strong> works through
+        the write and evict annotations one at a time. <strong>14.6</strong> adds a transaction. <strong>14.7</strong>
+        moves the cache out of process.
+      </p>
+      <h3>Module map</h3>
+      <p>All fifteen modules live under <code>ch14/</code> and share one build file,
+      <code>ch14/build.gradle</code>. Module paths below are relative to <code>ch14/</code>.</p>
+      <table>
+        <thead><tr>
+          <th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th>
+        </tr></thead>
+        <tbody>
+          <tr>
+            <td class="num">14.1</td>
+            <td><code>recipe_14_1_i</code>, <code>recipe_14_1_ii</code>, <code>recipe_14_1_iii</code></td>
+            <td>Why caching is needed, and what a cache looks like with <em>no</em> Spring cache abstraction.
+              <code>i</code> has no cache at all, so all five calls take 500&nbsp;ms. <code>ii</code> builds a raw
+              Caffeine cache inside <code>Main</code>. <code>iii</code> keeps the same caching logic but promotes the
+              cache to a Spring bean — and the service class goes from package-private to <code>public</code> so the
+              configuration can see it.</td>
+            <td><code>PlainCalculationService</code>, <code>PlainCachingCalculationService</code>,
+              <code>CalculationConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">14.2</td>
+            <td><code>recipe_14_2_i</code>, <code>recipe_14_2_ii</code></td>
+            <td>The same hand-written read-through logic against Spring's own <code>org.springframework.cache.Cache</code>,
+              so the provider becomes a configuration decision instead of an import. <code>i</code> uses
+              <code>ConcurrentMapCacheManager</code>; <code>ii</code> uses <code>CaffeineCacheManager</code>.</td>
+            <td><code>PlainCachingCalculationService</code>, <code>CalculationConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">14.3</td>
+            <td><code>recipe_14_3_i</code>, <code>recipe_14_3_ii</code></td>
+            <td>Declarative caching: <code>calculate</code> is private again and the public method carries nothing but
+              <code>@Cacheable("calculations")</code>. <code>i</code> uses the default proxy mode; <code>ii</code>
+              switches to <code>AdviceMode.ASPECTJ</code> with <code>@EnableLoadTimeWeaving</code>.</td>
+            <td><code>PlainCalculationService</code>, <code>CalculationConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">14.4</td>
+            <td><code>recipe_14_4_i</code></td>
+            <td>Installing a custom <code>KeyGenerator</code> as the context-wide default by implementing
+              <code>CachingConfigurer</code> — while leaving the annotation itself untouched.</td>
+            <td><code>CustomKeyGenerator</code>, <code>CalculationConfiguration</code>,
+              <code>PlainCalculationService</code></td>
+          </tr>
+          <tr>
+            <td class="num">14.5</td>
+            <td><code>recipe_14_5_i</code> … <code>recipe_14_5_v</code></td>
+            <td>The whole annotation surface on a mutable repository, one annotation added per variant: read caching,
+              evict on delete, evict on update with a SpEL key, populate on create with <code>@CachePut</code> plus
+              <code>unless</code> on the read. Every variant runs the same ten-step <code>StopWatch</code> script, so
+              the differences are measurable and printable.</td>
+            <td><code>Customer</code>, <code>CustomerRepository</code>,
+              <code>MapBasedCustomerRepository</code>, <code>CustomerConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">14.6</td>
+            <td><code>recipe_14_6_i</code></td>
+            <td>Caching in front of a real database, inside a transaction. The repository becomes
+              <code>JdbcCustomerRepository</code> over embedded H2, and the cache manager is wrapped in
+              <code>TransactionAwareCacheManagerProxy</code> so cache writes land only if the transaction commits.</td>
+            <td><code>JdbcCustomerRepository</code>, <code>CustomerConfiguration</code>, <code>schema.sql</code></td>
+          </tr>
+          <tr>
+            <td class="num">14.7</td>
+            <td><code>recipe_14_7_i</code></td>
+            <td>Out-of-process cache store. Only the <code>CacheManager</code> changes
+              (<code>RedisCacheManager</code> over <code>JedisConnectionFactory</code>); the repository and its
+              annotations are the 14.5&nbsp;<code>iv</code> ones. <code>Customer</code> gains
+              <code>implements Serializable</code> because the value now crosses a socket.</td>
+            <td><code>MapBasedCustomerRepository</code>, <code>Customer</code>, <code>CustomerConfiguration</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout info">
+        <h4>Two things this chapter does <em>not</em> contain</h4>
+        <p>There is no <code>@Caching</code> (the container annotation for stacking several cache operations on one
+        method), and no <code>CacheErrorHandler</code>, <code>@CacheConfig</code>, <code>sync</code>,
+        <code>condition</code> or <code>allEntries</code> usage anywhere in <code>ch14/</code> — checked by grepping
+        every <code>.java</code> file in the fifteen modules. Nor is there a cache event listener. The only
+        listener-shaped artefact is <code>recipe_14_7_i/out/production/resources/cache-client.xml</code>, a
+        Spring&nbsp;GemFire namespace config declaring a <code>gfe:local-region</code> named <code>customers</code> with
+        a <code>gfe:cache-listener</code> pointing at
+        <code>com.apress.springrecipes.caching.LoggingCacheListener</code> — a class that does not exist in this
+        repository, under an <code>out/</code> directory that is IDE build output and not part of the Gradle build. It
+        is a leftover from an earlier edition, not a recipe.</p>
+      </div>
+    </section>
+
+    <section id="escalation">
+      <span class="kicker">Recipes 14.1 to 14.7</span>
+      <h2>The escalation ladder</h2>
+      <p>Each rung removes one more piece of cache code from the service and moves it into configuration or an
+        annotation.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">From hand-rolled cache to annotation, module by module</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    a["14_1_i, PlainCalculationService, no cache, five calls, five times 500ms"]
+    a -- "add a cache the service owns" --> b["14_1_ii, Caffeine Cache built in Main, handed to PlainCachingCalculationService"]
+    b -- "move the cache into configuration" --> c["14_1_iii, same caching logic, cache now the calculationsCache bean"]
+    c -- "swap the provider type for Spring's Cache" --> d["14_2_i, ConcurrentMapCacheManager, get plus putIfAbsent"]
+    d -- "change only the CacheManager bean" --> e["14_2_ii, CaffeineCacheManager, get plus put"]
+    e -- "delete all cache code from the service" --> f["14_3_i, EnableCaching plus Cacheable on the method"]
+    f -- "same advice, applied by weaving" --> g["14_3_ii, AdviceMode ASPECTJ with EnableLoadTimeWeaving"]
+    f -- "same annotation, different key" --> h["14_4_i, CachingConfigurer supplies CustomKeyGenerator"]
+    f -- "switch domain, keep only the read" --> i["14_5_i, Cacheable on find only, writes left uncached"]
+    i -- "evict on delete" --> j["14_5_ii, plus CacheEvict on remove"]
+    j -- "evict on update with a SpEL key" --> k["14_5_iii, plus CacheEvict key customer dot id"]
+    k -- "populate on create, stop caching nulls" --> l["14_5_iv, plus CachePut on create and unless on find"]
+    l -- "whitespace only" --> m["14_5_v, behaviourally identical to iv"]
+    l -- "put a database and a transaction underneath" --> n["14_6_i, JdbcCustomerRepository over H2, transaction aware CacheManager"]
+    l -- "put the cache out of process" --> o["14_7_i, RedisCacheManager over JedisConnectionFactory, Customer is Serializable"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong>
+        The load-bearing transition is <code>14_2_ii</code> to <code>14_3_i</code>. Before it,
+        <code>PlainCachingCalculationService.heavyCalculation</code> contains the read-through pattern itself —
+        <code>cache.get(key, BigDecimal.class)</code>, a null check, the computation, then a write — and the class holds
+        an <code>org.springframework.cache.Cache</code> field injected through its constructor. After it, the class holds
+        <em>no</em> cache field at all: <code>heavyCalculation</code> is just <code>return calculate(base, power)</code>
+        annotated <code>@Cacheable("calculations")</code>
+        (<code>ch14/recipe_14_3_i/src/main/java/com/apress/spring6recipes/caching/PlainCalculationService.java</code>).
+        The three <code>14_1_x</code> rungs deserve a second look, because they already cache successfully with
+        <code>cache.get(key, k -&gt; this.calculate(base, power))</code>: Caffeine's own loader does the read-through, so
+        Spring's abstraction buys provider swappability and annotation-driven code, not the caching itself. And note that
+        the mechanism taught in 14.3 is orthogonal to the store — <code>14_3_i</code> and <code>14_3_ii</code> configure
+        a byte-equivalent <code>CaffeineCacheManager</code>; only <em>who applies the advice</em> changes.</p>
+      <p class="path">Evidence: ch14/recipe_14_1_ii/src/main/java/com/apress/spring6recipes/caching/Main.java,
+        ch14/recipe_14_2_i/…/config/CalculationConfiguration.java,
+        ch14/recipe_14_3_i/…/PlainCalculationService.java</p>
+    </section>
+
+    <section id="proxy">
+      <span class="kicker">The core mechanism</span>
+      <h2>Proxy interception, hit and miss</h2>
+      <p>Everything else in the chapter assumes this picture. Once <code>@EnableCaching</code> is present, the
+        container registers caching infrastructure and wraps any bean with a cache annotation in a proxy.
+        <code>Main</code> obtains the bean with <code>context.getBean(CalculationService.class)</code> and therefore
+        holds the <em>proxy</em>; the <code>PlainCalculationService</code> instance is reachable only from inside the
+        interceptor.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">One heavyCalculation call: cache hit versus cache miss</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant M as Main
+    participant P as JDK proxy of CalculationService
+    participant I as CacheInterceptor
+    participant KG as KeyGenerator
+    participant CM as CaffeineCacheManager
+    participant C as Cache named calculations
+    participant T as PlainCalculationService target
+
+    M->>P: context.getBean CalculationService
+    Note over M,P: the reference Main holds is the proxy, not the target
+    M->>P: heavyCalculation with base 2 and power 16
+    P->>I: invoke, ReflectiveMethodInvocation
+    I->>KG: generate target, method, params
+    KG-->>I: SimpleKey built from base and power
+    I->>CM: getCache with cache name calculations
+    CM-->>I: Cache handle, created on first request
+    I->>C: get key
+    alt cache hit
+        C-->>I: ValueWrapper holding the cached BigDecimal
+        I-->>P: return that value, interceptor chain not invoked
+        P-->>M: 65536, heavyCalculation body never entered
+    else cache miss
+        C-->>I: null ValueWrapper
+        I->>T: proceed through the chain
+        T->>T: calculate, Utils.sleep 500 then base.pow power
+        T-->>I: 65536
+        I->>C: put key and value
+        C-->>I: stored
+        I-->>P: return the computed value
+        P-->>M: 65536, only the first call pays 500ms
+    end
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong>
+        Hop by hop. (1) <code>Main</code> calls <code>getBean</code> and receives the proxy. (2) The call to
+        <code>heavyCalculation</code> lands on the proxy's <code>InvocationHandler</code>, which delegates to Spring's
+        <code>CacheInterceptor</code> — the advice class wired by <code>@EnableCaching</code>, in
+        <code>org.springframework.cache.interceptor</code>, not in the chapter source. (3) The interceptor asks the
+        <code>KeyGenerator</code> for a key from <code>(target, method, params)</code>. (4) It asks the
+        <code>CacheManager</code> for the <code>Cache</code> named in the annotation, here <code>"calculations"</code>.
+        (5) <code>Cache.get(key)</code> decides the branch. On a hit the interceptor returns the stored
+        <code>BigDecimal</code> and the target method is <em>never invoked</em> — that is the entire optimisation, and
+        it is why 14.1's five 500&nbsp;ms lines become one slow line followed by four near-zero ones. On a miss the
+        interceptor calls <code>invocation.proceed()</code>, the real <code>calculate()</code> runs, and the interceptor
+        performs the <code>put</code> itself on the way out — the target has no idea a store exists. The
+        <code>CacheManager</code> bean in <code>ch14/recipe_14_3_i/…/config/CalculationConfiguration.java</code> is a
+        <code>CaffeineCacheManager</code> with <code>maximumSize(1000)</code> and
+        <code>expireAfterWrite(Duration.ofMinutes(5))</code>, so the <code>Cache</code> participant is a
+        <code>CaffeineCache</code> view over an in-heap Caffeine map.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">How one configuration class becomes an intercepting bean</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    cfg["CalculationConfiguration, Configuration plus EnableCaching"] --> infra["Container registers a CacheOperationSource and the caching advisor"]
+    cfg --> cmb["Bean cacheManager, a CaffeineCacheManager with maximumSize 1000 and expireAfterWrite 5 minutes"]
+    cfg --> svb["Bean calculationService, a plain PlainCalculationService with no cache field"]
+    svb --> probe{"Does any public method carry a cache annotation?"}
+    probe -- "yes, Cacheable on heavyCalculation" --> px["JDK proxy implementing CalculationService, proxyTargetClass defaults to false and an interface exists"]
+    probe -- "no" --> plain["Bean handed back as is, the annotation is inert"]
+    infra --> px
+    cmb --> px
+    px --> getb["getBean CalculationService returns the proxy"]
+    px --> hold["The proxy holds the CacheManager, the target holds nothing"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong>
+        The left column is literal source: <code>CalculationConfiguration</code> declares
+        <code>@Configuration</code>, <code>@EnableCaching</code>, a <code>CacheManager cacheManager()</code> bean and a
+        <code>CalculationService calculationService()</code> bean returning <code>new PlainCalculationService()</code>.
+        <code>@EnableCaching</code> is what pulls the advisor into the context, and it is not optional — its absence is
+        exactly why <code>14_1_iii</code> and the <code>14_2_x</code> modules still cache correctly without it, since
+        those services call the cache themselves. The decision node is the debugging rule to remember: annotate a
+        private method, or call an annotated method from another method of the same object, and you take the lower
+        branch — no interception, no error, just a cache that never appears to work. The edge from
+        <code>cmb</code> to <code>px</code> records where the manager is injected: into the <em>advice</em>. And in
+        <code>14_4_i</code> this same configuration class additionally <code>implements CachingConfigurer</code>, so
+        the graph gains one more edge from <code>infra</code> back to <code>cfg</code> for the
+        <code>KeyGenerator</code>.</p>
+    </section>
+
+    <section id="paths">
+      <span class="kicker">Recipe 14.5</span>
+      <h2>Read, write and evict paths</h2>
+      <p>The four annotations are not symmetric, and the asymmetry is where the bugs live. Three rules account for
+        every variant in 14.5:</p>
+      <ul>
+        <li><code>@Cacheable</code> may <em>skip</em> the method body. <code>@CachePut</code> never does — the body
+          always runs, then its result is stored.</li>
+        <li><code>@CacheEvict</code> fires <strong>after</strong> the method returns successfully, because every recipe
+          leaves <code>beforeInvocation</code> at its default of <code>false</code>. If the method throws, nothing is
+          evicted.</li>
+        <li><code>@CachePut</code> stores the <em>return value</em>, so a <code>create</code> method declared
+          <code>void</code> could not use it.</li>
+      </ul>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The four annotated methods of MapBasedCustomerRepository</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    call["Call reaches the repository proxy"] --> which{"Which annotation is on the invoked method, recipe 14_5_iv"}
+    which -- "find, Cacheable with unless" --> pre{"Entry present for the key?"}
+    pre -- yes --> skip["Body skipped, cached Customer returned in about 0ms"]
+    pre -- no --> body["Body runs, Utils.sleep 500 then a map lookup"]
+    body --> cond{"Is the returned value null?"}
+    cond -- "yes, unless blocks the write" --> nostore["Value returned, nothing written to the cache"]
+    cond -- "no" --> store["Value written to the cache under the key"]
+    store --> ok["Value returned"]
+    which -- "create, CachePut" --> body2["Body always runs, AtomicLong id then computeIfAbsent"]
+    body2 --> overwrite["Returned Customer written under key result dot id, an existing entry is replaced, never short circuited"]
+    which -- "update, CacheEvict with key customer dot id" --> body3["Body runs, map put replaces the entry"]
+    body3 --> evict1["Cache entry for that id removed AFTER the body returned"]
+    which -- "remove, CacheEvict with no key" --> body4["Body runs, map remove"]
+    body4 --> evict2["Default key is the single long parameter, the same key find used"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong>
+        Start from <code>ch14/recipe_14_5_iv/src/main/java/com/apress/spring6recipes/caching/MapBasedCustomerRepository.java</code>.
+        <code>find</code> carries <code>@Cacheable(value = "customers", unless = "#result == null")</code>; the
+        <code>unless</code> expression is evaluated <em>after</em> the body against the returned value, and it is what
+        stops a miss from storing a null. <code>14_5_i</code> uses the bare
+        <code>@Cacheable(value = "customers")</code>, so there the miss <em>does</em> store null under the probed id —
+        <code>ConcurrentMapCache</code> and <code>CaffeineCache</code> both represent null with Spring's
+        <code>NullValue</code> placeholder, since the underlying maps cannot hold one. <code>create</code> carries
+        <code>@CachePut(value = "customers", key = "#result.id")</code>: <code>#result</code> is available to
+        <code>@CachePut</code> and <code>@Cacheable</code> but not to a before-invocation <code>@CacheEvict</code>, and
+        using the generated id as the key is the only option, because the caller does not know that id yet.
+        <code>update</code> carries <code>@CacheEvict(value = "customers", key = "#customer.id")</code>, naming the
+        method parameter so that eviction targets the <code>Long</code> key rather than the <code>Customer</code>
+        object. <code>remove</code> carries the shorthand <code>@CacheEvict("customers")</code> and needs no key at
+        all, because its only parameter is the primitive <code>long customerId</code>. One sentence to keep: reads may
+        be short-circuited, writes never are, and eviction is a <em>post</em>-invocation action.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">State</span>
+          <span class="dtitle">Lifecycle of one cached entry, and which variant unlocks each move</span></figcaption>
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> Cold
+    Cold --> Loaded : find an existing id, body runs 500ms then stores, all of 14_5
+    Cold --> NullCached : find an unknown id and the null is stored too, 14_5_i to 14_5_iii
+    NullCached --> NullCached : find that id again, hit on the stored null, 0ms and still no customer
+    NullCached --> Cold : expireAfterWrite after 5 minutes
+    Cold --> Loaded : create stores the returned value directly via CachePut, from 14_5_iv, no miss at all
+    Loaded --> Loaded : find the same id again, hit, body skipped
+    Loaded --> Stale : update with no annotation, 14_5_i and 14_5_ii
+    Loaded --> Cold : update evicting key customer dot id, from 14_5_iii
+    Stale --> Stale : find keeps serving the OLD cached value while the map already holds the new one
+    Stale --> Cold : remove with CacheEvict, from 14_5_ii, or after 5 minutes
+    Loaded --> Ghost : remove with no annotation, 14_5_i only
+    Loaded --> Cold : remove with CacheEvict, from 14_5_ii
+    Ghost --> Ghost : find returns a Customer that no longer exists in the map
+    Ghost --> Cold : expireAfterWrite after 5 minutes, no annotation clears it in 14_5_i
+    Cold --> [*]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the transitions.</strong>
+        <code>Loaded to Stale</code> is the bug <code>14_5_i</code> and <code>14_5_ii</code> still have:
+        <code>update</code> is unannotated in both, so <code>customers.put(...)</code> changes the map but not the
+        cache, and the next <code>find</code> is served straight from Caffeine. The StopWatch prints about 0&nbsp;ms,
+        which reads as success, while the printed value is still <code>Customer[id=1, name=Marten Deinum]</code> after
+        the rename to Josh Long. <code>14_5_iii</code> fixes exactly that edge by adding
+        <code>@CacheEvict(value = "customers", key = "#customer.id")</code>, turning <code>Loaded</code> into
+        <code>Cold</code> so the following read reloads. <code>Loaded to Ghost</code> is the
+        <code>14_5_i</code>-only edge: <code>remove</code> has no annotation, so a deleted customer stays readable from
+        cache. The self-loops on <code>Stale</code> and <code>Ghost</code> are the point of the diagram — a cached wrong
+        answer is fast, so no timing signal warns you, and the only escape hatch is the 5-minute
+        <code>expireAfterWrite</code>. The transition that <em>never</em> happens in these recipes is
+        <code>NullCached to Loaded</code>: once a null is cached for an id, a later insert of that id stays invisible for
+        up to five minutes, which is what <code>unless = "#result == null"</code> in <code>14_5_iv</code> forecloses.
+        In 14.5 that hazard is latent, because <code>Main</code> probes
+        <code>customerRepository.find(System.currentTimeMillis())</code> — an id the repository's <code>AtomicLong</code>
+        will never generate. Change that probe to a small id and <code>unless</code> becomes load-bearing.</p>
+
+      <h3>Annotation surface per variant</h3>
+      <p>Copied from the annotation strings in
+      <code>ch14/recipe_14_5_*/src/main/java/com/apress/spring6recipes/caching/MapBasedCustomerRepository.java</code>
+      and the two repositories that reuse it. An empty cell means the method carries no cache annotation there.</p>
+      <table>
+        <thead><tr><th>Module</th><th><code>find(long)</code></th><th><code>create(String)</code></th>
+          <th><code>update(Customer)</code></th><th><code>remove(long)</code></th></tr></thead>
+        <tbody>
+          <tr><td><code>14_5_i</code></td><td><code>@Cacheable(value = "customers")</code></td><td></td><td></td><td></td></tr>
+          <tr><td><code>14_5_ii</code></td><td><code>@Cacheable(value = "customers")</code></td><td></td><td></td>
+            <td><code>@CacheEvict("customers")</code></td></tr>
+          <tr><td><code>14_5_iii</code></td><td><code>@Cacheable(value = "customers")</code></td><td></td>
+            <td><code>@CacheEvict(value = "customers", key = "#customer.id")</code></td>
+            <td><code>@CacheEvict("customers")</code></td></tr>
+          <tr><td><code>14_5_iv</code></td>
+            <td><code>@Cacheable(value = "customers", unless = "#result == null")</code></td>
+            <td><code>@CachePut(value = "customers", key = "#result.id")</code></td>
+            <td><code>@CacheEvict(value = "customers", key = "#customer.id")</code></td>
+            <td><code>@CacheEvict("customers")</code></td></tr>
+          <tr><td><code>14_5_v</code></td><td>identical to <code>iv</code></td><td>identical to <code>iv</code></td>
+            <td>identical to <code>iv</code></td><td>identical to <code>iv</code></td></tr>
+          <tr><td><code>14_7_i</code></td><td>identical to <code>iv</code></td><td>identical to <code>iv</code></td>
+            <td>identical to <code>iv</code></td><td>identical to <code>iv</code></td></tr>
+          <tr><td><code>14_6_i</code></td><td><code>@Cacheable(value = "customers")</code></td>
+            <td><code>@CachePut(value = "customers", key = "#result.id")</code></td>
+            <td><code>@CacheEvict(value = "customers", key = "#customer.id")</code></td>
+            <td><code>@CacheEvict(value = "customers")</code></td></tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        <h4><code>14_5_iv</code> and <code>14_5_v</code> are the same recipe</h4>
+        <p>A recursive diff of the two <code>src</code> trees shows the only difference is a space around the
+        <code>=</code> inside two annotation attribute lists (<code>value="customers"</code> versus
+        <code>value = "customers"</code>). No behavioural difference whatsoever; read <code>v</code> as a formatting
+        commit of <code>iv</code>. The <code>14_6_i</code> and <code>14_7_i</code> rows show the other honest
+        difference: <code>14_6_i</code> reuses the 14.5&nbsp;<code>iv</code> annotation set but drops
+        <code>unless</code> on <code>find</code>, and uses the long form <code>@CacheEvict(value = "customers")</code>
+        on <code>remove</code> rather than the shorthand.</p>
+      </div>
+      <p class="path">Evidence: ch14/recipe_14_5_iv/…/MapBasedCustomerRepository.java lines 18, 25, 32, 38;
+        ch14/recipe_14_6_i/…/JdbcCustomerRepository.java lines 25, 33, 47, 54</p>
+    </section>
+
+    <section id="keys">
+      <span class="kicker">Recipe 14.4</span>
+      <h2>Key resolution</h2>
+      <p>Two keys must agree or the cache never hits: the one <code>@Cacheable</code> writes under, and the one a later
+        read or <code>@CacheEvict</code> looks up with. Spring resolves the key in a fixed precedence order, and
+        <code>recipe_14_4_i</code> occupies the third slot.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Which key wins for a given annotated method</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    op["Cache operation on a method"] --> q1{"Is a key attribute present in the annotation?"}
+    q1 -- "yes, from 14_5_iii onward" --> spel["SpEL evaluated against the parameters, and the result for Cacheable and CachePut"]
+    spel --> r1["customer dot id yields the Long id, result dot id yields the id of the returned Customer"]
+    q1 -- "no, as in 14_3_i, 14_4_i and 14_5_i" --> q2{"Is a keyGenerator attribute naming a bean present?"}
+    q2 -- "yes, never happens anywhere in ch14" --> named["That named KeyGenerator bean is consulted"]
+    q2 -- no --> q3{"Does a CachingConfigurer supply a keyGenerator?"}
+    q3 -- "yes, only in 14_4_i" --> custom["CustomKeyGenerator, returns params 0 caret params 1, so the key is the string 2 caret 16"]
+    q3 -- "no, every other recipe" --> simple["SimpleKeyGenerator, one non array parameter becomes the key itself, several become a SimpleKey, none gives null"]
+    custom --> r2["The same string the hand written 14_1_ii code produced, base caret power"]
+    simple --> r3["For find and remove the key is the Long customerId, which is why the evict matches the read"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong>
+        A <code>key</code> attribute always beats a <code>KeyGenerator</code>, which is why <code>14_5_iii</code> has
+        to spell out <code>key = "#customer.id"</code>. Left to the default generator,
+        <code>update(Customer customer)</code> would key on the <code>Customer</code> instance while
+        <code>find(long)</code> keyed on a <code>Long</code>; the eviction would then target an entry that does not
+        exist, the stale value would survive, and the code would still look correct. The middle branch is drawn for
+        completeness only — no module in this chapter uses the <code>keyGenerator</code> attribute. The interesting
+        leaf is <code>14_4_i</code>: <code>CustomKeyGenerator</code> implements
+        <code>org.springframework.cache.interceptor.KeyGenerator</code> and returns
+        <code>params[0] + "^" + params[1]</code>, and it is installed by
+        <code>CalculationConfiguration implements CachingConfigurer</code> overriding <code>keyGenerator()</code> as a
+        <code>@Bean</code>. Because that makes it the <em>context default</em>, every cache annotation in the container
+        uses it without naming it — and note that <code>@Cacheable("calculations")</code> in <code>14_4_i</code> is
+        character-identical to the one in <code>14_3_i</code> yet stores under a completely different key. That is the
+        operational hazard: add a second annotated service to this context and its key shape changes too, silently,
+        along with its hit rate. <code>CustomKeyGenerator</code> indexing <code>params[0]</code> and
+        <code>params[1]</code> blindly is also a latent break the moment the method signature changes.</p>
+      <div class="callout info">
+        <h4>Why <code>key = "#customer.id"</code> works on a record</h4>
+        <p><code>Customer</code> is <code>record Customer(long id, String name)</code>, so it exposes
+        <code>id()</code>, not <code>getId()</code>. Spring&nbsp;6's SpEL resolves the property through that
+        record-style accessor, which is what lets <code>#customer.id</code> and <code>#result.id</code> evaluate. On an
+        older Spring, or if you prefer the dependency spelled out, <code>#customer.id()</code> is the method-call form
+        of the same expression.</p>
+      </div>
+      <p class="path">Evidence: ch14/recipe_14_4_i/src/main/java/com/apress/spring6recipes/caching/CustomKeyGenerator.java,
+        ch14/recipe_14_4_i/…/config/CalculationConfiguration.java lines 19, 22, 34</p>
+    </section>
+
+    <section id="domain">
+      <span class="kicker">Types under cache</span>
+      <h2>Cached domain types</h2>
+      <p>One interface, three implementations across 14.5 to 14.7 — and the annotations sit on the
+        <em>implementation</em>, never on the interface. That placement is not cosmetic: in proxy mode Spring inspects
+        the target class's method.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Customer, CustomerRepository and the two calculation service lines</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Customer {
+        +long id
+        +String name
+    }
+    class CustomerRepository {
+        +find(customerId) Customer
+        +create(name) Customer
+        +update(customer) void
+        +remove(customerId) void
+    }
+    class MapBasedCustomerRepository {
+        -AtomicLong idGenerator
+        -ConcurrentHashMap customers
+        +find(customerId) Customer
+        +create(name) Customer
+        +update(customer) void
+        +remove(customerId) void
+    }
+    class JdbcCustomerRepository {
+        -JdbcTemplate jdbc
+        +find(customerId) Customer
+        +create(name) Customer
+        +update(customer) void
+        +remove(customerId) void
+    }
+    class CalculationService {
+        +heavyCalculation(base, power) BigDecimal
+    }
+    class PlainCalculationService {
+        +heavyCalculation(base, power) BigDecimal
+        -calculate(base, power) BigDecimal
+    }
+    class PlainCachingCalculationService {
+        -Cache cache
+        +heavyCalculation(base, power) BigDecimal
+    }
+    class Serializable
+    MapBasedCustomerRepository ..|> CustomerRepository : 14_5_i to v and 14_7_i
+    JdbcCustomerRepository ..|> CustomerRepository : 14_6_i, annotated Repository and Transactional
+    MapBasedCustomerRepository o-- Customer : cached value, and the map of record
+    JdbcCustomerRepository ..> Customer : mapped from a row of the customer table
+    PlainCalculationService ..|> CalculationService : 14_1_i, 14_3_i, 14_3_ii, 14_4_i
+    PlainCachingCalculationService ..|> CalculationService : 14_1_ii to iii, 14_2_i, 14_2_ii
+    Customer ..|> Serializable : declared only in 14_7_i
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the structure.</strong>
+        The load-bearing detail is hidden in one member line: <code>PlainCachingCalculationService</code>'s
+        <code>-Cache cache</code> field is a <em>different type</em> in the two recipe groups. In 14.1
+        <code>ii</code> and <code>iii</code> it is <code>com.github.benmanes.caffeine.cache.Cache</code>, the
+        provider's own class, so replacing Caffeine means editing the service. In 14.2 it is
+        <code>org.springframework.cache.Cache</code>
+        (<code>ch14/recipe_14_2_i/…/PlainCachingCalculationService.java</code>), and that is what lets the
+        <em>same</em> source file compile against <code>ConcurrentMapCacheManager</code> in <code>14_2_i</code> and
+        <code>CaffeineCacheManager</code> in <code>14_2_ii</code> — the abstraction earning its keep in one line. From
+        14.3 the field disappears entirely. One member that the diagram deliberately omits is
+        <code>calculate</code>: the 14.1 pair keep a private <code>calculate(base, power)</code> for the sleep-and-pow
+        work, whereas 14.2 inlines it into <code>heavyCalculation</code> (and <code>14_2_ii</code> even bypasses
+        <code>Utils.sleep</code> for a raw <code>Thread.sleep(500)</code> with the <code>InterruptedException</code>
+        swallowed). On the right, note that
+        <code>JdbcCustomerRepository</code> is the only implementation carrying class-level <code>@Repository</code> and
+        <code>@Transactional</code>, and that <code>MapBasedCustomerRepository</code> is reused verbatim by the Redis
+        recipe. So in <code>14_7_i</code> the system of record is a <code>ConcurrentHashMap</code> that dies with the
+        JVM while the <em>cache</em> is a network service that survives it — an inversion worth checking before you
+        copy the wiring into something real.</p>
+      <p class="path">Evidence: ch14/recipe_14_5_i/…/Customer.java, ch14/recipe_14_7_i/…/Customer.java (adds
+        implements Serializable), ch14/recipe_14_6_i/…/JdbcCustomerRepository.java lines 14-16</p>
+    </section>
+
+    <section id="tx">
+      <span class="kicker">Recipe 14.6</span>
+      <h2>Caching inside a transaction</h2>
+      <p><code>recipe_14_6_i</code> is the only module where cached data and a transaction share a method. Its
+        configuration does one thing no other recipe does — it refuses to publish the Caffeine manager directly:</p>
+      <pre><code>@Bean
+public CacheManager cacheManager() {
+    var caffeine = Caffeine.newBuilder()
+                    .maximumSize(1000)
+                    .expireAfterWrite(Duration.ofMinutes(5));
+    var cacheManager = new CaffeineCacheManager();
+    cacheManager.setCaffeine(caffeine);
+    return new TransactionAwareCacheManagerProxy(cacheManager);
+}</code></pre>
+      <p class="path">ch14/recipe_14_6_i/src/main/java/com/apress/spring6recipes/caching/config/CustomerConfiguration.java</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Cache writes deferred until the transaction commits</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant M as Main
+    participant P as proxy of CustomerRepository
+    participant TX as transaction interceptor
+    participant I as CacheInterceptor
+    participant J as JdbcCustomerRepository
+    participant TA as TransactionAwareCacheManagerProxy
+    participant D as TransactionAwareCacheDecorator
+    participant CAF as CaffeineCache named customers
+    participant DB as embedded H2, database customers
+
+    M->>P: remove with customerId 1
+    P->>TX: class level Transactional, begin transaction
+    TX->>I: caching advice runs around the target
+    I->>J: proceed to remove
+    J->>DB: DELETE FROM customer WHERE id
+    DB-->>J: affected row count
+    J-->>I: void returned
+    I->>TA: getCache customers
+    TA->>D: wrap the Caffeine cache
+    D->>D: evict is deferred, a TransactionSynchronization is registered
+    TX->>TX: commit
+    D->>CAF: afterCommit replays the evict
+    Note over D,CAF: on rollback the deferred evict is dropped, so cache and database stay consistent
+    TX-->>M: call returns
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong>
+        Two independent pieces of advice wrap this one bean: the transaction interceptor from
+        <code>@EnableTransactionManagement</code> and the caching interceptor from <code>@EnableCaching</code>. Both
+        default to the lowest precedence, so the order between them is not something the recipe may rely on — the
+        nesting in the diagram is one plausible order, not a guaranteed one, and that is precisely why the
+        <code>CacheManager</code> is <em>wrapped</em> rather than the advice reordered. Under
+        <code>TransactionAwareCacheManagerProxy</code>, every <code>Cache</code> the caching interceptor receives is a
+        transaction-aware decorator whose <code>put</code>, <code>evict</code> and <code>clear</code> are queued against
+        the active transaction and replayed only in <code>afterCommit</code>; outside a transaction they apply
+        immediately, and reads always go straight through. The consequence for <code>find</code>, which is annotated
+        <code>@Cacheable(value = "customers")</code> and inherits the class-level <code>@Transactional</code>: a
+        database read inside an uncommitted transaction does not warm the cache yet, so two <code>find</code> calls in
+        one transaction both hit H2. The other reason to care is what happens on the way back: without the decorator, a
+        rollback after a <code>put</code> would leave the cache holding a row the database does not have — wrong data
+        served fast — whereas an evict lost to a rollback is merely slow. Last, note that <code>find</code> here uses
+        <code>jdbc.queryForObject</code>, which <em>throws</em> <code>EmptyResultDataAccessException</code> for a
+        missing id instead of returning null, and this variant dropped the <code>unless</code> guard along with the
+        null-tolerant map. The map-backed recipes print <code>Get 'Unknown Customer' (result) : null</code>; this one
+        aborts on that same first StopWatch step.</p>
+      <div class="callout danger">
+        <h4>H2 is the database, not the cache</h4>
+        <p>It is tempting to file 14.6 as "the JDBC cache recipe". It is not. There is no JDBC-backed
+        <code>CacheManager</code> and no cache table; the store is still Caffeine. <code>spring-jdbc</code> and
+        <code>h2</code> are on the classpath because <code>JdbcCustomerRepository</code> reads and writes the
+        <code>customer</code> table created by <code>ch14/recipe_14_6_i/src/main/resources/schema.sql</code>, loaded via
+        <code>new EmbeddedDatabaseBuilder().setType(EmbeddedDatabaseType.H2).setName("customers").addScript("classpath:/schema.sql").build()</code>.
+        The recipe teaches caching <em>in front of</em> JDBC, and the transaction interaction that comes with it.</p>
+      </div>
+    </section>
+
+    <section id="weaving">
+      <span class="kicker">Recipe 14.3_ii</span>
+      <h2>Proxy mode versus AspectJ mode</h2>
+      <p><code>14_3_i</code> and <code>14_3_ii</code> have the same service, the same private <code>calculate</code>,
+        the same <code>@Cacheable("calculations")</code> and the same <code>CaffeineCacheManager</code>. Only the
+        configuration annotation differs — and with it, the thing that applies the advice.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Two ways to apply identical cache advice</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    src["PlainCalculationService with Cacheable on heavyCalculation"] --> mode{"mode attribute on EnableCaching"}
+    mode -- "PROXY, the default, 14_3_i" --> px["Container builds a JDK proxy implementing CalculationService"]
+    px --> lim1["Advice lives in the proxy, so the call must come in through a container obtained bean"]
+    lim1 --> lim2["A call from one method of the target into another annotated method is NOT intercepted"]
+    lim2 --> lim3["An instance built with new is not cached at all"]
+    mode -- "ASPECTJ with EnableLoadTimeWeaving, 14_3_ii" --> wv["AspectJ weaver rewrites PlainCalculationService bytecode at class load time"]
+    wv --> adv["Cache advice is inlined into the class, there is no separate proxy object"]
+    adv --> free1["Self invocation is intercepted"]
+    free1 --> free2["Instances built with new are intercepted too, once their class loader is woven"]
+    wv --> cost["Needs a javaagent, here aspectjweaver with spring-instrument on the module"]
+    px --> cost2["Needs no agent, but needs proxyTargetClass true when there is no interface to proxy"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong>
+        Concretely, <code>ch14/recipe_14_3_ii/…/config/CalculationConfiguration.java</code> carries
+        <code>@EnableLoadTimeWeaving</code> and <code>@EnableCaching(mode = AdviceMode.ASPECTJ)</code>, and
+        <code>ch14/build.gradle</code> gives that one module <code>spring-aspects</code>,
+        <code>spring-instrument</code>, <code>aspectjweaver</code> and <code>aspectjrt</code> — every other ch14 module
+        gets only <code>spring-context</code>, <code>spring-context-support</code> and <code>caffeine</code> from the
+        <code>subprojects</code> block. Both branches still resolve the <code>CacheManager</code> from the container, so
+        the <em>store</em> is identical; what changes is who holds the interception code. Be honest about the payoff
+        here: <code>Main</code> in both modules calls through <code>context.getBean(CalculationService.class)</code>,
+        and <code>calculate</code> is private and unannotated, so the two variants print the same five timings. The
+        ASPECTJ branch only earns its agent when you actually have self-invocation or non-bean instances, which is what
+        the right-hand column of this diagram is for. Practically: run <code>14_3_ii</code> without
+        <code>-javaagent</code> and you get no interception and no exception — five slow calls, and a misleading
+        conclusion that the cache is broken rather than unapplied.</p>
+    </section>
+
+    <section id="providers">
+      <span class="kicker">Configuration and infrastructure</span>
+      <h2>Providers, caches and eviction policy</h2>
+      <p>One build file decides the classpath for all fifteen modules, so <em>classpath presence</em> and
+        <em>provider in use</em> are different facts. <code>ch14/build.gradle</code> puts <code>caffeine</code> on every
+        module, then adds AspectJ only to <code>recipe_14_3_ii</code>, <code>spring-jdbc</code> plus <code>h2</code>
+        only to <code>recipe_14_6_i</code>, and <code>jedis</code> plus <code>spring-data-redis</code> only to
+        <code>recipe_14_7_i</code>. The provider actually used is whatever <code>cacheManager()</code> returns.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Process topology: what is inside the JVM and what is not</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph jvm["One JVM, an AnnotationConfigApplicationContext started by Main"]
+        app["Main, calls getBean then the method"]
+        px["Caching proxy, or woven advice in 14_3_ii"]
+        repo["MapBasedCustomerRepository or JdbcCustomerRepository, the system of record"]
+        cm["CacheManager bean"]
+        heap["Caffeine or ConcurrentMapCache, ordinary object references on the heap"]
+        dec["TransactionAwareCacheDecorator, 14_6_i only"]
+        h2[("embedded H2, database named customers, 14_6_i only")]
+        app -- "method call" --> px
+        px -- "intercept, consult" --> cm
+        px -- "only on a miss" --> repo
+        cm -- "getCache name" --> heap
+        cm -- "wraps" --> dec
+        dec -- "deferred writes" --> heap
+        repo -- "JdbcTemplate" --> h2
+    end
+    subgraph ext["Separate process, must already be running"]
+        redis[("Redis, localhost 6379")]
+    end
+    cm -- "only in 14_7_i, RedisCacheManager create over JedisConnectionFactory" --> redis
+    redis -- "JDK serialized Customer, and the reason Customer implements Serializable there" --> px
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the topology.</strong>
+        Everything inside the subgraph boundary is in-heap: Caffeine and <code>ConcurrentMapCache</code> hold object
+        <em>references</em>, which is why 14.5 can cache a <code>Customer</code> record with no serialization
+        consideration at all and why restarting <code>Main</code> empties the cache completely. The single crossing is
+        <code>14_7_i</code>: <code>RedisCacheManager.create(connectionFactory)</code> over a bare
+        <code>new JedisConnectionFactory()</code>, so host and port are the Jedis defaults
+        (<code>localhost:6379</code>) — nothing is configured, nothing is externalised, no property file exists in the
+        module. That is the one module that <em>requires</em> a running external service, and it is also why
+        <code>ch14/recipe_14_7_i/…/Customer.java</code> uniquely declares <code>implements Serializable</code>: the
+        cached value must be JDK-serialised onto the wire, so a hit still costs a socket round trip plus
+        deserialisation. Read the edge back into <code>px</code> as the durability inversion: entries outlive the
+        process, which turns 14.5's "the cache forgets" behaviour into 14.7's "the cache remembers something that is no
+        longer true". The H2 cylinder sits <em>inside</em> the boundary on purpose —
+        <code>EmbeddedDatabaseBuilder</code> starts a private in-memory database per process, so 14.6 needs no server
+        either.</p>
+
+      <h3>Recipe to provider matrix</h3>
+      <p>Cache names, key expressions and settings below are copied from the annotation strings and builder calls in
+        the source. The last column combines cache-level expiry with annotation-level eviction, since both apply.</p>
+      <table>
+        <thead><tr>
+          <th>Recipe</th><th>Module</th><th>Provider (confirmed from source)</th><th>Cache name</th>
+          <th>Key expression</th><th>TTL and eviction</th>
+        </tr></thead>
+        <tbody>
+          <tr><td class="num">14.1</td><td><code>recipe_14_1_i</code></td>
+            <td><strong>none</strong> — no cache of any kind</td><td>&mdash;</td><td>&mdash;</td>
+            <td>&mdash; (the baseline; 500&nbsp;ms on every call)</td></tr>
+          <tr><td class="num">14.1</td><td><code>recipe_14_1_ii</code></td>
+            <td><strong>Caffeine</strong>, raw <code>com.github.benmanes.caffeine.cache.Cache</code> built in
+              <code>Main</code></td>
+            <td>&mdash; (no named caches; Spring's abstraction is absent)</td>
+            <td><code>base + "^" + power</code>, hand written</td>
+            <td><code>maximumSize(1000)</code>, <code>expireAfterWrite(Duration.ofMinutes(5))</code>; no explicit
+              evict</td></tr>
+          <tr><td class="num">14.1</td><td><code>recipe_14_1_iii</code></td>
+            <td><strong>Caffeine</strong>, same builder, now the <code>calculationsCache()</code> <code>@Bean</code></td>
+            <td>&mdash;</td><td><code>base + "^" + power</code>, hand written</td>
+            <td>identical: 1000 entries, 5 minute write expiry</td></tr>
+          <tr><td class="num">14.2</td><td><code>recipe_14_2_i</code></td>
+            <td><strong>ConcurrentMap</strong> — <code>new ConcurrentMapCacheManager()</code></td>
+            <td><code>"calculations"</code>, obtained with <code>cacheManager.getCache("calculations")</code></td>
+            <td><code>base + "^" + power</code>, hand written</td>
+            <td><strong>no TTL and no size limit</strong>; the write is <code>putIfAbsent</code>, so a concurrent value
+              is not overwritten; caches are created on demand</td></tr>
+          <tr><td class="num">14.2</td><td><code>recipe_14_2_ii</code></td>
+            <td><strong>Caffeine</strong> — <code>CaffeineCacheManager</code> with <code>setCaffeine(builder)</code></td>
+            <td><code>"calculations"</code></td><td><code>base + "^" + power</code>, hand written</td>
+            <td>1000 entries, 5 minute write expiry; the write is a plain <code>put</code>, last writer wins</td></tr>
+          <tr><td class="num">14.3</td><td><code>recipe_14_3_i</code></td>
+            <td><strong>Caffeine</strong> — <code>CaffeineCacheManager</code></td>
+            <td><code>"calculations"</code>, from <code>@Cacheable("calculations")</code></td>
+            <td>default <code>SimpleKeyGenerator</code>, a <code>SimpleKey</code> of <code>base</code> and
+              <code>power</code></td>
+            <td>1000 entries, 5 minute write expiry; no evict annotation</td></tr>
+          <tr><td class="num">14.3</td><td><code>recipe_14_3_ii</code></td>
+            <td><strong>Caffeine</strong>, identical manager; AspectJ load-time weaving instead of a proxy</td>
+            <td><code>"calculations"</code></td><td>default <code>SimpleKeyGenerator</code></td>
+            <td>1000 entries, 5 minute write expiry</td></tr>
+          <tr><td class="num">14.4</td><td><code>recipe_14_4_i</code></td>
+            <td><strong>Caffeine</strong> — <code>CaffeineCacheManager</code></td><td><code>"calculations"</code></td>
+            <td><code>CustomKeyGenerator</code>: <code>params[0] + "^" + params[1]</code>, installed as the default via
+              <code>CachingConfigurer.keyGenerator()</code></td>
+            <td>1000 entries, 5 minute write expiry</td></tr>
+          <tr><td class="num">14.5</td><td><code>recipe_14_5_i</code> to <code>_v</code></td>
+            <td><strong>Caffeine</strong> — <code>CaffeineCacheManager</code> in all five</td>
+            <td><code>"customers"</code></td>
+            <td>default <code>SimpleKeyGenerator</code> for <code>find</code> and <code>remove</code> (the single
+              <code>long</code> parameter becomes the key); <code>#customer.id</code> and <code>#result.id</code> from
+              <code>iii</code> and <code>iv</code> onward</td>
+            <td>1000 entries, 5 minute write expiry; eviction purely by annotation, added one method per variant</td></tr>
+          <tr><td class="num">14.6</td><td><code>recipe_14_6_i</code></td>
+            <td><strong>Caffeine</strong>, wrapped in <code>TransactionAwareCacheManagerProxy</code>; H2 is the system
+              of record, not the cache</td>
+            <td><code>"customers"</code></td>
+            <td><code>#customer.id</code> on <code>update</code>, <code>#result.id</code> on <code>create</code>,
+              default for <code>find</code> and <code>remove</code></td>
+            <td>1000 entries, 5 minute write expiry; every write and evict additionally deferred to transaction
+              commit</td></tr>
+          <tr><td class="num">14.7</td><td><code>recipe_14_7_i</code></td>
+            <td><strong>Redis</strong> — <code>RedisCacheManager.create(connectionFactory)</code> over
+              <code>JedisConnectionFactory</code>; Jedis 4.3.1 with spring-data-bom 2022.0.0</td>
+            <td><code>"customers"</code></td>
+            <td><code>unless = "#result == null"</code> on <code>find</code>, <code>#result.id</code> on
+              <code>create</code>, <code>#customer.id</code> on <code>update</code>, default on <code>remove</code></td>
+            <td><strong>none configured.</strong> The manager is created with no
+              <code>RedisCacheConfiguration</code>, so the recipe sets no entry TTL and no size cap; expiry is left
+              entirely to the Redis server's own maxmemory policy. This is the only module in the chapter with no
+              explicit expiry at all</td></tr>
+          <tr><td class="num">&mdash;</td>
+            <td colspan="5"><strong>Checked and not present:</strong> Hazelcast
+              (<code>HazelcastCacheManager</code>), Ehcache&nbsp;3, GemFire or Apache Geode, a JSR-107
+              <code>JCacheCacheManager</code>, Infinispan, Memcached, Redis&nbsp;<em>Lettuce</em>, and any
+              <code>JdbcCacheManager</code> or Ehcache <code>cache.xml</code> under
+              <code>ch14/*/src/main/resources</code> (only <code>14_6_i</code> has resources at all, and it is
+              <code>schema.sql</code>). The platform BOM does constrain <code>caffeine:jcache</code> and
+              <code>javax.cache:cache-api</code>, but no ch14 module depends on either.</td></tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        <h4>Two asymmetries to carry away</h4>
+        <p><strong>Expiry.</strong> Every Caffeine-based recipe sets
+        <code>expireAfterWrite(Duration.ofMinutes(5))</code> and <code>maximumSize(1000)</code> except
+        <code>14_2_i</code>, whose <code>ConcurrentMapCacheManager</code> has neither: that module's cache grows
+        unbounded and lives until the JVM exits, so a missed <code>@CacheEvict</code> there is permanent rather than
+        self-healing after five minutes. <strong>Shared state.</strong> <code>14_7_i</code> sets no TTL either, and the
+        store is out of process and persistent, so the <code>14_5_i</code>-style "only <code>remove</code> evicts" bug
+        is a classroom demonstration in 14.5 and a production incident in 14.7 — it survives a redeploy.</p>
+      </div>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Practice</span>
+      <h2>Building and running</h2>
+      <p>Chapter 14 modules are plain <code>main</code> methods, not web applications, and none of them applies Gradle's
+        <code>application</code> plugin. <code>ch14/build.gradle</code> applies the shadow plugin to every subproject,
+        sets <code>Main-Class</code> to <code>com.apress.spring6recipes.caching.Main</code> (the same fully qualified
+        name in all fifteen modules) and makes <code>build</code> finalise with <code>shadowJar</code>. So build, then
+        run the fat jar from that module's <code>build/libs</code>:</p>
+      <pre><code># from the repository root
+./gradlew :ch14:recipe_14_5_iv:build
+
+java --enable-preview -cp "ch14/recipe_14_5_iv/build/libs/*" com.apress.spring6recipes.caching.Main</code></pre>
+      <p><code>--enable-preview</code> is not decoration. The root <code>build.gradle</code> passes it to every
+        <code>JavaCompile</code> and pins <code>toolchain { languageVersion = JavaLanguageVersion.of(19) }</code>, and
+        classes compiled with preview features must be run on the same major release with the flag. Expect one slow line
+        and four fast ones in 14.1 to 14.4, and a <code>StopWatch.prettyPrint()</code> table in 14.5 to 14.7.</p>
+      <h3>Per-module prerequisites</h3>
+      <table>
+        <thead><tr><th>Module(s)</th><th>Extra requirement</th><th>How to tell it worked</th></tr></thead>
+        <tbody>
+          <tr><td><code>recipe_14_1_i</code> … <code>recipe_14_5_v</code></td>
+            <td>None. <code>caffeine</code> and <code>spring-context-support</code> come from the
+              <code>subprojects</code> block in <code>ch14/build.gradle</code>; the H2, Jedis and AspectJ jars are not
+              wanted.</td>
+            <td><code>14_1_i</code> prints five lines of roughly 500&nbsp;ms; <code>14_1_ii</code> onward print one slow
+              line and four near-zero ones.</td></tr>
+          <tr><td><code>recipe_14_3_ii</code></td>
+            <td>Load-time weaving: run with <code>-javaagent</code> pointing at
+              <code>aspectjweaver-1.9.19.jar</code> (the module also pulls <code>spring-instrument</code>). No Gradle
+              task in the repository sets this, so it has to be an IDE run configuration or a manual
+              <code>java</code> command.</td>
+            <td>With the agent, calls 2 to 5 cost about 0&nbsp;ms. Without it, all five cost 500&nbsp;ms and the program
+              still exits cleanly — the failure is silent.</td></tr>
+          <tr><td><code>recipe_14_6_i</code></td>
+            <td>No external database. <code>EmbeddedDatabaseBuilder</code> starts a private in-memory H2 named
+              <code>customers</code> and executes <code>schema.sql</code> from
+              <code>src/main/resources</code>.</td>
+            <td>Create, update and remove behave as in 14.5&nbsp;<code>iv</code>; the very first
+              <code>find(System.currentTimeMillis())</code> step throws
+              <code>EmptyResultDataAccessException</code> out of <code>queryForObject</code>, since no such row
+              exists.</td></tr>
+          <tr><td><code>recipe_14_7_i</code></td>
+            <td><strong>Requires a reachable Redis.</strong> <code>new JedisConnectionFactory()</code> hard-defaults to
+              <code>localhost:6379</code> and nothing in the chapter configures or starts one — there is no Dockerfile,
+              no <code>palantir.docker</code> block and no docker-run task in <code>ch14/build.gradle</code>, so bring
+              your own, e.g. <code>docker run --rm -p 6379:6379 redis:7</code>. The connection is opened lazily by
+              <code>RedisCacheManager</code>, so an unreachable server surfaces on the first cache operation rather
+              than at context startup.</td>
+            <td><code>redis-cli KEYS "*"</code> shows the <code>customers</code> entries after a run, and they are still
+              there when you restart <code>Main</code> — the visible proof that this cache is not in the JVM.</td></tr>
+        </tbody>
+      </table>
+      <h3>Comparing the 14.5 variants in one sitting</h3>
+      <p>The five 14.5 modules share an identical <code>Main</code>, which makes them a hand-run regression suite. The
+        diagnostic lines are <code>Get 'Updated Customer 1'</code> and <code>Get 'Deleted Customer 1'</code>:</p>
+      <pre><code>for r in 14_5_i 14_5_ii 14_5_iii 14_5_iv 14_5_v; do
+  ./gradlew ":ch14:recipe_${r}:build" -q
+  java --enable-preview -cp "ch14/recipe_${r}/build/libs/*" com.apress.spring6recipes.caching.Main
+done</code></pre>
+      <p>In <code>14_5_i</code> the updated-customer lines print the <em>old</em> name (a stale hit at near 0&nbsp;ms)
+        and the deleted lines keep returning the customer. In <code>14_5_ii</code> only the deleted lines move, to a
+        genuine miss. In <code>14_5_iii</code> the updated lines become a real miss too. In <code>14_5_iv</code> the
+        unknown lookup stops being cached and the post-create lookup is a hit instead of a 500&nbsp;ms miss.
+        <code>14_5_v</code> prints the same thing as <code>iv</code>, because it is the same thing.</p>
+      <div class="callout info">
+        <h4>Build notes</h4>
+        <p>The root <code>gradle.properties</code> pins <code>org.gradle.java.home</code> to a JDK&nbsp;17 path on this
+        machine while the toolchain asks for 19; if a <code>:ch14:…</code> compile task cannot find a 19 compiler,
+        install a matching JDK or drop that line locally. Module coordinates come from the
+        <code>spring-6-recipes-dependencies</code> platform: Spring Framework 6.0.3, Caffeine 3.1.2, Jedis 4.3.1,
+        H2 2.1.214, AspectJ 1.9.19, project version <code>6.0.0-SNAPSHOT</code> — so the shadow jar is
+        <code>recipe_14_x_y-6.0.0-SNAPSHOT-all.jar</code>, which is why the classpath wildcard form above is the
+        version-proof way to run it.</p>
+      </div>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch14/</code> &mdash; 15 caching recipes, three confirmed cache providers &mdash;
+  <a href="../ch13/index.html">&larr; Chapter 13 — Spring Testing</a> &middot;
+  <a href="../index.html">All chapters</a>
+</footer>
+</body>
+</html>

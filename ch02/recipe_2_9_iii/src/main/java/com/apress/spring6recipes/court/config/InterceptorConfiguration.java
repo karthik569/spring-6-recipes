@@ -23,6 +23,6 @@ public class InterceptorConfiguration implements WebMvcConfigurer {
 
 	@Bean
 	public ExtensionInterceptor summaryReportInterceptor() {
-		return new ExtensionInterceptor(cnm);
+		return new ExtensionInterceptor();
 	}
 }

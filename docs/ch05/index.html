@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 5 — Spring Security — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 5</div>
+  <h1>Chapter 5 — Spring Security</h1>
+  <p class="lede">The chapter takes one application — a to-do board — and adds security to it in
+    increments: first the bare <code>@EnableWebSecurity</code> defaults, then the authentication entry
+    point, then where the users actually come from, then how access rules are expressed, and finally
+    per-object ACLs and the reactive equivalent. Every servlet recipe is a <code>war</code> module that
+    depends on <code>ch05/recipe_5_shared</code> and changes nothing except
+    <code>com.apress.spring6recipes.board.security.TodoSecurityConfig</code>, so the diffs between
+    recipes are exactly the diffs between configuration calls. The one thing to hold in your head is
+    that a Spring Security configuration is not a set of rules — it is a <em>factory for a servlet
+    filter chain</em>, and the rules are read by a single filter at the end of it.</p>
+  <div class="chip-row">
+    <span class="chip">26 modules: 25 recipes + recipe_5_shared</span>
+    <span class="chip">Spring Security 6.0.1 / Spring Framework 6.0.3</span>
+    <span class="chip">SecurityFilterChain, HttpSecurity, UserDetailsManager, AuthorizationManager</span>
+    <span class="chip">./gradlew :ch05:recipe_5_3_iv:build</span>
+    <span class="chip">H2 in-memory, Tomcat 10.0.27 via Docker, port 8080</span>
+    <span class="chip">5-3-v needs an OpenDS LDAP container</span>
+    <span class="chip">5-5-iii and 5-6-i do not compile on 6.0</span>
+  </div>
+
+  <nav class="pager">
+    <a href="../ch04/index.html">&larr; Chapter 4 — Spring WebFlux</a>
+    <a href="../ch06/index.html">Chapter 6 — Spring Data Access &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc"><h2>On this page</h2><ol>
+    <li><a href="#overview">What the chapter builds</a></li>
+    <li><a href="#bootstrap">How security enters a servlet application</a></li>
+    <li><a href="#chain">The security filter chain</a></li>
+    <li><a href="#login">Authenticating a submission</a></li>
+    <li><a href="#principals">Principals, authorities, roles</a></li>
+    <li><a href="#stores">Where the users come from</a></li>
+    <li><a href="#authorise">The authorisation decision</a></li>
+    <li><a href="#method">Method security</a></li>
+    <li><a href="#acl">Per-object ACLs</a></li>
+    <li><a href="#reactive">Reactive security</a></li>
+    <li><a href="#running">Building and running the recipes</a></li>
+  </ol></aside>
+  <article>
+
+    <section id="overview">
+      <h2>What the chapter builds</h2>
+      <p>The domain object is <code>com.apress.spring6recipes.board.Todo</code> — <code>id</code>,
+        <code>owner</code>, <code>description</code>, <code>completed</code> — persisted by
+      <span class="path">ch05/recipe_5_shared/src/main/java/com/apress/spring6recipes/board/JdbcTodoRepository.java</span>
+      against an embedded H2 database named <code>todos</code>. <code>TodoController</code> is mapped to
+      <code>/todos</code> and renders Thymeleaf templates that also live in the shared module, including
+      <span class="path">templates/login.html</span> and <span class="path">templates/logout-success.html</span>.
+      Because the shared module is a <code>java-library</code>, its templates and its
+      <code>schema.sql</code>/<code>data.sql</code> land on the WAR classpath and are picked up by
+      <code>TodoWebConfig</code> via the <code>classpath:/templates/</code> prefix.</p>
+      <p>Nothing about the application changes between recipes. What changes is one class per module:
+      <span class="path">…/board/security/TodoSecurityConfig.java</span>. That makes the chapter
+      unusually diagrammable — each recipe is a distinct shape of the filter chain, not a distinct
+      program. Four clusters emerge from the source:</p>
+      <ul>
+        <li><strong>5-1 to 5-3</strong> — the chain and its entry points: defaults, HTTP Basic versus
+          form login, a custom login page, logout, and the user store (in-memory, JDBC, custom SQL,
+          BCrypt, LDAP).</li>
+        <li><strong>5-4 to 5-5</strong> — how access rules are expressed: custom
+          <code>AuthorizationManager</code>s, SpEL strings, bean references in SpEL, and method-level
+          <code>@Secured</code>/<code>@PreAuthorize</code>/<code>@PostFilter</code>.</li>
+        <li><strong>5-6 to 5-7</strong> — a leftover Spring Security 5 configuration style, and ACLs.</li>
+        <li><strong>5-8</strong> — the same ideas on <code>ServerHttpSecurity</code> with WebFlux and R2DBC.</li>
+      </ul>
+
+      <h3>Module Map</h3>
+      <table>
+        <caption class="num">All 26 modules under <code>ch05/</code>. There is no <code>recipe_5_1_i</code>
+          directory in the repository; recipe numbering starts at <em>ii</em>.</caption>
+        <thead><tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>5-1</td>
+            <td><code>recipe_5_1_ii</code>, <code>recipe_5_1_iii</code>, <code>recipe_5_1_iv</code></td>
+            <td>The chain with nothing configured (ii), then URL rules plus form login and a disabled CSRF
+              filter (iii), then CSRF re-enabled on a cookie repository (iv).</td>
+            <td><code>TodoSecurityConfig</code>, <code>TodoSecurityInitializer</code>,
+              <code>InMemoryUserDetailsManager</code>, <code>CookieCsrfTokenRepository</code></td>
+          </tr>
+          <tr>
+            <td>5-2</td>
+            <td><code>recipe_5_2_i</code>, <code>recipe_5_2_ii</code>, <code>recipe_5_2_iii</code>,
+              <code>recipe_5_2_iv</code></td>
+            <td>Choosing the authentication entry point: HTTP Basic only, form login only, form login on a
+              custom <code>/login</code> page, plus success and failure URLs.</td>
+            <td><code>TodoSecurityConfig</code>, <code>WebMvcConfigurer.addViewControllers</code>,
+              <code>FormLoginConfigurer</code></td>
+          </tr>
+          <tr>
+            <td>5-3</td>
+            <td><code>recipe_5_3_i</code> … <code>recipe_5_3_v</code></td>
+            <td>Logout configuration and the user store: in-memory with e-mail principals and a disabled
+              account (i), <code>JdbcUserDetailsManager</code> (ii), custom <code>member</code>/<code>member_role</code>
+              SQL (iii), a <code>BCryptPasswordEncoder</code> bean (iv), LDAP bind authentication (v).</td>
+            <td><code>LogoutConfigurer</code>, <code>JdbcUserDetailsManager</code>,
+              <code>BCryptPasswordEncoder</code>, <code>DefaultSpringSecurityContextSource</code>,
+              <code>LdapBindAuthenticationManagerFactory</code></td>
+          </tr>
+          <tr>
+            <td>5-4</td>
+            <td><code>recipe_5_4_i</code>, <code>recipe_5_4_ii</code>, <code>recipe_5_4_iii</code></td>
+            <td>Three ways to express "ADMIN <em>and</em> only from localhost": a composed
+              <code>AuthorizationManager</code>, a SpEL string, and a SpEL bean reference.</td>
+            <td><code>LocalhostAuthorizationManager</code>, <code>AuthorizationManagers.allOf</code>,
+              <code>WebExpressionAuthorizationManager</code>, <code>AccessChecker</code>,
+              <code>ExtendedWebSecurityExpressionRoot</code></td>
+          </tr>
+          <tr>
+            <td>5-5</td>
+            <td><code>recipe_5_5_i</code>, <code>recipe_5_5_ii</code>, <code>recipe_5_5_iii</code></td>
+            <td>Method security on <code>TodoServiceImpl</code>: <code>@Secured</code>, then
+              <code>@PreAuthorize</code>/<code>@PostAuthorize</code>, then <code>@PostFilter</code> on the
+              returned list.</td>
+            <td><code>TodoServiceImpl</code>, <code>@EnableMethodSecurity</code>,
+              <code>SecuredAuthorizationManager</code>, <code>PreAuthorizeAuthorizationManager</code>,
+              <code>PostFilterAuthorizationMethodInterceptor</code></td>
+          </tr>
+          <tr>
+            <td>5-6</td>
+            <td><code>recipe_5_6_i</code></td>
+            <td>A pre-6.0 configuration: <code>WebSecurityConfigurerAdapter</code> with
+              <code>authorizeRequests()</code>, <code>antMatchers()</code> and
+              <code>auth.jdbcAuthentication()</code>. Byte-for-byte identical to 5-5-iii's config except
+              that it does not ship its own <code>TodoServiceImpl</code>.</td>
+            <td><code>TodoSecurityConfig</code>, <code>TodoSecurityInitializer</code>,
+              <code>BCryptPasswordEncoder</code></td>
+          </tr>
+          <tr>
+            <td>5-7</td>
+            <td><code>recipe_5_7_i</code></td>
+            <td>Spring Security ACL: mutable per-object permissions in <code>ACL_*</code> tables, cached,
+              and consulted from <code>hasPermission(...)</code> in method annotations.</td>
+            <td><code>TodoAclConfig</code>, <code>JdbcMutableAclService</code>,
+              <code>BasicLookupStrategy</code>, <code>SpringCacheBasedAclCache</code>,
+              <code>AclPermissionEvaluator</code>, <code>AclEntryVoter</code></td>
+          </tr>
+          <tr>
+            <td>5-8</td>
+            <td><code>recipe_5_8_i</code> … <code>recipe_5_8_v</code></td>
+            <td>Reactive security on <code>ServerHttpSecurity</code>: defaults (i), HTTP Basic (ii), form
+              login (iii), a custom login page with CSRF disabled (iv), and authorization rules including a
+              hand-written reactive decision function (v).</td>
+            <td><code>SecurityConfiguration</code>, <code>@EnableWebFluxSecurity</code>,
+              <code>MapReactiveUserDetailsService</code>, <code>SecurityWebFilterChain</code>,
+              <code>SecurityControllerAdvice</code></td>
+          </tr>
+          <tr>
+            <td>shared</td>
+            <td><code>recipe_5_shared</code></td>
+            <td>The unsecured application that every non-5-8 module depends on: repository, service,
+              controller, MVC/Thymeleaf/H2 configuration, templates and DDL.</td>
+            <td><code>Todo</code>, <code>TodoRepository</code>, <code>JdbcTodoRepository</code>,
+              <code>TodoService</code>, <code>TodoServiceImpl</code>, <code>TodoController</code>,
+              <code>TodoWebConfig</code>, <code>TodoWebInitializer</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout danger"><h4>Three things the source does not contain</h4>
+        <p>No recipe in <code>ch05/</code> configures remember-me, OAuth2/OpenID Connect or JWT resource
+          server support, or a custom <code>jakarta.servlet.Filter</code>/<code>AuthenticationEntryPoint</code>.
+          Grepping the chapter for <code>rememberMe</code>, <code>oauth2</code>, <code>jwt</code>,
+          <code>OncePerRequestFilter</code> and <code>addFilterBefore</code> returns nothing but the
+          <code>logoutSuccessUrl</code> hits. Those topics belong to other chapters; the diagrams below
+          describe only what is actually wired here.</p>
+        <p>Two more source-level gaps worth knowing before you run anything: the custom JDBC queries in
+          5-3-iii onwards read <code>member</code> and <code>member_role</code>, and no <code>schema.sql</code>
+          anywhere in <code>ch05/</code> creates those tables — only <code>USERS</code>, <code>AUTHORITIES</code>
+          and the <code>ACL_*</code> set. And <code>recipe_5_5_iii</code> and <code>recipe_5_6_i</code>
+          subclass <code>WebSecurityConfigurerAdapter</code> and call <code>antMatchers(...)</code>, both of
+          which were removed from <code>spring-security-config:6.0.1</code> (verified against the jar:
+          <code>HttpSecurity.authorizeRequests()</code> survives but
+          <code>AbstractRequestMatcherRegistry</code> now only offers <code>requestMatchers</code>), so those
+          two modules do not compile in this repository as pinned.</p>
+      </div>
+    </section>
+
+    <section id="bootstrap">
+      <h2>How security enters a servlet application</h2>
+      <p>There is no <code>web.xml</code> in this chapter. Two <code>WebApplicationInitializer</code>
+        subclasses, both in <code>recipe_5_shared</code> and each recipe respectively, do the registering at
+        container startup, and the order they register in is the order requests pass through them.
+        <code>TodoWebInitializer</code> extends
+        <code>AbstractAnnotationConfigDispatcherServletInitializer</code> and maps
+        <code>TodoWebConfig</code> to the <code>DispatcherServlet</code> with
+        <code>getRootConfigClasses()</code> returning <code>null</code> — so there is no root web
+        application context at all. <code>TodoSecurityInitializer</code> extends
+        <code>AbstractSecurityWebApplicationInitializer</code> and creates its own
+        <code>AnnotationConfigWebApplicationContext</code> registering <code>WebSecurityConfiguration</code>.</p>
+      <p>The interesting detail is the difference between the recipes here. All of 5-1 to 5-5-ii and 5-7 use
+        the no-argument form of <code>AbstractSecurityWebApplicationInitializer</code>, and rely on
+        <code>TodoSecurityConfig</code> being reachable as a <code>@Configuration</code> — which it is, because
+        it sits in <code>com.apress.spring6recipes.board.security</code> and
+        <code>TodoWebConfig</code> declares <code>@ComponentScan("com.apress.spring6recipes.board")</code>.
+        Only <code>recipe_5_5_iii</code> and <code>recipe_5_6_i</code> pass it explicitly, with
+        <code>super(TodoSecurityConfig.class)</code> in the initializer's constructor.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Startup wiring: two initializers, one filter, one bean</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    SCI["SpringServletContainerInitializer, from spring-web"]
+    WSI["TodoWebInitializer, shared module"]
+    SSI["TodoSecurityInitializer, per recipe"]
+    DSR["DispatcherServletRegistrationBean, mapping slash"]
+    HHF["HiddenHttpMethodFilter, from getServletFilters"]
+    DFP["DelegatingFilterProxy named springSecurityFilterChain, mapping every URL"]
+    CTX["AnnotationConfigWebApplicationContext with WebSecurityConfiguration"]
+    FCP["FilterChainProxy, the SecurityFilterChain beans"]
+    DISP["DispatcherServlet, handler mapping to TodoController"]
+    SCI -->|"discovers WebApplicationInitializer"| WSI
+    SCI -->|"discovers WebApplicationInitializer"| SSI
+    WSI --> DSR
+    WSI --> HHF
+    DSR --> HHF
+    HHF --> DISP
+    SSI --> DFP
+    SSI --> CTX
+    CTX -->|"builds the bean named springSecurityFilterChain"| FCP
+    DFP -->|"looks the bean up by name"| FCP
+    FCP -->|"chain.doFilter once the chain agrees"| DISP
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the wiring.</strong> <code>SpringServletContainerInitializer</code>
+        (contributed by <code>spring-web</code>) finds both initializers on the WAR classpath. The security
+        one calls <code>onStartup</code>, which registers a <code>DelegatingFilterProxy</code> under the
+        literal name <code>springSecurityFilterChain</code> and stores the context it created under a
+        ServletContext attribute — those two strings are the only hard-coded facts in
+        <code>AbstractSecurityWebApplicationInitializer</code>, and the proxy resolves the real
+        <code>FilterChainProxy</code> lazily by bean name. The web one registers
+        <code>DispatcherServlet</code> plus the servlet filters from
+        <code>getServletFilters()</code>, which in this chapter is exactly
+        <code>HiddenHttpMethodFilter</code>. <code>TodoWebConfig</code> then contributes
+        <code>@EnableWebMvc</code>, <code>@EnableTransactionManagement</code>, the Thymeleaf view resolver,
+        the embedded <code>DataSource</code> and a <code>DataSourceTransactionManager</code>. One consequence
+        worth holding on to: <code>HiddenHttpMethodFilter</code> rewrites <code>POST</code> plus
+        <code>_method=DELETE</code> into a real <code>DELETE</code> request, and it runs <em>inside</em> the
+        servlet registration, while the security proxy is registered against the context. Since
+        <code>AuthorizationFilter</code> only ever sees the method it is handed, the relative order of these
+        two registrations decides whether <code>requestMatchers(HttpMethod.DELETE, "/todos/*")</code> can
+        match the deletes the templates actually emit. Neither initializer declares an
+        <code>@Order</code>, so do not assume it.</p>
+      <p><code>@EnableWebSecurity</code> is what turns the plain <code>@Configuration</code> into the
+        bootstrap. It imports <code>WebSecurityConfiguration</code> (the <code>springSecurityFilterChain</code>
+        bean itself), <code>HttpSecurityConfiguration</code> (the request-scoped <code>HttpSecurity</code>
+        prototype the recipes' <code>securityFilterChain(HttpSecurity)</code> method receives),
+        <code>AuthenticationConfiguration</code>, and — via <code>SpringWebMvcImportSelector</code>, only when
+        <code>DispatcherServlet</code> is on the classpath — <code>WebMvcSecurityConfiguration</code>. That
+        last one is why <code>&lt;form th:action&gt;</code> in the shared templates silently acquires a hidden
+        <code>_csrf</code> input: it registers a <code>RequestDataValueProcessor</code>, plus the argument
+        resolvers behind <code>@AuthenticationPrincipal</code>.</p>
+    </section>
+
+    <section id="chain">
+      <h2>The security filter chain</h2>
+      <p>This is the chapter's defining structure. <code>HttpSecurity</code> is a builder whose output is a
+        <code>java.util.List&lt;jakarta.servlet.Filter&gt;</code>; the order is not the order you write the DSL
+        calls but a fixed table in <code>FilterOrderRegistration</code>. The numbers below are read out of
+        <code>spring-security-config-6.0.1</code> itself, and the presence of each filter is traced to the
+        DSL call in the recipes — <code>httpSecurity()</code> applies
+        <code>csrf</code>, <code>logout</code>, <code>exceptionHandling</code>, <code>requestCache</code>,
+        <code>securityContext</code>, <code>servletApi</code>, <code>sessionManagement</code>,
+        <code>headers</code>, <code>anonymous</code> and <code>DefaultLoginPageConfigurer</code> without being
+        asked, which is why <code>recipe_5_1_ii</code>'s empty class is not "no security" but "the whole chain
+        with every URL protected".</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">FilterChainProxy for the form-login recipes, in FilterOrderRegistration order</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    IN["request handed to FilterChainProxy by DelegatingFilterProxy"]
+    A["100 DisableEncodeUrlFilter, added by SessionManagementConfigurer"]
+    B["500 WebAsyncManagerIntegrationFilter, applied by default"]
+    C["600 SecurityContextHolderFilter, from securityContext, loads the session context"]
+    D["800 HeaderWriterFilter, from headers"]
+    E["1000 CsrfFilter, from csrf, absent in 5-1-iii where csrf is disabled"]
+    F["1100 LogoutFilter, from logout, POST to /logout"]
+    G["1900 UsernamePasswordAuthenticationFilter, from formLogin"]
+    GS["2600 BasicAuthenticationFilter, from httpBasic, the 5-2-i alternative"]
+    H["2100 DefaultLoginPageGeneratingFilter, from DefaultLoginPageConfigurer"]
+    I["2200 DefaultLogoutPageGeneratingFilter"]
+    J["2700 RequestCacheAwareFilter, replays the saved request"]
+    K["2800 SecurityContextHolderAwareRequestFilter, from servletApi"]
+    L["3100 AnonymousAuthenticationFilter, from anonymous"]
+    M["3300 SessionManagementFilter, from sessionManagement"]
+    N["3400 ExceptionTranslationFilter, from exceptionHandling"]
+    O["3600 AuthorizationFilter, from authorizeHttpRequests"]
+    OUT["DispatcherServlet"]
+    EP["LoginUrlAuthenticationEntryPoint, 302 to /login"]
+    ADH["AccessDeniedHandlerImpl, 403"]
+    IN --> A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K --> L --> M --> N --> O --> OUT
+    G -.->|"replaced by, in recipe 5-2-i"| GS
+    GS -.-> H
+    O -->|"throws AuthenticationException"| N
+    N -->|"no usable Authentication"| EP
+    N -->|"AccessDeniedException, already signed in"| ADH
+        </pre>
+      </figure>
+      <p class="reading"><strong>Walking the arrows.</strong> <code>FilterChainProxy.doFilter</code> runs the
+        list once, guarded by its own <code>firewalledRequest</code> wrapper.
+        <code>SecurityContextHolderFilter</code> (600) pulls a <code>SecurityContext</code> out of the session
+        through <code>SecurityContextHolderFilter</code>'s repository and puts it in the holder <em>before</em>
+        anything downstream, and clears it in a <code>finally</code>. <code>CsrfFilter</code> (1000) rejects any
+        state-changing method whose <code>_csrf</code> parameter does not match the token in the
+        <code>HttpSessionCsrfTokenRepository</code> — wrapped in a <code>LazyCsrfTokenRepository</code> by
+        default — which is precisely what <code>recipe_5_1_iii</code> opts out of with
+        <code>http.csrf().disable()</code> and what <code>recipe_5_1_iv</code> opts back into with
+        <code>csrfTokenRepository(new CookieCsrfTokenRepository())</code>.
+        <code>UsernamePasswordAuthenticationFilter</code> (1900) acts only on <code>POST /login</code>; every
+        other request falls through. <code>DefaultLoginPageGeneratingFilter</code> (2100) only serves
+        <code>GET /login</code> when no custom login page was configured — in 5-2-iii onward
+        <code>loginPage("/login")</code> takes over and the generated page steps aside, which is why
+        <code>/login</code> there resolves through
+        <code>TodoSecurityConfig.addViewControllers</code> instead.
+        <code>AnonymousAuthenticationFilter</code> (3100) is the reason the holder is never empty: if nothing
+        authenticated, it installs an <code>AnonymousAuthenticationToken</code>. That matters because
+        <code>AuthorizationFilter</code> (3600) is the <em>last</em> filter — it sits below
+        <code>ExceptionTranslationFilter</code> (3400) deliberately, so that the exceptions it throws on its
+        way back up are converted into a 302 or a 403 rather than escaping to the container. Read the two
+        dotted edges as the actual control flow of a denied request: 3600 throws, 3400 catches.</p>
+      <p><code>recipe_5_1_ii</code> is the sharpest illustration. Its entire configuration is
+      <span class="path">ch05/recipe_5_1_ii/src/main/java/com/apress/spring6recipes/board/security/TodoSecurityConfig.java</span>
+      — <code>@Configuration @EnableWebSecurity public class TodoSecurityConfig { }</code>. No
+      <code>SecurityFilterChain</code> bean, no user store. The request-scoped <code>HttpSecurity</code> still
+      gets all nine default configurers, so <code>AuthorizationFilter</code> denies everything that is not
+      permitted by rule and there is no rule, and with no
+      <code>UserDetailsManager</code> bean <code>AuthenticationConfiguration</code> generates a single random
+      password user at startup.</p>
+    </section>
+
+    <section id="login">
+      <h2>Authenticating a submission</h2>
+      <p>Form login is a <code>POST</code> to a URL that no controller owns. In every recipe from 5-2-iii
+        onward that URL is <code>/login</code>, the form is
+      <span class="path">ch05/recipe_5_shared/src/main/resources/templates/login.html</span>, and the
+        parameter names are the defaults <code>username</code> and <code>password</code>. Three settings on
+        <code>FormLoginConfigurer</code> drive the outcome: <code>defaultSuccessUrl("/todos")</code> from
+        5-2-iv, <code>failureUrl("/login?error=true")</code>, and the
+        <code>loginPage("/login").permitAll()</code> pair that both points the entry point at the custom page
+        and adds the permit-all rule.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">POST /login: the two outcomes</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant U as UsernamePasswordAuthenticationFilter
+    participant PM as ProviderManager
+    participant DAP as DaoAuthenticationProvider
+    participant UDM as UserDetailsManager
+    participant ENC as PasswordEncoder
+    participant OK as SavedRequestAwareAuthenticationSuccessHandler
+    participant NG as SimpleUrlAuthenticationFailureHandler
+    B->>U: POST /login, username and password fields
+    U->>U: attemptAuthentication, build unauthenticated UsernamePasswordAuthenticationToken
+    U->>PM: authenticate(token)
+    PM->>DAP: delegate to the configured AuthenticationProvider
+    DAP->>UDM: retrieveUser, loadUserByUsername
+    UDM-->>DAP: UserDetails, authorities USER and optionally ADMIN
+    DAP->>ENC: additionalAuthenticationChecks, matches raw against stored
+    alt credentials match, account enabled and not locked
+        DAP-->>PM: authenticated UsernamePasswordAuthenticationToken
+        PM-->>U: Authentication
+        U->>OK: onAuthenticationSuccess
+        OK-->>B: 302 to the saved request, else to defaultSuccessUrl /todos
+        Note over U,OK: CsrfAuthenticationStrategy and SessionManagementAuthenticationStrategy rotate the session id
+    else BadCredentialsException or DisabledException
+        DAP-->>U: exception propagates out of authenticate
+        U->>NG: onAuthenticationFailure
+        NG-->>B: 302 to failureUrl /login with error=true
+    end
+    Note over B,UDM: recipe 5-3-i marks jdoe@does.net disabled, which is the DisabledException branch
+        </pre>
+      </figure>
+      <p class="reading"><strong>Walking the hops.</strong>
+        <code>UsernamePasswordAuthenticationFilter.attemptAuthentication</code> reads the two parameters and
+        produces an <em>unauthenticated</em> <code>UsernamePasswordAuthenticationToken</code>; the filter then
+        calls <code>this.getAuthenticationManager().authenticate(...)</code>, which in these recipes is the
+        <code>AuthenticationManager</code> that <code>AuthenticationConfiguration</code> derives from the
+        single <code>UserDetailsManager</code> bean — a <code>ProviderManager</code> holding one
+        <code>DaoAuthenticationProvider</code>. That provider does two things in order:
+        <code>retrieveUser</code> through the <code>UserDetailsService</code> half of the manager, then
+        <code>additionalAuthenticationChecks</code> through the <code>PasswordEncoder</code>. On success the
+        <code>SessionAuthenticationStrategy</code> chain runs <em>before</em> the context is saved —
+        <code>CsrfAuthenticationStrategy</code> migrates the CSRF token and
+        <code>SessionManagementAuthenticationStrategy</code> records the session — which is why the
+        <code>JSESSIONID</code> changes between the login POST and the redirect. On the failure branch the
+        exception never reaches the container: <code>AbstractAuthenticationProcessingFilter</code> catches it,
+        publishes it as an <code>AuthenticationFailureEvent</code>, stores it in the session under
+        <code>SPRING_SECURITY_LAST_EXCEPTION</code>, and hands over to the failure handler. That session
+        attribute is what the template reads:
+        <code>${session.SPRING_SECURITY_LAST_EXCEPTION.message}</code> inside the
+        <code>th:if="${param.error != null}"</code> block in <code>login.html</code> — a contract between the
+        failure handler and the view that is easy to miss because neither side mentions the other.</p>
+      <p>Logout is the mirror image and is only configured from 5-3-i onward:
+        <code>http.logout().logoutSuccessUrl("/logout-success").permitAll()</code>. <code>LogoutFilter</code>
+        sits at order 1100, upstream of everything, and delegates to
+        <code>SecurityContextLogoutHandler</code> (invalidate the session, clear the holder) and
+        <code>CsrfLogoutHandler</code>, then to <code>SimpleUrlLogoutSuccessHandler</code> pointed at the
+        view-controller registered for <code>/logout-success</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">State</span>
+          <span class="dtitle">One session's authentication states across recipes 5-2 and 5-3</span></figcaption>
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> Anonymous
+    Anonymous --> LoginView : AuthorizationFilter denies, ExceptionTranslationFilter redirects to /login
+    LoginView --> Authenticating : POST /login reaches UsernamePasswordAuthenticationFilter
+    Authenticating --> Authenticated : DaoAuthenticationProvider returns an authenticated token
+    Authenticating --> LoginView : BadCredentialsException or DisabledException
+    Authenticated --> Anonymous : session times out, SecurityContextHolderFilter finds nothing
+    Authenticated --> LoggedOut : LogoutFilter matches /logout
+    LoggedOut --> Anonymous : redirect to /logout-success
+    LoggedOut --> [*]
+        </pre>
+      </figure>
+      <p class="reading"><strong>What each state means in code.</strong> <em>Anonymous</em> is not "no
+        authentication" — <code>AnonymousAuthenticationFilter</code> has installed an
+        <code>AnonymousAuthenticationToken</code> named <code>anonymousUser</code>, and
+        <code>AuthorizationFilter</code>'s manager sees it as lacking <code>USER</code>.
+        <em>Authenticating</em> is a single request, not a dwell state; it exists only inside
+        <code>UsernamePasswordAuthenticationFilter.doFilterInternal</code>. <em>Authenticated</em> means a
+        <code>SecurityContext</code> with a real token has been written to the session by
+        <code>SecurityContextRepository</code>, and it persists across requests until it expires or logout
+        runs — the two arrows leaving it. Note what is deliberately absent: there is no
+        <code>RememberMeAuthenticationFilter</code> state anywhere in this chapter, because no recipe calls
+        <code>http.rememberMe()</code>; the fifth state the book discusses for other applications simply is
+        not exercised here.</p>
+    </section>
+
+    <section id="principals">
+      <h2>Principals, authorities, roles</h2>
+      <p>Every recipe in the chapter seeds the same three principals, and the vocabulary choice across the
+        recipes is the point. They are built with
+        <code>User.withDefaultPasswordEncoder().username(...).password(...).authorities("USER", "ADMIN")</code>
+        and — from 5-3-i — keyed by e-mail address rather than by short name, so the principal name doubles as
+        the <code>Todo.owner</code> value that <code>TodosController</code> writes and that
+        <code>recipe_5_5_ii</code>'s <code>@PostAuthorize</code> later compares against
+        <code>authentication.name</code>.</p>
+      <table>
+        <thead><tr><th>Principal</th><th>Password</th><th>Authorities</th><th>Flag</th></tr></thead>
+        <tbody>
+          <tr><td><code>user</code> / <code>marten@deinum.biz</code></td><td><code>user</code></td>
+            <td><code>USER</code></td><td>from 5-3-i the username changes; 5-8 uses <code>marten</code></td></tr>
+          <tr><td><code>admin</code> / <code>admin@ya2do.io</code></td><td><code>admin</code></td>
+            <td><code>USER</code>, <code>ADMIN</code></td><td>listed in 5-1-iii onward</td></tr>
+          <tr><td><code>jdoe@does.net</code></td><td><code>unknown</code></td><td><code>USER</code></td>
+            <td><code>disabled(true)</code>, added in 5-3-i and kept through 5-5-ii and 5-7-i</td></tr>
+        </tbody>
+      </table>
+      <p>The distinction the recipes draw repeatedly is <strong>authority versus role</strong>.
+        <code>authorities("USER")</code> stores the literal string <code>USER</code>, which
+        <code>hasAuthority("USER")</code> matches exactly. <code>hasRole('ROLE_ADMIN')</code>, as used in the
+        SpEL strings of <code>recipe_5_4_ii</code> and <code>recipe_5_4_iii</code>, strips a configured prefix
+        before comparing — so it only matches an authority literally called <code>ROLE_ADMIN</code>, which none
+        of these users have. That is a real trap in those two recipes and it is visible straight from the
+        source: the same config that grants <code>USER</code>/<code>ADMIN</code> as authorities tests for a
+        prefixed role.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The object model the filter chain carries around</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class UserDetailsService {
+        loadUserByUsername(username)
+    }
+    class UserDetailsManager {
+        createUser(details)
+        saveUser(details)
+        updateUser(details)
+        deleteUser(username)
+        changePassword(username, password)
+        userExists(username)
+    }
+    class UserDetails {
+        getUsername()
+        getPassword()
+        getAuthorities()
+        isAccountNonExpired()
+        isAccountNonLocked()
+        isEnabled()
+    }
+    class User {
+        static withDefaultPasswordEncoder()
+        static withEncoderByClass(type)
+    }
+    class InMemoryUserDetailsManager
+    class JdbcUserDetailsManager
+    class MapReactiveUserDetailsService
+    class GrantedAuthority {
+        getAuthority()
+    }
+    class SimpleGrantedAuthority
+    class Authentication {
+        getName()
+        getPrincipal()
+        getCredentials()
+        getAuthorities()
+        getDetails()
+        isAuthenticated()
+    }
+    class UsernamePasswordAuthenticationToken
+    class WebAuthenticationDetails {
+        getRemoteAddress()
+        getSessionId()
+    }
+    UserDetailsManager ..|> UserDetailsService
+    UserDetails ..|> User
+    UserDetailsManager --> User : creates and stores
+    InMemoryUserDetailsManager ..|> UserDetailsManager
+    JdbcUserDetailsManager ..|> UserDetailsManager
+    InMemoryUserDetailsManager --> User : holds a map of them
+    JdbcUserDetailsManager --> User : rebuilds them from USERS plus AUTHORITIES
+    User --> GrantedAuthority : USER and ADMIN
+    GrantedAuthority ..|> SimpleGrantedAuthority
+    Authentication ..|> UsernamePasswordAuthenticationToken
+    UsernamePasswordAuthenticationToken --> UserDetails : principal
+    UsernamePasswordAuthenticationToken --> WebAuthenticationDetails : details
+    MapReactiveUserDetailsService ..|> UserDetailsService
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the graph.</strong> The left-hand branch is the store side:
+        <code>UserDetailsManager</code> extends <code>UserDetailsService</code>, which is why a single bean
+        method can both authenticate and administer — and why 5-3-ii's <code>initializeUsers</code> can call
+        <code>users.createUser(user1)</code> on the same object that
+        <code>DaoAuthenticationProvider</code> later calls <code>loadUserByUsername</code> on.
+        <code>recipe_5_1_iii</code> returns the interface type <code>UserDetailsManager</code> from a bean
+        method whose body constructs <code>InMemoryUserDetailsManager</code>; <code>5-3_ii</code> swaps only
+        the constructor argument from two <code>User</code>s to the injected <code>DataSource</code>. The
+        right-hand branch is the request side: after a successful authentication the
+        <code>UsernamePasswordAuthenticationToken</code> stores the <code>UserDetails</code> as its principal
+        (or the username string, if <code>hideUserDetails</code> is set, which it is not here) and copies the
+        authorities across. <code>WebAuthenticationDetails</code> is the field that makes recipes 5-4 possible
+        at all — <code>LocalhostAuthorizationManager.check</code> and <code>AccessChecker.hasLocalAccess</code>
+        both pattern-match <code>authentication.getDetails()</code> against it to reach
+        <code>getRemoteAddress()</code>, and it is populated automatically by
+        <code>WebAuthenticationDetailsSource</code> on the login filter, not by anything in this chapter.
+        <code>MapReactiveUserDetailsService</code> implements <code>UserDetailsService</code> too, which is how
+        5-8 keeps the same seeds while the rest of the stack goes reactive.</p>
+    </section>
+
+    <section id="stores">
+      <h2>Where the users come from</h2>
+      <p>Five backends appear across the chapter, and swapping between them is a one-bean edit. The JDBC
+        family is where the reading pays off: <code>recipe_5_3_ii</code> uses
+        <code>JdbcUserDetailsManager</code> with Spring Security's default SQL against <code>USERS</code> and
+        <code>AUTHORITIES</code> — tables that <code>recipe_5_shared/src/main/resources/schema.sql</code> does
+        create — while <code>recipe_5_3_iii</code> overrides both queries to read <code>member</code> and a
+        <code>member</code>/<code>member_role</code> join, and keeps calling <code>createUser</code>, which
+        still writes to <code>users</code>/<code>authorities</code>. That asymmetry is the recipe's lesson as
+        much as its bug: reads and writes on <code>JdbcUserDetailsManager</code> are configured separately.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Config source to store, per recipe group</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph SG1["5-1-iii, 5-1-iv, 5-2-i to 5-2-iv, in memory"]
+        BEAN1["userDetailsService bean"]
+        IM["InMemoryUserDetailsManager"]
+        BEAN1 --> IM
+    end
+    subgraph SG2["5-3-ii, default JDBC SQL"]
+        BEAN2["userDetailsService with DataSource"]
+        JD2["JdbcUserDetailsManager"]
+        T2["USERS and AUTHORITIES, created by shared schema.sql"]
+        BEAN2 --> JD2 --> T2
+    end
+    subgraph SG3["5-3-iii through 5-5-ii and 5-7-i, custom SQL"]
+        BEAN3["userDetailsService bean"]
+        JD3["JdbcUserDetailsManager"]
+        Q3["setUsersByUsernameQuery, member"]
+        Q4["setAuthoritiesByUsernameQuery, member joined to member_role"]
+        BEAN3 --> JD3
+        JD3 --> Q3
+        JD3 --> Q4
+    end
+    subgraph SG4["5-3-v, LDAP bind"]
+        CS["DefaultSpringSecurityContextSource, ldap://ldap-server:389 with base dc spring6recipes, dc com"]
+        POP["DefaultLdapAuthoritiesPopulator, ou groups, rolePrefix empty"]
+        FAC["LdapBindAuthenticationManagerFactory"]
+        PAT["userDnPatterns uid 0, ou people"]
+        AM["authenticationManager bean"]
+        CS --> POP
+        CS --> FAC
+        POP --> FAC
+        FAC --> PAT
+        FAC --> AM
+    end
+    subgraph SG5["5-8-i to 5-8-v, reactive"]
+        MR["MapReactiveUserDetailsService, users marten and admin"]
+    end
+    IM --> DAP["DaoAuthenticationProvider inside ProviderManager"]
+    JD2 --> DAP
+    JD3 --> DAP
+    AM --> FILTER["UsernamePasswordAuthenticationFilter, wired via setAuthenticationManager"]
+    MR --> RWEB["AuthenticationWebFilter on the reactive chain"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the branches.</strong> The first three subgraphs all terminate in
+        <code>DaoAuthenticationProvider</code>, and <code>AuthenticationConfiguration</code> finds the
+        <code>UserDetailsManager</code> bean by type — that autowiring is why none of these recipes mentions a
+        provider, an <code>AuthenticationProvider</code> bean or an
+        <code>AuthenticationManagerBuilder</code> anywhere; the only explicit manager in the chapter is the
+        LDAP one. Password encoding is the other injected collaborator: <code>5-3-iv</code> adds a
+        <code>BCryptPasswordEncoder</code> bean and that is the entire diff against <code>5-3-iii</code>,
+        because <code>GlobalAuthenticationConfigurerAdapter</code> picks up a single
+        <code>PasswordEncoder</code> bean and hands it to the provider — which is also why
+        <code>recipe_5_5_iii</code> and <code>recipe_5_6_i</code>, from the adapter era, have to wire it by
+        hand with <code>auth.jdbcAuthentication().passwordEncoder(passwordEncoder()).dataSource(dataSource())</code>.
+        The LDAP branch replaces the provider rather than the store: <code>5-3-v</code> builds a context
+        source over <code>ldap://ldap-server:389/dc=spring6recipes,dc=com</code>, points
+        <code>userDnPatterns("uid={0},ou=people")</code> at the entries in
+      <span class="path">ch05/recipe_5_3_v/src/main/resources/ldap/users.ldif</span>, and sets
+        <code>populator.setRolePrefix("")</code> so the group <code>cn</code> values <code>admin</code> and
+        <code>user</code> become authorities verbatim and can satisfy
+        <code>hasAuthority("ADMIN")</code> unchanged. Its <code>authenticationManager</code> bean is then
+        consumed by the form-login filter, and <code>docker-compose.yml</code> in the same module maps the
+        OpenDS container's 389 to host 1389 and links it as the hostname <code>ldap-server</code> — the URL
+        above only resolves inside that compose network.</p>
+    </section>
+
+    <section id="authorise">
+      <h2>The authorisation decision</h2>
+      <p><code>authorizeHttpRequests</code> does not produce a filter per rule. It produces one
+        <code>AuthorizationFilter</code> holding an ordered list of
+        <code>RequestMatcher</code>/<code>AuthorizationManager</code> pairs, and the decision is
+        first-match-wins. The rules the recipes declare are, in order:
+        <code>requestMatchers(HttpMethod.DELETE, "/todos/*").hasAuthority("ADMIN")</code>, then
+        <code>requestMatchers("/todos", "/todos/*").hasAuthority("USER")</code>. Everything else —
+        <code>/login</code>, <code>/logout</code> — is permitted by the DSL calls that configure those screens,
+        and there is no <code>anyRequest()</code> clause in any recipe, so unlisted URLs fall to the default
+        deny.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">AuthorizationFilter.decide, with the deny paths</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    START["AuthorizationFilter.doFilterInternal, order 3600"] --> SUP["supplier of Authentication from SecurityContextHolder"]
+    SUP --> MATCH{"which RequestMatcher matches first, in declaration order"}
+    MATCH -->|"DELETE plus /todos/*"| DM["the delete manager"]
+    MATCH -->|"/todos or /todos/*"| UM["AuthorityAuthorizationManager.hasAuthority USER"]
+    MATCH -->|"no rule matched"| DEF["no Registration, AuthorizationFilter denies"]
+    UM --> UD{"token authorities contain USER"}
+    UD -->|"yes"| PASS["granted, continue down the chain"]
+    UD -->|"no"| DENY["AuthorizationDecision false"]
+    DEF --> DENY
+    DM --> WHICH{"which recipe"}
+    WHICH -->|"5-1-iii to 5-3-v, 5-5-i, 5-5-ii, 5-7-i"| ADM["AuthorityAuthorizationManager.hasAuthority ADMIN"]
+    WHICH -->|"5-4-i"| ALL["AuthorizationManagers.allOf with hasAuthority ADMIN and LocalhostAuthorizationManager"]
+    WHICH -->|"5-4-ii and 5-4-iii"| SPEL["WebExpressionAuthorizationManager with a SpEL string"]
+    WHICH -->|"5-8-v"| FN["custom function returning Mono of AuthorizationDecision"]
+    ADM --> DENY2{"ADMIN present"}
+    ALL --> AND1{"ADMIN present"}
+    AND1 -->|"no"| DENY
+    AND1 -->|"yes"| IP{"WebAuthenticationDetails remoteAddress is 127.0.0.1 or the IPv6 loopback"}
+    IP -->|"no"| DENY
+    IP -->|"yes"| PASS
+    SPEL --> EV{"expression root evaluates"}
+    EV -->|"hasRole ROLE_ADMIN and hasIpAddress loopback"| DENY
+    EV -->|"5-4-iii, hasRole ROLE_ADMIN and bean accessChecker hasLocalAccess"| PASS
+    FN --> OWN{"authorities contain ADMIN, or the authenticated name equals todo.owner"}
+    OWN -->|"no"| DENY
+    OWN -->|"yes"| PASS
+    DENY --> CATCH["thrown back up as AccessDeniedException to ExceptionTranslationFilter, order 3400"]
+    DENY2 -->|"yes"| PASS
+    DENY2 -->|"no"| CATCH
+    CATCH --> ANON{"is the Authentication anonymous"}
+    ANON -->|"yes"| ENTRY["LoginUrlAuthenticationEntryPoint, 302 to /login, request cached"]
+    ANON -->|"no"| HANDLER["AccessDeniedHandlerImpl, 403 Forbidden"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Walking the decision.</strong>
+        <code>AuthorizationFilter</code> asks its <code>RequestMatcherDeferredRegister</code>-built list for
+        the first entry whose matcher accepts the request, then calls
+        <code>AuthorizationManager.check(Supplier, RequestEntry)</code> and inspects the returned
+        <code>AuthorizationDecision</code>; a <code>null</code> or false decision throws
+        <code>AccessDeniedException</code>. The supplier is lazy on purpose — an anonymous user does not pay
+        for expression evaluation at all. The three variants in 5-4 are three different answers to the same
+        sentence. <code>recipe_5_4_i</code> composes managers: <code>AuthorityAuthorizationManager.hasAuthority</code>
+        short-circuits, then <code>LocalhostAuthorizationManager.check</code> pattern-matches
+        <code>authentication.getDetails()</code> as <code>WebAuthenticationDetails</code> and string-compares
+        <code>getRemoteAddress()</code>. <code>recipe_5_4_ii</code> hands the same predicate to SpEL as
+        <code>"hasRole('ROLE_ADMIN') and (hasIpAddress('127.0.0.1') or hasIpAddress('0:0:0:0:0:0:0:1'))"</code>
+        through <code>WebExpressionAuthorizationManager</code>, which evaluates it against a
+        <code>WebSecurityExpressionRoot</code>. <code>recipe_5_4_iii</code> swaps the inline IP test for a bean
+        reference — <code>@accessChecker.hasLocalAccess(authentication)</code> — resolved through the
+        <code>BeanResolver</code> that <code>WebMvcSecurityConfiguration</code> contributes, so
+        <code>AccessChecker</code>, a plain <code>@Component</code>, becomes part of the authorisation rule
+        while keeping the <code>and</code> spelling of the expression language.
+        <code>recipe_5_4_ii</code> additionally carries <code>ExtendedWebSecurityExpressionHandler</code> and
+        <code>ExtendedWebSecurityExpressionRoot</code> adding a <code>localAccess()</code> method — but note
+        that its <code>TodoSecurityConfig</code> never registers that handler and writes the predicate inline
+        instead, so the extension is present in the module and unused. That is the honest reading of the
+        source, not an oversight in this page.</p>
+      <div class="callout info"><h4>hasRole is not hasAuthority</h4>
+        <p><code>recipe_5_4_ii</code> and <code>recipe_5_4_iii</code> ask for
+          <code>hasRole('ROLE_ADMIN')</code> while every seeded principal carries the authority
+          <code>ADMIN</code>. <code>hasRole</code> prepends a role prefix (default <code>ROLE_</code>) to its
+          argument and compares against the authority list, so the argument should have been
+          <code>'ADMIN'</code>, not <code>'ROLE_ADMIN'</code>. Every DELETE in those two recipes takes the deny
+          branch regardless of who issues it from where. Recipes 5-1, 5-2, 5-3, 5-5 and 5-7 all use
+          <code>hasAuthority("ADMIN")</code> and are unaffected.</p>
+      </div>
+    </section>
+
+    <section id="method">
+      <h2>Method security</h2>
+      <p>URL rules stop at the controller boundary; a <code>TodoService</code> injected anywhere else would
+        not pass through <code>AuthorizationFilter</code> at all. Recipes 5-5 add <code>@EnableMethodSecurity</code>
+        and put the rules on the implementation. The annotation you enable determines the interceptor chain
+        registered for you: <code>securedEnabled = true</code> in <code>recipe_5_5_i</code>,
+        <code>prePostEnabled = true</code> in <code>recipe_5_5_ii</code> and <code>recipe_5_5_iii</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">TodoController.list through the method-security proxy</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant TC as TodoController
+    participant PX as proxy around TodoServiceImpl
+    participant BEF as AuthorizationManagerBeforeMethodInterceptor
+    participant PRE as PreAuthorizeAuthorizationManager
+    participant EXP as MethodSecurityExpressionRoot
+    participant SVC as TodoServiceImpl
+    participant AFT as PostFilterAuthorizationMethodInterceptor
+    participant REPO as JdbcTodoRepository
+    TC->>PX: listTodos()
+    PX->>BEF: invoke, method plus Authentication from SecurityContextHolder
+    BEF->>PRE: check for the PreAuthorize expression hasAuthority USER
+    PRE->>EXP: evaluate the SpEL against the invocation
+    EXP-->>PRE: true or false
+    PRE-->>BEF: AuthorizationDecision
+    BEF-->>TC: AccessDeniedException, nothing below ran
+    BEF->>SVC: proceed only when granted
+    SVC->>REPO: findAll()
+    REPO-->>SVC: List of Todo rows
+    SVC-->>PX: the list
+    PX->>AFT: hand the return value to PostFilter
+    AFT->>EXP: for each filterObject, ADMIN or owner equals authentication.name
+    AFT-->>TC: a filtered list, other owners removed
+    Note over PX,SVC: Transactional advice is a separate interceptor on the same proxy, ordered after security
+        </pre>
+      </figure>
+      <p class="reading"><strong>Walking the hops.</strong> <code>@EnableMethodSecurity</code> imports
+        <code>MethodSecuritySelector</code>, which picks <code>SecuredMethodSecurityConfiguration</code> or
+        <code>PrePostMethodSecurityConfiguration</code> according to the flags and registers an auto-proxy
+        advisor over <code>TodoServiceImpl</code> — the class is package-private and annotated
+        <code>@Service</code>, so the bean is proxied by interface through <code>TodoService</code>. The
+        before-advice is <code>AuthorizationManagerBeforeMethodInterceptor</code>; the after-advice, present
+        only for <code>@PostAuthorize</code> and <code>@PostFilter</code>, is
+        <code>AuthorizationManagerAfterMethodInterceptor</code> and <code>PostFilterAuthorizationMethodInterceptor</code>.
+        Because the decision is made <em>before</em> the join point, a denial never touches the database —
+        hop 8 returns without ever calling <code>findAll()</code>. Differences between the three variants, from
+        the source: <code>recipe_5_5_i</code> uses <code>@Secured</code> with bare authority strings, and on
+        <code>remove</code> lists <code>{ "USER", "ADMIN" }</code>, which
+        <code>SecuredAuthorizationManager</code> treats as any-of; <code>recipe_5_5_ii</code> adds
+        <code>@PostAuthorize("returnObject.owner == authentication.name")</code> on <code>findById</code>,
+        whose signature still returns an <code>Optional</code> because that is what the shared
+        <code>TodoService</code> declares — so <code>returnObject</code> is the <code>Optional</code>, not the
+        <code>Todo</code> inside it; <code>recipe_5_5_iii</code> changes that method to return
+        <code>Todo</code> while leaving <code>@Override</code> on it, and puts the filtering expression shown at
+        hop 12 on <code>listTodos</code> instead. <code>recipe_5_7_i</code> keeps the same interceptors and
+        merely changes the expressions to <code>hasPermission(...)</code>, which is the door into the next
+        section.</p>
+      <p>Two caveats the recipes do not address. First, self-invocation: <code>complete(long id)</code> calls
+        <code>findById(id)</code> on <code>this</code>, so the annotated method is entered without the proxy and
+        its security annotation is not consulted for that internal hop. Second,
+        <code>recipe_5_5_i</code> and <code>recipe_5_5_ii</code> <em>redefine</em> <code>TodoServiceImpl</code>
+        in their own source set, shadowing the shared module's class of the same fully-qualified name, which is
+        what makes the annotations take effect at all. <code>recipe_5_5_iii</code> does neither cleanly: its
+        <code>findById</code> returns <code>Todo</code> against an interface method declared
+        <code>Optional&lt;Todo&gt;</code> (and it drops the <code>java.util.Optional</code> import while still
+        returning <code>todoRepository.findOne(id)</code>), and its configuration extends
+        <code>WebSecurityConfigurerAdapter</code> — so method security is only buildable as written in 5-5-i and
+        5-5-ii.</p>
+    </section>
+
+    <section id="acl">
+      <h2>Per-object ACLs</h2>
+      <p>Recipe 5-7-i is the only module in the chapter that reaches beyond roles to per-row permissions. It
+        adds <code>spring-security-acl</code> in <span class="path">ch05/build.gradle</span>, ships the four
+        <code>ACL_SID</code>/<code>ACL_CLASS</code>/<code>ACL_OBJECT_IDENTITY</code>/<code>ACL_ENTRY</code>
+        tables in its own <code>schema.sql</code>, and wires the ACL object graph in a second configuration
+        class, <code>TodoAclConfig</code>. <code>ehcache.xml</code> is present in the module and declares a
+        cache named <code>aclCache</code>, but the configuration uses
+        <code>CaffeineCacheManager</code> — the EhCache file is a leftover from an earlier edition.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">TodoAclConfig bean resolution</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    CFG["TodoAclConfig, constructor-injected DataSource"]
+    DS["DataSource from TodoWebConfig, embedded H2 named todos"]
+    CAF["Caffeine spec, expireAfterWrite 15 minutes"]
+    CM["CaffeineCacheManager"]
+    ACLC["named cache aclCache"]
+    CACHE["SpringCacheBasedAclCache"]
+    AUD["ConsoleAuditLogger"]
+    PGS["DefaultPermissionGrantingStrategy"]
+    AAS["AclAuthorizationStrategyImpl with SimpleGrantedAuthority ADMIN"]
+    LS["BasicLookupStrategy"]
+    AS["JdbcMutableAclService, a MutableAclService"]
+    PE["AclPermissionEvaluator"]
+    VOT["AclEntryVoter, attribute ACL_MESSAGE_DELETE"]
+    HANDLER["DefaultMethodSecurityExpressionHandler"]
+    IMPL["TodoServiceImpl, hasPermission expressions"]
+    DS --> CFG
+    CFG --> CAF --> CM --> ACLC --> CACHE
+    AUD --> PGS --> CACHE
+    AAS --> CACHE
+    CACHE --> LS
+    PGS --> LS
+    AAS --> LS
+    DS --> LS
+    LS --> AS
+    CACHE --> AS
+    DS --> AS
+    AS --> PE --> HANDLER --> IMPL
+    AS --> VOT
+    IMPL -->|"createAcl and insertAce"| AS
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the dependencies.</strong> The constructor of
+        <code>TodoAclConfig</code> takes the <code>DataSource</code> that
+        <code>recipe_5_shared</code>'s <code>TodoWebConfig.dataSource()</code> produces, so ACL state lives in
+        the same H2 database as the to-do rows. <code>BasicLookupStrategy</code> is the read path — it joins
+        the four <code>ACL_*</code> tables and populates <code>SpringCacheBasedAclCache</code>, whose
+        <code>PermissionGrantingStrategy</code> is a <code>DefaultPermissionGrantingStrategy</code> wrapping a
+        <code>ConsoleAuditLogger</code>, so every allow and deny prints.
+        <code>JdbcMutableAclService</code> is the write path and is what
+        <code>TodoServiceImpl.save</code> calls: it builds an <code>ObjectIdentityImpl(Todo.class, todo.getId())</code>
+        and then six <code>insertAce</code> calls, granting <code>READ</code>, <code>WRITE</code> and
+        <code>DELETE</code> to a <code>PrincipalSid</code> of the new owner's name and the same three to a
+        <code>GrantedAuthoritySid("ADMIN")</code>. The link that makes <code>hasPermission</code> work at all is
+        the quiet one: <code>TodoServiceImpl</code> never references <code>AclPermissionEvaluator</code>, but
+        <code>GlobalMethodSecurityConfiguration.afterSingletonsInstantiated</code> looks up a
+        <code>PermissionEvaluator</code> bean by type and calls <code>setPermissionEvaluator</code> on the
+        <code>DefaultMethodSecurityExpressionHandler</code> — so the bean named <code>permissionEvaluator</code>
+        here is what makes <code>hasPermission(filterObject, 'read')</code> resolve to an ACE lookup rather than
+        failing. <code>AclEntryVoter</code>, with the attribute <code>ACL_MESSAGE_DELETE</code>, is the legacy
+        voting path and is not referenced by any annotation in the module.</p>
+      <p>The module also contains a bug worth naming: the <code>@PreAuthorize</code> expressions on
+        <code>complete</code> and <code>remove</code> pass the type string
+        <code>'com.apress.springrecipes.board.Todo'</code>, while the class is
+        <code>com.apress.spring6recipes.board.Todo</code>. <code>ObjectIdentityImpl</code> resolves that string
+        reflectively, so those two methods would fail on a class-not-found rather than on a permission
+        decision, whereas the <code>@PostFilter</code> on <code>listTodos</code> passes the
+        <code>Todo</code> object itself and is immune.</p>
+    </section>
+
+    <section id="reactive">
+      <h2>Reactive security</h2>
+      <p>The 5-8 modules drop the WAR, the servlet API and the shared module entirely:
+        <code>WebFluxConfiguration</code> plus <code>ReactorNettyBootstrap.main()</code> start an
+        <code>HttpServer</code> on <code>localhost:8080</code> directly, and persistence goes through
+        <code>DatabaseClient</code> over <code>r2dbc:h2:mem:///todos</code>. Security moves with them:
+        <code>@EnableWebFluxSecurity</code> instead of <code>@EnableWebSecurity</code>,
+        <code>ServerHttpSecurity</code> instead of <code>HttpSecurity</code>, and a
+        <code>SecurityWebFilterChain</code> instead of a <code>SecurityFilterChain</code> — the same shape, but
+        the reactive chain is <code>WebFilter</code>s over <code>Mono</code>s, so
+        <code>AuthenticationWebFilter</code>, <code>CsrfWebFilter</code>,
+        <code>SecurityContextServerWebExchangeWebFilter</code>, <code>ReactorContextWebFilter</code>,
+        <code>ExceptionTranslationWebFilter</code> and <code>AuthorizationWebFilter</code> replace their servlet
+        counterparts.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">recipe_5_8_i through v: what each variant adds</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    V1["5-8-i, SecurityConfiguration with EnableWebFluxSecurity and MapReactiveUserDetailsService only"]
+    V2["5-8-ii, adds springWebFilterChain with httpBasic, plus securityPages router and csrfToken filter function"]
+    V3["5-8-iii, same chain bean but formLogin instead of httpBasic"]
+    V4["5-8-iv, formLogin with loginPage /login, csrf disabled, authorizeExchange permitting /login"]
+    V5["5-8-v, authorizeExchange rules, cookie CSRF repository, custom access function, TodoService injected"]
+    V1 --> V2 --> V3 --> V4 --> V5
+    V2 -.->|"identical WebFluxConfiguration additions"| V3
+    V5 -->|"CookieServerCsrfTokenRepository"| CC["CsrfWebFilter writes the token to a cookie"]
+    V5 -->|"pathMatchers DELETE /todos"| FN["todoRemoveAllowed, returns Mono of AuthorizationDecision"]
+    FN --> ADM{"authorities contain ADMIN"}
+    ADM -->|"no"| OWN["isOwner, reads id path variable"]
+    OWN -->|"todo owner not equal to authentication name"| DEN["decision false"]
+    ADM -->|"yes"| GRANT["decision true, continue"]
+    OWN -->|"owner matches"| GRANT
+    DEN --> ETW["ExceptionTranslationWebFilter"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Walking the progression.</strong> <code>5-8-i</code> is the reactive twin of
+        <code>recipe_5_1_ii</code>: <code>@EnableWebFluxSecurity</code> alone, so <code>ServerHttpSecurity</code>
+        applies its own defaults, every exchange is denied, and <code>MapReactiveUserDetailsService</code>
+        supplies users <code>marten</code>/<code>secret</code> and <code>admin</code>/<code>admin</code> — note
+        these are short names, not the e-mail principals of the servlet recipes.
+        <code>5-8-ii</code> adds the <code>springWebFilterChain(ServerHttpSecurity)</code> bean returning
+        <code>http.httpBasic().and().build()</code>, which puts an <code>AuthenticationWebFilter</code> with a
+        <code>ServerHttpBasicAuthenticationConverter</code> in front of <code>AuthorizationWebFilter</code>.
+        <code>5-8-iii</code> changes one word to <code>http.formLogin()</code>, and the two modules then share
+        the rest of their code: a <code>securityPages</code> <code>RouterFunction</code> in
+        <code>WebFluxConfiguration</code> serving <code>GET /login</code> from the template, wrapped in a
+        <code>HandlerFilterFunction</code> that copies the <code>CsrfToken</code> out of the exchange attributes
+        so Thymeleaf can render it, plus <code>SecurityControllerAdvice</code> doing the same via
+        <code>@ModelAttribute</code>. <code>5-8-iv</code> switches to the lambda form throughout —
+        <code>formLogin((f) -&gt; f.loginPage("/login"))</code>, <code>csrf(ServerHttpSecurity.CsrfSpec::disable)</code>,
+        <code>authorizeExchange((auth) -&gt; auth.pathMatchers("/login").permitAll())</code> — and so drops the
+        need for the CSRF router filter, which is why its <code>securityPages</code> builds the route without
+        <code>.filter(csrfToken())</code> even though the method is still defined.
+        <code>5-8-v</code> is the one to read closely: it re-enables CSRF on a
+        <code>CookieServerCsrfTokenRepository</code>, adds <code>pathMatchers("/todos").hasAuthority("USER")</code>,
+        and replaces the delete rule with <code>.access(this::todoRemoveAllowed)</code> — a method returning
+        <code>Mono&lt;AuthorizationDecision&gt;</code>, exactly the reactive <code>AuthorizationManager</code>
+        contract that <code>LocalhostAuthorizationManager</code> implements on the servlet side. Inside it,
+        <code>isOwner</code> reads the <code>id</code> exchange-primitive variable and calls
+        <code>todoService.findById(id)...</code> ending in <code>.block()</code>. That blocking call on a
+        WebFlux worker is in the source, not in this description of it, and it is the reason 5-8-v is the end
+        of the progression rather than a template.</p>
+    </section>
+
+    <section id="running">
+      <h2>Building and running the recipes</h2>
+      <p>Every module is a Gradle project in the root settings file, addressed as
+        <code>:ch05:recipe_5_x_y</code>. The chapter's build script applies <code>war</code>,
+        <code>com.palantir.docker</code> and <code>com.palantir.docker-run</code> to every recipe module except
+        the shared one, and the 5-8 modules additionally skip the servlet dependencies.</p>
+      <pre><code># compile one recipe (shared module is built as a dependency)
+./gradlew :ch05:recipe_5_3_iv:build
+
+# the chapter's declared default task for each recipe is clean + build
+./gradlew :ch05:recipe_5_1_iii
+
+# jar the whole thing up if you want to run it outside Gradle
+./gradlew :ch05:recipe_5_3_iv:uberJar
+
+# 5-8-x has no war to deploy: it is a plain main class on Reactor Netty
+./gradlew :ch05:recipe_5_8_v:run 2&gt;/dev/null || \
+  java -cp "$(ls ch05/recipe_5_8_v/build/libs/*all.jar)" com.apress.spring6recipes.todo.ReactorNettyBootstrap</code></pre>
+      <h3>Deploying a servlet recipe</h3>
+      <p>Non-5-8 recipes produce <code>todos.war</code> — the name is forced by
+        <code>war { archiveFileName = 'todos.war' }</code> in <span class="path">ch05/build.gradle</span> so
+        that <span class="path">ch05/Dockerfile</span> can copy it to <code>ROOT.war</code>. That Dockerfile
+        downloads <code>apache-tomcat-10.0.27</code> onto <code>eclipse-temurin:19-jdk-alpine</code>, deletes
+        the default webapps, exposes <code>8080</code> and <code>5005</code> for JDWP, and runs
+        <code>catalina.sh run</code>. The <code>dockerRun</code> block maps <code>8080:8080</code> and names the
+        container <code>s6r-todos-security-&lt;module&gt;</code> from image
+        <code>s6r/todos-security:&lt;module&gt;</code>, so:</p>
+      <pre><code>./gradlew :ch05:recipe_5_3_iv:docker :ch05:recipe_5_3_iv:dockerRun
+# then http://localhost:8080/todos
+# user  marten@deinum.biz / user      authority USER
+# admin admin@ya2do.io     / admin      authorities USER and ADMIN
+#       jdoe@does.net      / unknown    disabled, expect the failure branch</code></pre>
+      <h3>Prerequisites found in the source</h3>
+      <table>
+        <thead><tr><th>Recipes</th><th>Prerequisite</th><th>Where it is declared</th></tr></thead>
+        <tbody>
+          <tr><td>5-1 to 5-2, 5-3-i to 5-3-iv, 5-4, 5-5-i/ii, 5-7</td>
+            <td>Nothing but Docker and port 8080. The database is an embedded H2 named <code>todos</code>,
+              seeded by the shared <code>schema.sql</code> and <code>data.sql</code> on every start.</td>
+            <td><code>EmbeddedDatabaseBuilder</code> in <code>TodoWebConfig</code></td></tr>
+          <tr><td>5-3-v</td>
+            <td>An LDAP server reachable as <code>ldap-server:389</code> with base
+              <code>dc=spring6recipes,dc=com</code>, loaded from <code>users.ldif</code>.
+              <code>docker-compose.yml</code> brings up <code>tnguyen1/ldap-opends</code> on host port 1389 and
+              a <code>sr4/todos-security</code> web container linked to it as <code>ldap-server</code> — note
+              the compose image name uses <code>sr4</code>, not the <code>s6r</code> the Gradle plugin builds,
+              and the compose <code>LDAP_BASEDN</code> says <code>dc=springrecipes</code> while the config and
+              the LDIF say <code>dc=spring6recipes</code>.</td>
+            <td><code>ch05/recipe_5_3_v/src/main/docker/docker-compose.yml</code></td></tr>
+          <tr><td>5-5-iii, 5-6-i</td>
+            <td>Unbuildable as pinned. They also point the login screen at <code>/login.jsp</code> and
+              <code>/logout-success.jsp</code>, and there are no JSP files anywhere in <code>ch05/</code>.</td>
+            <td><code>WebSecurityConfigurerAdapter</code> absent from the 6.0.1 jar</td></tr>
+          <tr><td>5-7-i</td>
+            <td><code>spring-security-acl:6.0.1</code> and Caffeine, added per project in the chapter build
+              script; plus the <code>ACL_*</code> tables, which only this module's own <code>schema.sql</code>
+              ships.</td>
+            <td><code>project('recipe_5_7_i')</code> in <code>ch05/build.gradle</code></td></tr>
+          <tr><td>5-8-i to 5-8-v</td>
+            <td>No container, no servlet: <code>ReactorNettyBootstrap</code> binds
+              <code>localhost:8080</code> and waits on <code>System.in.read()</code>. H2 comes from
+              <code>r2dbc-h2</code> via <code>ConnectionFactoryInitializer</code> running the module's own
+              <code>schema.sql</code> and <code>data.sql</code>.</td>
+            <td><code>ch05/recipe_5_8_v/src/main/java/…/ReactorNettyBootstrap.java</code></td></tr>
+        </tbody>
+      </table>
+      <p>Two notes on the toolchain. The root build pins a Java 19 toolchain and
+        <code>--enable-preview</code> for every recipe module, and <span class="path">gradle.properties</span>
+        hard-codes <code>org.gradle.java.home</code> to a single machine's JDK 17 path — drop that line if your
+        JDK lives elsewhere. And <code>dockerRun</code> will fail on any port already taken, so only one
+        recipe at a time.</p>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch05/</code> &middot;
+  <a href="../index.html">Spring 6 Recipes diagram index</a>
+</footer>
+</body>
+</html>

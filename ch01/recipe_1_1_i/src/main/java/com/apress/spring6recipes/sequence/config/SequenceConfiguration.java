@@ -8,6 +8,9 @@ import com.apress.spring6recipes.sequence.Sequence;
 @Configuration
 public class SequenceConfiguration {
 
+    /**
+     * @return 	A Sequence bean with a prefix of "30", a suffix of "A", and an initial value of 100000.
+     */
 	@Bean
 	public Sequence sequence() {
 		var seqgen = new Sequence();

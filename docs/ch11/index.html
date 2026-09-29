@@ -1,0 +1,947 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 11 — Spring Messaging — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 11</div>
+  <h1>Chapter 11 — Spring Messaging</h1>
+  <p class="lede">Every recipe in this chapter is the same postal parcel travelling between two JVM
+  processes — a <code>FrontDesk</code> producer and a <code>BackOffice</code> consumer — over a real message
+  broker. The chapter is a ladder: variant <em>i</em> drives the broker with its own native client, then
+  Spring’s <code>JmsTemplate</code>, message converters, transaction managers, listener containers and
+  connection pooling are added one rung at a time; the last two recipes repeat the same ladder for RabbitMQ
+  and Kafka. Nothing here is WebSocket, STOMP or GraphQL — <code>spring-websocket</code>,
+  <code>spring-messaging</code> and <code>spring-graphql</code> appear nowhere in <code>ch11/</code>.</p>
+  <div class="chip-row">
+    <span class="chip">32 modules, 16 FrontDesk / BackOffice pairs</span>
+    <span class="chip">recipes 11.1 – 11.7</span>
+    <span class="chip">spring-jms 6.0.3</span>
+    <span class="chip">spring-rabbit 3.0.0</span>
+    <span class="chip">spring-kafka 3.0.0</span>
+    <span class="chip">artemis-jakarta-client 2.27.1</span>
+    <span class="chip">destination mail.queue, Kafka topic mails</span>
+    <span class="chip">needs a running broker</span>
+    <span class="chip">./gradlew :ch11:recipe_11_2_ii_BackOffice:build</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch10/index.html">&larr; Chapter 10 — Spring Enterprise Integration</a>
+    <a href="../ch12/index.html">Chapter 12 — Spring Integration &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc"><h2>On this page</h2><ol>
+    <li><a href="#overview">Overview and module map</a></li>
+    <li><a href="#gateway">Getting onto JmsTemplate (11.1)</a></li>
+    <li><a href="#conversion">Payload conversion (11.2)</a></li>
+    <li><a href="#transactions">Transacted send and receive (11.3)</a></li>
+    <li><a href="#listeners">Listener containers and @JmsListener (11.4)</a></li>
+    <li><a href="#pooling">Connection pooling (11.5)</a></li>
+    <li><a href="#transports">Leaving JMS: AMQP and Kafka (11.6, 11.7)</a></li>
+    <li><a href="#styles">Messaging styles compared</a></li>
+    <li><a href="#running">Building and running</a></li>
+  </ol></aside>
+  <article>
+
+    <section id="overview">
+      <span class="kicker">Mental model</span>
+      <h2>One parcel, three brokers</h2>
+      <p>The domain is a mail room tracking parcels. The payload is identical in all 32 modules:
+      <code>Mail</code> with <code>mailId</code>, <code>country</code>, <code>weight</code> — a record in most
+      modules, and a plain JavaBean with getters and setters in the four modules where a bean-style class is
+      required (<code>recipe_11_1_iii_BackOffice</code>, <code>recipe_11_1_iv_BackOffice</code>,
+      <code>recipe_11_4_iv_FrontDesk</code>, <code>recipe_11_7_ii_FrontDesk</code>). Producers run
+      <code>FrontDeskMain</code>, consumers run <code>BackOfficeMain</code>; both boot a standalone
+      <code>AnnotationConfigApplicationContext</code> and exit, so the two processes only ever meet through
+      the broker.</p>
+      <p>Two destination names carry everything in the chapter: the queue <code>mail.queue</code> (JMS in
+      11.1–11.5, and the same literal reused as an AMQP routing key / queue name in 11.6) and the Kafka topic
+      <code>mails</code> (11.7). Every destination is point-to-point: no JMS <code>Topic</code> and no pub/sub
+      fan-out, no reply destination and no request-reply — <code>JmsTemplate.sendAndReceive</code> is never
+      called and <code>@SendTo</code> is never declared anywhere in <code>ch11/</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Broker and destination topology of all seven recipes</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    fdJ["FrontDeskMain, recipes 11.1 to 11.5"]
+    fdA["FrontDeskMain, recipes 11.6_i and 11.6_ii"]
+    fdK["FrontDeskMain, recipes 11.7_i and 11.7_ii"]
+
+    jt["JmsTemplate or raw JMSContext"]
+    rt["RabbitTemplate or raw rabbitmq client"]
+    kt["KafkaTemplate"]
+
+    ar["ActiveMQ Artemis, tcp localhost 61616"]
+    rb["RabbitMQ, 127.0.0.1 5672, guest guest"]
+    ka["Kafka, localhost 9092"]
+
+    jq[("mail.queue on JMS")]
+    aq[("mail.queue on AMQP")]
+    tp[("topic mails")]
+
+    poll["BackOfficeImpl receive and receiveAndConvert, 11.1 to 11.3"]
+    smlc["SimpleMessageListenerContainer, 11.4_i"]
+    jls["JmsListener MailListener, 11.4_ii to 11.5"]
+    rawc["DefaultConsumer via channel basicConsume, 11.6_i"]
+    rls["RabbitListener MailListener, 11.6_ii"]
+    kls["KafkaListener MailListener, group1, 11.7"]
+
+    fdJ --> jt --> ar --> jq
+    jq --> poll
+    jq --> smlc
+    jq --> jls
+    fdA --> rt --> rb --> aq
+    aq --> rawc
+    aq --> rls
+    fdK --> kt --> ka --> tp
+    tp --> kls
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Three producer entry points, three brokers, one
+      payload. The left branch is what most of the chapter is: <code>FrontDeskMain</code> looks up a
+      <code>FrontDesk</code> bean, that bean hands a <code>Mail</code> to a <code>JmsTemplate</code> (or, in
+      <code>recipe_11_1_i_FrontDesk</code>, to a plain <code>JMSContext</code>), and Artemis parks a
+      <code>MapMessage</code> on <code>mail.queue</code>. The middle of the branch matters: the queue has
+      <em>two</em> possible readers — the polling <code>BackOfficeImpl</code> used by 11.1–11.3, and the
+      push-based listener containers introduced in 11.4, which is exactly the axis the chapter turns on.
+      The AMQP branch reuses the literal <code>mail.queue</code> but on a different broker: in 11.6_i it is
+      published to the default exchange with that routing key, in 11.6_ii through
+      <code>RabbitTemplate.setRoutingKey("mail.queue")</code>. The Kafka branch is the only one with an
+      asynchronous return type — <code>KafkaOperations.send("mails", ...)</code> yields a future that
+      <code>FrontDeskImpl</code> completes with <code>whenComplete</code>.</p>
+
+      <div class="callout info">
+        <h4>Where chapter 11 stops and chapters 10 and 12 start</h4>
+        <p><strong>Chapter 10</strong> (<code>ch10/build.gradle</code>) has no broker on its classpath at all:
+        it is remote invocation and scheduling — the <code>replicator</code> and <code>weather</code> packages,
+        <code>jakarta.mail</code> for SMTP, <code>quartz</code> for jobs, and <code>spring-ws-core</code> for
+        SOAP. If a call blocks and returns a value to the caller, it is chapter 10.
+        <strong>Chapter 11</strong> is the broker-native layer: <code>spring-jms</code>,
+        <code>spring-rabbit</code>, <code>spring-kafka</code>, <code>JmsTemplate</code>, message converters,
+        <code>MessageListener</code> containers, <code>@JmsListener</code>, <code>@RabbitListener</code>,
+        <code>@KafkaListener</code>. Fire-and-forget, one queue, one topic.
+        <strong>Chapter 12</strong> (<code>ch12/build.gradle</code>) then puts
+        <code>spring-integration-core</code> and <code>spring-integration-jms</code> on top of the same
+        Artemis queue and re-expresses it as <code>IntegrationFlow</code> DSL, channels, transformers and
+        <code>@MessagingGateway</code> (e.g. <code>ch12/recipe_12_2_i/.../IntegrationConfiguration.java</code>
+        with its <code>jmsInbound</code> flow). Same broker, one abstraction higher.</p>
+      </div>
+
+      <h3>Module map</h3>
+      <table>
+        <thead><tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="num">11.1 i</td>
+            <td><code>recipe_11_1_i_FrontDesk</code>, <code>recipe_11_1_i_BackOffice</code></td>
+            <td>Baseline: Jakarta JMS 2.0 only. <code>ActiveMQConnectionFactory</code>, <code>JMSContext</code>,
+            <code>Session.AUTO_ACKNOWLEDGE</code> are coded inline; Spring is used for the bean and the main
+            method, nothing else.</td>
+            <td><code>FrontDeskImpl</code>, <code>BackOfficeImpl</code>, <code>Mail</code> record</td>
+          </tr>
+          <tr>
+            <td class="num">11.1 ii</td>
+            <td><code>recipe_11_1_ii_FrontDesk</code>, <code>recipe_11_1_ii_BackOffice</code></td>
+            <td>The same two operations through <code>JmsTemplate</code>: a <code>ConnectionFactory</code> bean,
+            a <code>Queue</code> bean named <code>mailDestination</code>, and a <code>MessageCreator</code>
+            lambda. Back office sets <code>setReceiveTimeout(10000)</code>.</td>
+            <td><code>FrontDeskImpl(JmsTemplate, Destination)</code>, <code>BackOfficeConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.1 iii</td>
+            <td><code>recipe_11_1_iii_FrontDesk</code>, <code>recipe_11_1_iii_BackOffice</code></td>
+            <td>Destination moves into the template: front desk uses <code>setDefaultDestination(mailDestination)</code>,
+            back office uses <code>setDefaultDestinationName("mail.queue")</code> and drops the injected
+            <code>Destination</code>. Back-office <code>Mail</code> becomes a JavaBean.</td>
+            <td><code>JmsTemplate.setDefaultDestination</code>, <code>Mail</code> class</td>
+          </tr>
+          <tr>
+            <td class="num">11.1 iv</td>
+            <td><code>recipe_11_1_iv_FrontDesk</code>, <code>recipe_11_1_iv_BackOffice</code></td>
+            <td>Implements the gateway by extending <code>JmsGatewaySupport</code> and calling
+            <code>getJmsTemplate()</code>; the config wires it with <code>setJmsTemplate(jms)</code> instead of a
+            constructor.</td>
+            <td><code>FrontDeskImpl extends JmsGatewaySupport</code>, <code>BackOfficeImpl</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.2 i</td>
+            <td><code>recipe_11_2_i_FrontDesk</code>, <code>recipe_11_2_i_BackOffice</code></td>
+            <td>Template-level conversion without a custom converter: <code>convertAndSend(Map)</code> out,
+            <code>receiveAndConvert()</code> cast back to a <code>Map</code> in.</td>
+            <td><code>FrontDeskImpl</code>, <code>BackOfficeImpl.convert(Map)</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.2 ii</td>
+            <td><code>recipe_11_2_ii_FrontDesk</code>, <code>recipe_11_2_ii_BackOffice</code></td>
+            <td>A <code>MessageConverter</code> of their own so the gateway speaks <code>Mail</code>:
+            <code>convertAndSend(mail)</code> and <code>(Mail) receiveAndConvert()</code>. The converter bean is
+            registered on the template via <code>setMessageConverter</code>.</td>
+            <td><code>MailMessageConverter</code>, <code>JmsTemplate</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.3</td>
+            <td><code>recipe_11_3_FrontDesk</code>, <code>recipe_11_3_BackOffice</code></td>
+            <td>Spring-managed JMS transactions: <code>@EnableTransactionManagement</code>, a
+            <code>JmsTransactionManager</code> bean, and <code>@Transactional</code> on
+            <code>sendMail</code> / <code>receiveMail</code>. These two modules alone also pull in
+            <code>spring-aop</code> and <code>aspectjtools</code> in <code>ch11/build.gradle</code>.</td>
+            <td><code>FrontOfficeConfiguration</code>, <code>JmsTransactionManager</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.4 i</td>
+            <td><code>recipe_11_4_i_FrontDesk</code>, <code>recipe_11_4_i_BackOffice</code></td>
+            <td>Stop polling: a <code>SimpleMessageListenerContainer</code> bean bound to
+            <code>mail.queue</code> with a <code>MailListener</code> that implements
+            <code>jakarta.jms.MessageListener</code> and unwraps the <code>MapMessage</code> by hand.</td>
+            <td><code>MailListener.onMessage(Message)</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.4 ii</td>
+            <td><code>recipe_11_4_ii_FrontDesk</code>, <code>recipe_11_4_ii_BackOffice</code></td>
+            <td><code>@EnableJms</code> plus <code>@JmsListener(destination = "mail.queue")</code> on a POJO
+            method taking a <code>Map</code>; the container is produced by
+            <code>SimpleJmsListenerContainerFactory</code>. No converter on the factory yet.</td>
+            <td><code>MailListener.displayMail(Map)</code>, <code>SimpleJmsListenerContainerFactory</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.4 iii</td>
+            <td><code>recipe_11_4_iii_FrontDesk</code>, <code>recipe_11_4_iii_BackOffice</code></td>
+            <td>Same annotated listener, but the factory is given
+            <code>setMessageConverter(new MailMessageConverter())</code>, so the method signature becomes
+            <code>displayMail(Mail mail)</code>.</td>
+            <td><code>MailMessageConverter</code>, <code>@JmsListener</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.4 iv</td>
+            <td><code>recipe_11_4_iv_FrontDesk</code>, <code>recipe_11_4_iv_BackOffice</code></td>
+            <td>Swaps the simple factory for <code>DefaultJmsListenerContainerFactory</code> with
+            <code>setSessionTransacted(true)</code> — acknowledge after the listener returns, redeliver on
+            exception. Its front desk is the odd one out: it builds a <code>GenericXmlApplicationContext</code>
+            from <code>beans-front.xml</code>.</td>
+            <td><code>DefaultJmsListenerContainerFactory</code>, <code>FrontDeskMain</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.5</td>
+            <td><code>recipe_11_5_FrontDesk</code>, <code>recipe_11_5_BackOffice</code></td>
+            <td>Connection reuse. Front desk wraps Artemis in Spring’s
+            <code>CachingConnectionFactory</code>; back desk wraps it in MessagingHub’s
+            <code>JmsPoolConnectionFactory</code> marked <code>@Primary</code>. Adds the
+            <code>pooled-jms</code> dependency for both modules.</td>
+            <td><code>CachingConnectionFactory</code>, <code>JmsPoolConnectionFactory</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.6 i</td>
+            <td><code>recipe_11_6_i_FrontDesk</code>, <code>recipe_11_6_i_BackOffice</code></td>
+            <td>The baseline repeated for AMQP with the vendor client only: <code>com.rabbitmq.client.ConnectionFactory</code>,
+            <code>channel.queueDeclare("mail.queue", true, false, false, null)</code>,
+            <code>basicPublish</code>, <code>DefaultConsumer.handleDelivery</code>, and Jackson
+            <code>ObjectMapper</code> by hand.</td>
+            <td><code>FrontDeskImpl</code>, <code>BackOfficeImpl</code>, <code>MailListener</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.6 ii</td>
+            <td><code>recipe_11_6_ii_FrontDesk</code>, <code>recipe_11_6_ii_BackOffice</code></td>
+            <td>Spring AMQP equivalents: <code>@EnableRabbit</code>, <code>RabbitTemplate</code> with
+            <code>Jackson2JsonMessageConverter</code> and <code>setRoutingKey("mail.queue")</code>,
+            <code>FrontDeskImpl extends RabbitGatewaySupport</code>, and
+            <code>@RabbitListener(queues = "mail.queue")</code>.</td>
+            <td><code>RabbitGatewaySupport</code>, <code>SimpleRabbitListenerContainerFactory</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.7 i</td>
+            <td><code>recipe_11_7_i_FrontDesk</code>, <code>recipe_11_7_i_BackOffice</code></td>
+            <td>Kafka with raw strings: <code>IntegerSerializer</code> and <code>StringSerializer</code> on the
+            producer, <code>ObjectMapper.writeValueAsString</code> called by hand in
+            <code>FrontDeskImpl.convertToJson</code>, <code>@KafkaListener(topics = "mails")</code> receiving a
+            <code>String</code>. Consumer group <code>group1</code>.</td>
+            <td><code>DefaultKafkaProducerFactory</code>, <code>ConcurrentKafkaListenerContainerFactory</code></td>
+          </tr>
+          <tr>
+            <td class="num">11.7 ii</td>
+            <td><code>recipe_11_7_ii_FrontDesk</code>, <code>recipe_11_7_ii_BackOffice</code></td>
+            <td>Let Spring Kafka do the JSON: producer switches to <code>JsonSerializer</code> and a
+            <code>KafkaTemplate&lt;Integer, Object&gt;</code>, consumer keeps
+            <code>StringDeserializer</code> but adds <code>StringJsonMessageConverter</code> so the listener
+            signature becomes <code>displayMail(Mail mail)</code>. Producer-side <code>Mail</code> is a JavaBean.</td>
+            <td><code>JsonSerializer</code>, <code>StringJsonMessageConverter</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="path">Sources: ch11/recipe_11_1_i_FrontDesk/src/main/java/com/apress/spring6recipes/post —
+      same package layout in all 32 modules.</p>
+    </section>
+
+    <section id="gateway">
+      <span class="kicker">Recipe 11.1</span>
+      <h2>Four ways to hold a JmsTemplate</h2>
+      <p>11.1 does not change the wire format at all — the payload is a JMS <code>MapMessage</code> with the
+      keys <code>mailId</code>, <code>country</code>, <code>weight</code> in every variant: built by hand with
+      <code>session.createMapMessage()</code> from 11.1_ii onward, and handed to the provider as a plain Java
+      <code>Map</code> in 11.1_i. What changes is who owns the connection plumbing and where the
+      destination lives.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Variant progression i to iv within recipe 11.1</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    v1["11.1_i, new ActiveMQConnectionFactory inside sendMail, JMSContext producer and consumer"]
+    v2["11.1_ii, JmsTemplate and Queue injected as constructor arguments"]
+    v3["11.1_iii, destination configured on the template, JmsTemplate only argument"]
+    v4["11.1_iv, class extends JmsGatewaySupport, template set by setter"]
+    v1 -->|"Spring takes over connection and session lifecycle"| v2
+    v2 -->|"send and receive drop the Destination argument"| v3
+    v3 -->|"boilerplate moves into the base class"| v4
+    v4 --> wire["same MapMessage body in all four variants"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> In <code>recipe_11_1_i_FrontDesk</code> the whole
+      try-with-resources block — <code>cf.createContext(Session.AUTO_ACKNOWLEDGE)</code>,
+      <code>new ActiveMQQueue("mail.queue")</code>, <code>ctx.createProducer().send(destination, mapContext)</code>
+      — sits inside
+      <code>FrontDeskImpl.sendMail</code>, and the configuration class contributes nothing but the bean. One
+      step right, <code>FrontOfficeConfiguration</code> declares <code>connectionFactory()</code>,
+      <code>mailDestination()</code> and <code>jmsTemplate(ConnectionFactory cf)</code>, and
+      <code>sendMail</code> shrinks to <code>jmsTemplate.send(destination, session -&gt; ...)</code> — a
+      <code>MessageCreator</code> lambda is all that is left of the JMS API. At <em>iii</em> the front desk
+      template is given <code>setDefaultDestination(destination)</code> while the back office template uses
+      <code>setDefaultDestinationName("mail.queue")</code>, so both sides now call the destination-free
+      overloads <code>send(MessageCreator)</code> and <code>receive()</code>. At <em>iv</em> the two
+      implementations extend <code>JmsGatewaySupport</code> and read the template through
+      <code>getJmsTemplate()</code>; the config changed from constructor injection to
+      <code>backOffice.setJmsTemplate(jms)</code>. Note that <em>iii</em> and <em>iv</em> also replace the
+      back-office <code>Mail</code> record with a mutable JavaBean — a leftover of the Spring 5 original, not a
+      functional requirement.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The gateway shapes and what they delegate to</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class FrontDesk {
+        sendMail(Mail mail)
+    }
+    class BackOffice {
+        receiveMail() Mail
+    }
+    class JmsGatewaySupport {
+        setJmsTemplate(JmsTemplate template)
+        getJmsTemplate() JmsTemplate
+    }
+    class JmsTemplate {
+        send(MessageCreator creator)
+        send(Destination destination, MessageCreator creator)
+        receive() Message
+        receiveAndConvert() Object
+        convertAndSend(Object payload)
+        setDefaultDestinationName(String name)
+        setReceiveTimeout(long timeout)
+        setMessageConverter(MessageConverter converter)
+    }
+    class FrontDeskImpl_ii {
+        sendMail(Mail mail)
+    }
+    class FrontDeskImpl_iv {
+        sendMail(Mail mail)
+    }
+    class BackOfficeImpl {
+        receiveMail() Mail
+    }
+    class RabbitGatewaySupport {
+        getRabbitOperations() RabbitOperations
+    }
+    class FrontDeskImpl_6ii {
+        sendMail(Mail mail)
+    }
+    class FrontDeskImpl_7i {
+        sendMail(Mail mail)
+    }
+    class KafkaOperations {
+        send(String topic, Object value)
+    }
+    FrontDeskImpl_ii --> JmsTemplate : injected field, recipes 11.1_ii and 11.1_iii
+    JmsGatewaySupport --> FrontDeskImpl_iv : superclass, 11.1_iv onward
+    JmsGatewaySupport --> BackOfficeImpl : superclass from 11.1_iv, constructor injected in 11.1_ii and iii
+    FrontDesk --> FrontDeskImpl_ii : implemented by
+    FrontDesk --> FrontDeskImpl_iv : implemented by
+    FrontDesk --> FrontDeskImpl_6ii : implemented by, recipe 11.6_ii
+    FrontDesk --> FrontDeskImpl_7i : implemented by, recipe 11.7_i
+    BackOffice --> BackOfficeImpl : implemented by
+    RabbitGatewaySupport --> FrontDeskImpl_6ii : superclass
+    FrontDeskImpl_iv --> JmsTemplate : via getJmsTemplate
+    BackOfficeImpl --> JmsTemplate : via getJmsTemplate
+    FrontDeskImpl_7i --> KafkaOperations : constructor injected KafkaTemplate
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the classes.</strong> Only two application types exist per side —
+      <code>FrontDesk</code>/<code>FrontDeskImpl</code> and <code>BackOffice</code>/<code>BackOfficeImpl</code> —
+      and the variants differ by <em>how the messaging client reaches them</em>: field injection
+      (<code>recipe_11_1_ii</code>), inheritance from <code>JmsGatewaySupport</code>
+      (<code>recipe_11_1_iv</code>, and again in <code>recipe_11_2</code>, <code>recipe_11_3</code> and
+      <code>recipe_11_5_FrontDesk</code>), or a constructor-injected <code>KafkaOperations</code>
+      (<code>recipe_11_7_i_FrontDesk</code>, which is the interface <code>KafkaTemplate</code> implements). The
+      AMQP twin of the inheritance style is <code>recipe_11_6_ii_FrontDesk</code>’s
+      <code>FrontDeskImpl extends RabbitGatewaySupport</code> calling
+      <code>getRabbitOperations().convertAndSend(mail)</code>. <code>JmsTemplate</code> is the single object
+      every JMS recipe funnels through, and it is where each recipe installs its knobs —
+      <code>setReceiveTimeout</code>, <code>setDefaultDestinationName</code>,
+      <code>setMessageConverter</code>.</p>
+    </section>
+
+    <section id="conversion">
+      <span class="kicker">Recipe 11.2</span>
+      <h2>convertAndSend, receiveAndConvert, and a converter of your own</h2>
+      <p>11.2_i keeps the <code>Map</code> from 11.1 but stops building the message by hand:
+      <code>FrontDeskImpl.sendMail</code> does <code>getJmsTemplate().convertAndSend(map)</code> and
+      <code>BackOfficeImpl.receiveMail</code> does <code>(Map&lt;String, ?&gt;) getJmsTemplate().receiveAndConvert()</code>
+      before reassembling a <code>Mail</code> with <code>convert(Map)</code>. No
+      <code>setMessageConverter</code> call exists in either configuration, so the template’s default
+      conversion — the one that maps a <code>Map</code> payload to a <code>MapMessage</code> and back — is doing
+      the work. 11.2_ii is the recipe where the chapter introduces <code>MailMessageConverter</code>,
+      which implements <code>org.springframework.jms.support.converter.MessageConverter</code> with
+      <code>toMessage(Object, Session)</code> and <code>fromMessage(Message)</code>; the identical class is
+      copy-pasted into eleven modules: both sides of 11.2_ii, 11.3, 11.4_iii and 11.5, the front desk of
+      11.4_i and 11.4_ii, and the back office of 11.4_iv.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Polling send and receive in recipe 11.2_ii</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant FM as FrontDeskMain
+    participant FD as FrontDeskImpl
+    participant JT as JmsTemplate
+    participant MC as MailMessageConverter
+    participant BR as Artemis mail.queue
+    participant BM as BackOfficeMain
+    participant BO as BackOfficeImpl
+    FM->>FD: getBean FrontDesk then sendMail
+    FD->>JT: convertAndSend mail
+    JT->>MC: toMessage mail and session
+    MC-->>JT: MapMessage mailId country weight
+    JT->>BR: producer send to mail.queue
+    BM->>BO: getBean BackOffice then receiveMail
+    BO->>JT: receiveAndConvert
+    JT->>BR: consumer receive, blocking up to receiveTimeout 10000 ms
+    BR-->>JT: MapMessage or null on timeout
+    JT->>MC: fromMessage message
+    MC-->>JT: Mail record
+    JT-->>BO: Mail, cast by BackOfficeImpl
+    BO-->>BM: printed as Recevied
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the sequence.</strong> The producer never sees
+      <code>jakarta.jms</code> types: <code>JmsTemplate.convertAndSend</code> opens a connection and session
+      from the <code>ConnectionFactory</code> bean, asks the registered converter for a
+      <code>Message</code>, sends it and closes the session — a connection-per-send that 11.5 exists to fix.
+      <code>setDefaultDestinationName("mail.queue")</code> is what lets <code>convertAndSend</code> be called
+      with one argument. On the return leg, the crucial contract is <em>symmetry</em>:
+      <code>BackOfficeConfiguration</code> installs <code>new MailMessageConverter()</code> on its own template,
+      because <code>fromMessage</code> casts to <code>MapMessage</code> and would throw a
+      <code>MessageConversionException</code> on anything else. <code>setReceiveTimeout(10000)</code> is only on
+      the back-office template; with no message queued the consumer blocks for ten seconds and then
+      <code>receiveAndConvert</code> yields <code>null</code>, which
+      <code>BackOfficeImpl.receiveMail</code> happily prints as <code>Recevied: null</code> — the typos in
+      <code>BackOfficeMain</code> are in the source.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Converter implementations and every place one is registered</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class MessageConverter {
+        toMessage(Object object, Session session) Message
+        fromMessage(Message message) Object
+    }
+    class MailMessageConverter {
+        toMessage(Object object, Session session) Message
+        fromMessage(Message message) Object
+    }
+    class JmsTemplate {
+        setMessageConverter(MessageConverter converter)
+    }
+    class SimpleJmsListenerContainerFactory {
+        setConnectionFactory(ConnectionFactory cf)
+        setMessageConverter(MessageConverter converter)
+    }
+    class DefaultJmsListenerContainerFactory {
+        setSessionTransacted(boolean transacted)
+    }
+    class SimpleRabbitListenerContainerFactory {
+        setConnectionFactory(ConnectionFactory cf)
+    }
+    class Jackson2JsonMessageConverter
+    class StringJsonMessageConverter
+    class ConcurrentKafkaListenerContainerFactory {
+        setConsumerFactory(ConsumerFactory cf)
+        setMessageConverter(StringJsonMessageConverter converter)
+    }
+    class RabbitTemplate {
+        setMessageConverter(Jackson2JsonMessageConverter converter)
+        setRoutingKey(String key)
+    }
+    MessageConverter --> MailMessageConverter : implemented by
+    MailMessageConverter --> JmsTemplate : registered with setMessageConverter in 11.2_ii, 11.3, 11.4_i to iii front desk, 11.5_FrontDesk
+    MailMessageConverter --> SimpleJmsListenerContainerFactory : registered in 11.4_iii only
+    MailMessageConverter --> DefaultJmsListenerContainerFactory : registered in 11.4_iv and 11.5_BackOffice
+    Jackson2JsonMessageConverter --> RabbitTemplate : registered in 11.6_ii front desk
+    Jackson2JsonMessageConverter --> SimpleRabbitListenerContainerFactory : registered in 11.6_ii back office
+    StringJsonMessageConverter --> ConcurrentKafkaListenerContainerFactory : registered in 11.7_ii only
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the classes.</strong> Spring’s three messaging projects each expose
+      the same <em>converter on the container factory</em> idea, and the recipes show all three: JMS via
+      <code>SimpleJmsListenerContainerFactory</code> / <code>DefaultJmsListenerContainerFactory</code>, AMQP via
+      <code>SimpleRabbitListenerContainerFactory</code> with <code>Jackson2JsonMessageConverter</code>, Kafka via
+      <code>ConcurrentKafkaListenerContainerFactory</code> with <code>StringJsonMessageConverter</code>. The
+      important asymmetry is 11.4_ii versus 11.4_iii: <em>both</em> use
+      <code>@JmsListener(destination = "mail.queue")</code>, but because <em>ii</em> registers no converter the
+      listener method must take a <code>Map</code>, while <em>iii</em> registers
+      <code>MailMessageConverter</code> on the factory and the method becomes <code>displayMail(Mail mail)</code>.
+      The converter therefore belongs to the receiving endpoint, not to the sending one — and the annotated
+      container needs its own copy because it does not borrow the sending <code>JmsTemplate</code>.</p>
+    </section>
+
+    <section id="transactions">
+      <span class="kicker">Recipe 11.3</span>
+      <h2>@Transactional over a JMS session</h2>
+      <p>11.3 is the only recipe in the chapter that turns on Spring’s transaction machinery, and it does so on
+      both sides symmetrically. <code>recipe_11_3_FrontDesk/.../config/FrontOfficeConfiguration.java</code> and
+      its <code>BackOfficeConfiguration</code> twin are the 11.2_ii bean methods plus
+      <code>@EnableTransactionManagement</code> and a <code>JmsTransactionManager transactionManager(ConnectionFactory cf)</code>
+      bean; <code>FrontDeskImpl.sendMail</code> and <code>BackOfficeImpl.receiveMail</code> are the 11.2_ii
+      methods plus <code>@Transactional</code>. Because the gateway classes implement interfaces, the proxy is a
+      JDK dynamic proxy and <code>context.getBean(BackOffice.class)</code> in <code>BackOfficeMain</code> returns
+      the proxy, not the target.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Config source to container to resolved bean graph in recipe 11.3</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    main["BackOfficeMain, AnnotationConfigApplicationContext with BackOfficeConfiguration class"]
+    cfg["BackOfficeConfiguration, Configuration and EnableTransactionManagement"]
+    cf["connectionFactory bean, ActiveMQConnectionFactory tcp 61616"]
+    jms["jmsTemplate bean, mail.queue, receiveTimeout 10000, MailMessageConverter"]
+    txm["transactionManager bean, JmsTransactionManager built from cf"]
+    target["backOffice bean, BackOfficeImpl with setJmsTemplate"]
+    proxy["Transactional proxy for the BackOffice interface"]
+    main -->|"passes the config class"| cfg
+    cfg -->|"Bean factory methods invoked in dependency order"| cf
+    cf -->|"constructor argument into jmsTemplate"| jms
+    cf -->|"constructor argument into the transaction manager"| txm
+    jms -->|"setter argument"| target
+    cfg -->|"EnableTransactionManagement registers an auto proxy creator"| proxy
+    target -->|"wrapped because receiveMail is annotated Transactional"| proxy
+    txm -->|"decides when the transaction commits"| proxy
+    main -->|"getBean for BackOffice hands back"| proxy
+    proxy -->|"opens a transacted session before the call, commits after it"| jms
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Start at <code>BackOfficeMain</code>: the config
+      class is the only input, and the container’s <code>@Bean</code> factory methods are invoked lazily in
+      dependency order — <code>connectionFactory()</code> first, because both
+      <code>jmsTemplate(ConnectionFactory cf)</code> and <code>transactionManager(ConnectionFactory cf)</code>
+      request it. The <code>@EnableTransactionManagement</code> annotation registers the auto-proxy creator, so
+      the <code>backOffice</code> bean that leaves the container is a proxy around the target
+      <code>BackOfficeImpl</code>. When <code>receiveMail()</code> is invoked, the transaction interceptor opens a
+      transacted JMS session through <code>JmsTransactionManager</code> and binds it to the thread before the
+      target method body runs; <code>JmsTemplate</code>, given the same <code>ConnectionFactory</code>, detects
+      that bound session instead of creating a fresh one, and the acknowledgment happens at commit rather than
+      immediately. On the front-desk side the same pairing makes <code>convertAndSend</code> commit the send.
+      Note the second-order effect: <code>ch11/build.gradle</code> adds <code>spring-aop</code> and
+      <code>aspectjtools</code> to these two modules only — the annotation-driven proxying is what needs them.</p>
+    </section>
+
+    <section id="listeners">
+      <span class="kicker">Recipe 11.4</span>
+      <h2>From MessageListener to @JmsListener</h2>
+      <p>11.4 is where the back office stops asking and starts receiving. The <em>FrontDesk</em> half of
+      11.4_i–iii is unchanged from 11.3 and is only there to have something to send; all four variants differ in
+      the <em>BackOffice</em> container, and each <code>BackOfficeMain</code> is now just
+      <code>AnnotationConfigApplicationContext</code> followed by <code>System.in.read()</code> — the process
+      exists only to keep the container alive.</p>
+      <ul>
+        <li><code>recipe_11_4_i_BackOffice</code>: a <code>SimpleMessageListenerContainer</code> returned from a
+        bean method declared as <code>Object container(ConnectionFactory cf, MailListener msgListener)</code>,
+        configured with <code>setDestinationName("mail.queue")</code> and <code>setMessageListener(msgListener)</code>;
+        <code>MailListener implements MessageListener</code> and casts to <code>MapMessage</code> itself.</li>
+        <li><code>recipe_11_4_ii_BackOffice</code>: <code>@EnableJms</code> and a
+        <code>SimpleJmsListenerContainerFactory</code>; the listener is now an annotated POJO method
+        <code>@JmsListener(destination = "mail.queue") displayMail(Map)</code>.</li>
+        <li><code>recipe_11_4_iii_BackOffice</code>: identical, except the factory gets
+        <code>setMessageConverter(new MailMessageConverter())</code> and the parameter becomes
+        <code>Mail</code>. The <code>mailListener()</code> bean method stays in the config even though the
+        annotation no longer needs an explicit reference.</li>
+        <li><code>recipe_11_4_iv_BackOffice</code>: <code>DefaultJmsListenerContainerFactory</code> plus
+        <code>setSessionTransacted(true)</code> and the converter. Its <em>FrontDesk</em> is also the only module
+        in the chapter that boots XML: <code>new GenericXmlApplicationContext("beans-front.xml")</code>.</li>
+      </ul>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Push delivery through a JMS listener container</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant BM as BackOfficeMain
+    participant CX as AnnotationConfigApplicationContext
+    participant LC as Listener container
+    participant BR as Artemis mail.queue
+    participant ML as MailListener
+    participant FM as FrontDeskMain
+    FM->>BR: convertAndSend mail, MapMessage queued
+    BM->>CX: new context with BackOfficeConfiguration
+    CX->>LC: refresh creates and starts the container bean
+    LC->>BR: createConnection, createConsumer on mail.queue
+    LC->>ML: attach as MessageListener
+    BR-->>LC: onMessage pushed with the MapMessage
+    LC->>ML: 11.4_i calls onMessage directly
+    LC->>ML: 11.4_ii to iv converts then invokes displayMail
+    ML-->>BM: System.out printf Received
+    Note over LC,ML: sessionTransacted true in 11.4_iv acknowledges only after displayMail returns
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the sequence.</strong> Ordering is the whole story. The container bean
+      is started by the context refresh — <code>SimpleMessageListenerContainer</code> and the
+      <code>@JmsListener</code> containers are lifecycle beans, which is why <em>11.4_i</em> can declare the bean
+      with return type <code>Object</code> and still get started: the container inspects the instance, not the
+      signature. <code>System.in.read()</code> then blocks the non-daemon main thread so the JVM survives long
+      enough for the broker to push. From <em>ii</em> onwards the registration path changes: <code>@EnableJms</code>
+      installs a post-processor that scans beans for <code>@JmsListener</code> and builds a container per method
+      from the factory named <code>jmsListenerContainerFactory</code> — that bean-name match is the only link
+      between the annotation and the configuration. <em>iv</em>’s
+      <code>DefaultJmsListenerContainerFactory.setSessionTransacted(true)</code> is the substantive upgrade over
+      <em>iii</em>: with a transacted session, acknowledgment is the container’s decision after
+      <code>displayMail</code> returns without throwing; a listener that throws rolls the session back and the
+      message is redelivered instead of silently consumed.</p>
+
+      <div class="callout danger">
+        <h4>recipe_11_4_iv_FrontDesk does not run as checked in</h4>
+        <p><code>FrontDeskMain</code> in that module does
+        <code>new GenericXmlApplicationContext("beans-front.xml")</code>, but there is no
+        <code>src/main/resources</code> directory anywhere under <code>ch11/</code> — no XML file to resolve.
+        Pair <code>recipe_11_4_iv_BackOffice</code> with the Java-config producer from
+        <code>recipe_11_4_i_FrontDesk</code> instead; the wire format is compatible, since that producer sends a
+        <code>Map</code> that lands as a <code>MapMessage</code> which <em>iv</em>’s
+        <code>MailMessageConverter</code> reads back.</p>
+      </div>
+    </section>
+
+    <section id="pooling">
+      <span class="kicker">Recipe 11.5</span>
+      <h2>Two kinds of pooling, and which bean wins</h2>
+      <p>11.5 is a performance recipe, and the two sides deliberately use different libraries. The front desk
+      wraps Artemis in Spring’s own <code>CachingConnectionFactory</code> (<code>spring-jms</code>, reusing the
+      connection and cached sessions for producers); the back desk wraps it in MessagingHub
+      <code>JmsPoolConnectionFactory</code> from <code>org.messaginghub:pooled-jms</code>, added to these two
+      modules only, and marks it <code>@Primary</code>. The listener side keeps 11.4_iv’s
+      <code>DefaultJmsListenerContainerFactory</code> with <code>setSessionTransacted(true)</code> and the
+      converter; the listener itself is unchanged
+      (<code>@JmsListener(destination = "mail.queue") displayMail(Mail mail)</code>).</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Connection factory decoration and by-type injection resolution</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph FRONT["recipe_11_5_FrontDesk, FrontOfficeConfiguration"]
+        amq1["connectionFactory bean, ActiveMQConnectionFactory"]
+        cach["cachingConnectionFactory bean, CachingConnectionFactory wraps amq1"]
+        jt1["jmsTemplate bean, parameter typed CachingConnectionFactory"]
+        txm1["transactionManager bean, parameter named connectionFactory"]
+        fd["frontDesk bean, setJmsTemplate"]
+    end
+    subgraph BACK["recipe_11_5_BackOffice, BackOfficeConfiguration"]
+        amq2["connectionFactory bean, ActiveMQConnectionFactory"]
+        pool["pooledConnectionFactory bean, JmsPoolConnectionFactory with Primary"]
+        dtf["jmsListenerContainerFactory bean, DefaultJmsListenerContainerFactory"]
+        ml["mailListener bean, MailListener with JmsListener"]
+    end
+    amq1 -->|"delegated target"| cach
+    amq1 -->|"plain target, resolved by parameter name"| txm1
+    cach -->|"resolved by parameter type"| jt1
+    jt1 --> fd
+    amq2 -->|"underlying factory"| pool
+    amq2 -.->|"candidate by type"| dtf
+    pool -->|"Primary wins the ambiguous injection"| dtf
+    dtf --> ml
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Both subgraphs start from the same
+      <code>ActiveMQConnectionFactory</code> bean and end in a decorated wrapper, but they show two different
+      disambiguation rules. In the front desk there are two beans assignable to
+      <code>jakarta.jms.ConnectionFactory</code>, so
+      <code>jmsTemplate(CachingConnectionFactory cf)</code> narrows by the declared parameter type, while
+      <code>transactionManager(ConnectionFactory connectionFactory)</code> stays ambiguous and falls back to
+      matching the parameter <em>name</em> against the bean name — the raw factory, not the caching one. That is
+      a real behavioural consequence, not a typo: a caching connection factory under a JMS transaction manager
+      is the combination Spring warns about. In the back office the ambiguity is resolved declaratively instead:
+      <code>pooledConnectionFactory</code> carries <code>@Primary</code>, so
+      <code>jmsListenerContainerFactory(ConnectionFactory cf)</code> receives the pool and the container
+      borrows pooled connections per consumer. Nothing else changed relative to 11.4_iv — the pooling recipe is
+      purely an infrastructure swap.</p>
+    </section>
+
+    <section id="transports">
+      <span class="kicker">Recipes 11.6 and 11.7</span>
+      <h2>The same ladder on RabbitMQ and Kafka</h2>
+      <p>11.6 and 11.7 replay 11.1_i → 11.2/11.4 for two non-JMS transports, and the module pattern is identical:
+      <em>i</em> uses the vendor client directly, <em>ii</em> uses the Spring project. 11.6_i
+      (<code>recipe_11_6_i_FrontDesk</code>) builds a <code>com.rabbitmq.client.ConnectionFactory</code> with
+      host <code>localhost</code>, credentials <code>guest</code>/<code>guest</code>, port 5672, declares the
+      durable queue, and publishes JSON from an <code>ObjectMapper</code> via <code>basicPublish("", "mail.queue", null, bytes)</code>
+      — the empty exchange, i.e. the default exchange, whose routing rule is “deliver to the queue named by the
+      key”. Its back office registers an anonymous <code>DefaultConsumer</code> in
+      <code>handleDelivery</code> and calls <code>channel.basicConsume("mail.queue", true, consumer)</code> with
+      auto-acknowledgment on; <code>receiveMail()</code> returns <code>null</code> because the method is there
+      only to install the consumer.</p>
+      <p>11.6_ii replaces all of that with <code>spring-rabbit</code>: <code>@EnableRabbit</code>,
+      <code>SimpleRabbitListenerContainerFactory</code> and <code>@RabbitListener(queues = "mail.queue")</code>
+      on the consuming side, and on the producing side a <code>RabbitTemplate</code> configured with
+      <code>setRoutingKey("mail.queue")</code> plus <code>Jackson2JsonMessageConverter</code>, injected into a
+      <code>FrontDeskImpl extends RabbitGatewaySupport</code> and used as
+      <code>getRabbitOperations().convertAndSend(mail)</code>. The connection is
+      <code>org.springframework.amqp.rabbit.connection.CachingConnectionFactory("127.0.0.1")</code> on 5672 —
+      Spring AMQP’s caching factory, not the JMS one from 11.5.</p>
+      <p>11.7 is Kafka and the only place the chapter leaves point-to-point for a partitioned log. Note what is
+      <em>not</em> here: no consumer-per-message acknowledgment control, no re-delivery, no transaction manager,
+      and the destination is the topic literal <code>mails</code> in both <code>KafkaOperations.send</code> and
+      <code>@KafkaListener(topics = "mails")</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Kafka produce and consume round trip, 11.7_i versus 11.7_ii</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant FM as FrontDeskMain
+    participant FD as FrontDeskImpl
+    participant KT as KafkaTemplate
+    participant BR as Kafka localhost 9092
+    participant CL as ConcurrentMessageListenerContainer
+    participant SC as StringJsonMessageConverter
+    participant ML as MailListener
+    FM->>FD: sendMail with Mail 1234 US 1.5
+    FD->>KT: send to topic mails
+    Note over FD,KT: 11.7_i converts with ObjectMapper first, 11.7_ii lets JsonSerializer do it
+    KT->>BR: ProducerRecord, Integer key and String or JSON value
+    KT-->>FD: CompletableFuture of the send result
+    FD->>FD: whenComplete logs getRecordMetadata
+    CL->>BR: subscribe as group1 and poll the topic
+    BR-->>CL: ConsumerRecord batch
+    CL->>SC: fromMessage, only present in 11.7_ii
+    SC-->>CL: Mail instance
+    CL->>ML: displayMail, String in 11.7_i, Mail in 11.7_ii
+    CL-->>BR: container commits the offset for group1 after displayMail returns
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the sequence.</strong> The producer leg is asynchronous in a way the
+      JMS recipes never were: <code>FrontDeskImpl</code> holds a <code>KafkaOperations</code> (the interface
+      <code>KafkaTemplate</code> implements) and its <code>send("mails", ...)</code> returns a future, which
+      <code>whenComplete</code> turns into a log line with <code>sendResult.getRecordMetadata()</code> — hence
+      both <code>FrontDeskMain</code> classes end in <code>System.in.read()</code>, because the record would
+      otherwise be sent and the JVM would exit before the callback ran. Two different <code>KafkaTemplate</code>
+      generics distinguish the variants: <em>i</em> is <code>KafkaTemplate&lt;Integer, String&gt;</code> fed by
+      <code>StringSerializer</code>, <em>ii</em> is <code>KafkaTemplate&lt;Integer, Object&gt;</code> fed by
+      <code>JsonSerializer</code>, and that is why <code>recipe_11_7_ii_FrontDesk</code>’s <code>Mail</code>
+      became a getter-driven JavaBean. On the consuming leg the deserializers were deliberately left alone —
+      <code>IntegerDeserializer</code> and <code>StringDeserializer</code> in both variants — so <em>ii</em>
+      bridges JSON-in-a-String to a <code>Mail</code> by putting <code>StringJsonMessageConverter</code> on the
+      <code>ConcurrentKafkaListenerContainerFactory</code>. Offset management is the container’s, which is why
+      <code>consumerConfiguration()</code> pins <code>GROUP_ID_CONFIG</code> to <code>group1</code>.</p>
+    </section>
+
+    <section id="styles">
+      <span class="kicker">Comparison</span>
+      <h2>The messaging styles this chapter demonstrates</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Style</th>
+            <th>Recipes</th>
+            <th>Client abstraction</th>
+            <th>Endpoint in code</th>
+            <th>Threading and ack</th>
+            <th>Evidence</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Vendor client, hand rolled</td>
+            <td>11.1_i, 11.6_i</td>
+            <td><code>JMSContext</code> / <code>com.rabbitmq.client</code> channel</td>
+            <td><code>sendMail</code>, <code>receiveMail</code>, anonymous <code>DefaultConsumer</code></td>
+            <td>Caller’s thread; <code>AUTO_ACKNOWLEDGE</code> or <code>autoAck true</code></td>
+            <td><code>ch11/recipe_11_1_i_BackOffice/.../BackOfficeImpl.java</code>, <code>ch11/recipe_11_6_i_BackOffice/.../BackOfficeImpl.java</code></td>
+          </tr>
+          <tr>
+            <td>Template, explicit destination</td>
+            <td>11.1_ii</td>
+            <td><code>JmsTemplate</code> with an injected <code>Queue</code></td>
+            <td><code>send(Destination, MessageCreator)</code>, <code>receive(Destination)</code></td>
+            <td>Caller’s thread, connection per call, ten-second receive timeout</td>
+            <td><code>ch11/recipe_11_1_ii_BackOffice/.../config/BackOfficeConfiguration.java</code></td>
+          </tr>
+          <tr>
+            <td>Template, default destination</td>
+            <td>11.1_iii, 11.1_iv, 11.2_i</td>
+            <td><code>JmsTemplate</code> plus <code>JmsGatewaySupport</code></td>
+            <td><code>send(creator)</code>, <code>receive()</code>, <code>convertAndSend(map)</code></td>
+            <td>Caller’s thread</td>
+            <td><code>ch11/recipe_11_1_iv_FrontDesk/.../FrontDeskImpl.java</code></td>
+          </tr>
+          <tr>
+            <td>Converter-driven gateway</td>
+            <td>11.2_ii, 11.3, 11.5</td>
+            <td><code>JmsTemplate</code> with <code>MailMessageConverter</code></td>
+            <td><code>convertAndSend(mail)</code>, <code>receiveAndConvert()</code></td>
+            <td>Caller’s thread; 11.3 adds commit or rollback around the call</td>
+            <td><code>ch11/recipe_11_2_ii_BackOffice/.../MailMessageConverter.java</code></td>
+          </tr>
+          <tr>
+            <td>Transacted polling</td>
+            <td>11.3</td>
+            <td><code>JmsTransactionManager</code> + <code>@Transactional</code></td>
+            <td><code>sendMail</code> / <code>receiveMail</code> behind a proxy</td>
+            <td>Caller’s thread, session committed on return</td>
+            <td><code>ch11/recipe_11_3_BackOffice/.../config/BackOfficeConfiguration.java</code></td>
+          </tr>
+          <tr>
+            <td>Push, programmatic listener</td>
+            <td>11.4_i</td>
+            <td><code>SimpleMessageListenerContainer</code></td>
+            <td><code>MailListener implements MessageListener</code></td>
+            <td>Container’s consumer thread, one message per <code>onMessage</code></td>
+            <td><code>ch11/recipe_11_4_i_BackOffice/.../config/BackOfficeConfiguration.java</code></td>
+          </tr>
+          <tr>
+            <td>Push, annotated listener</td>
+            <td>11.4_ii, 11.4_iii, 11.4_iv, 11.5</td>
+            <td><code>@EnableJms</code> with simple then default container factory</td>
+            <td><code>@JmsListener(destination = "mail.queue")</code></td>
+            <td>Container thread; transacted session from <em>iv</em> onward</td>
+            <td><code>ch11/recipe_11_4_iv_BackOffice/.../config/BackOfficeConfiguration.java</code></td>
+          </tr>
+          <tr>
+            <td>AMQP declarative</td>
+            <td>11.6_ii</td>
+            <td><code>RabbitTemplate</code>, <code>SimpleRabbitListenerContainerFactory</code></td>
+            <td><code>@RabbitListener(queues = "mail.queue")</code></td>
+            <td>Container thread, Jackson JSON body</td>
+            <td><code>ch11/recipe_11_6_ii_BackOffice/.../MailListener.java</code></td>
+          </tr>
+          <tr>
+            <td>Kafka asynchronous producer plus polled consumer</td>
+            <td>11.7_i, 11.7_ii</td>
+            <td><code>KafkaTemplate</code>, <code>ConcurrentKafkaListenerContainerFactory</code></td>
+            <td><code>@KafkaListener(topics = "mails")</code></td>
+            <td>Future callback on the producer; container poll loop in group <code>group1</code></td>
+            <td><code>ch11/recipe_11_7_i_BackOffice/.../config/BackOfficeConfiguration.java</code></td>
+          </tr>
+        </tbody>
+      </table>
+      <p>No style in this table is a request-reply pair, and none is a broadcast: every recipe is a single
+      producer, a single named destination, and a single consumer. <code>@SendTo</code>,
+      <code>@DirtiestContext</code>-style headers, <code>replyTemplate</code> and STOMP never appear in
+      <code>ch11/</code>.</p>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Running it</span>
+      <h2>Build, start a broker, run both mains</h2>
+      <p>Modules are addressed as <code>:ch11:&lt;dir&gt;</code>; <code>settings.gradle</code> walks every
+      <code>ch*</code> directory containing “recipe” and includes it. There is no <code>application</code>
+      plugin in this chapter, so there is no <code>run</code> task. <code>ch11/build.gradle</code> applies the
+      shadow plugin to every subproject, makes <code>build</code> finalise on <code>shadowJar</code>, and sets
+      the jar manifest’s <code>Main-Class</code> to <code>com.apress.spring6recipes.post.FrontDeskMain</code> or
+      <code>...post.BackOfficeMain</code> based on whether the module name contains <code>Front</code> or
+      <code>Back</code>:</p>
+      <pre><code>./gradlew :ch11:recipe_11_2_ii_FrontDesk:build
+java --enable-preview -jar ch11/recipe_11_2_ii_FrontDesk/build/libs/recipe_11_2_ii_FrontDesk-6.0.0-SNAPSHOT-all.jar</code></pre>
+      <p>The version comes from <code>gradle.properties</code> (<code>version=6.0.0-SNAPSHOT</code>) and the
+      <code>-all</code> classifier from shadow, so list <code>build/libs</code> rather than typing the name. The
+      root build passes <code>--enable-preview</code> to every <code>JavaCompile</code> and
+      <code>JavaExec</code> task, so keep that flag on the command line when you run the jar, and note that
+      <code>gradle.properties</code> pins <code>org.gradle.java.home</code> to a local JDK 17 path while the root
+      build requests a Java 19 toolchain — adjust it for your machine before the first build.</p>
+      <p>Run the consumer first, then the producer. The consumer mains for 11.4 onwards block on
+      <code>System.in.read()</code>, so press Enter to shut them down. Java 19 is the toolchain version pinned
+      in the root <code>build.gradle</code>, and <code>--enable-preview</code> is passed to compile, test and
+      exec tasks.</p>
+
+      <h3>Broker prerequisites, per transport</h3>
+      <table>
+        <thead><tr><th>Recipes</th><th>Broker the code expects</th><th>How the repo starts it</th><th>Watch out</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="num">11.1 – 11.5</td>
+            <td>ActiveMQ Artemis on <code>tcp://localhost:61616</code>, queue <code>mail.queue</code>, no
+            credentials supplied</td>
+            <td><code>bin/artemis.sh</code> or <code>bin/start_all.sh</code>
+            (<code>s6r-artemis</code>, also exposes the console on 8161)</td>
+            <td>The compose service sets <code>AMQ_USER/AMQ_PASSWORD=admin</code> while the recipes connect
+            anonymously; enable anonymous access on the broker or the connection is refused.</td>
+          </tr>
+          <tr>
+            <td class="num">11.6</td>
+            <td>RabbitMQ on <code>127.0.0.1:5672</code>, <code>guest</code>/<code>guest</code>, durable queue
+            <code>mail.queue</code> on the default exchange</td>
+            <td><code>bin/rabbitmq.sh</code> (<code>docker-compose-rabbitmq.yml</code>, management UI on 15672)</td>
+            <td>Both 11.6_i modules call <code>queueDeclare</code> themselves; 11.6_ii declares no
+            <code>Queue</code> bean and its <code>RabbitTemplate</code> publishes to the default exchange, so the
+            durable <code>mail.queue</code> must already exist — run <code>recipe_11_6_i_FrontDesk</code> once, or
+            create it in the management UI.</td>
+          </tr>
+          <tr>
+            <td class="num">11.7</td>
+            <td>Kafka broker on <code>localhost:9092</code>, topic <code>mails</code>, consumer group
+            <code>group1</code></td>
+            <td><code>bin/kafka.sh</code> creates topic <code>mails</code> with one partition and one replica</td>
+            <td><code>bin/docker-compose-kafka.yml</code> declares <code>KAFKA_CREATE_TOPICS: "mails:1:1"</code>
+            but uses <code>build: .</code> with no Dockerfile in <code>bin/</code>, and advertises host
+            <code>kafka</code> where the recipes dial <code>localhost:9092</code>. Bring up a broker whose
+            advertised listener resolves to <code>localhost</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Verified constraints</h3>
+      <ul>
+        <li>No recipe in <code>ch11/</code> starts an embedded broker. <code>artemis-jakarta-server</code> is on
+        every subproject’s classpath from <code>ch11/build.gradle</code>, but no source file references a broker
+        service — you must supply the process.</li>
+        <li><code>recipe_11_4_iv_FrontDesk</code> fails to start standalone: it loads
+        <code>beans-front.xml</code>, and no XML resource exists under <code>ch11/</code>.</li>
+        <li><code>recipe_11_6_i_FrontDesk</code>’s configuration carries
+        <code>@EnableScheduling</code> but nothing in the chapter declares a scheduled method — no
+        <code>@Scheduled</code> exists in <code>ch11/</code>.</li>
+        <li><code>recipe_11_4_ii_BackOffice</code> imports <code>CachingConnectionFactory</code> without using
+        it; the plain factory is injected there. The caching wrapper first appears in 11.5.</li>
+        <li>Every recipe is a plain <code>main</code> method. There are no tests, no
+        <code>src/test</code> sources, no <code>application.properties</code> and no Spring Boot in this
+        chapter.</li>
+      </ul>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">Generated from source in <code>ch11/</code> · <a href="../index.html">All chapters</a></footer>
+</body>
+</html>

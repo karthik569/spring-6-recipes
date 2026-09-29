@@ -19,8 +19,14 @@ subprojects { subproject ->
         apply plugin: 'war'
         apply plugin: 'com.palantir.docker'
         apply plugin: 'com.palantir.docker-run'
+        apply plugin: 'org.gretty'
 
         defaultTasks 'build', 'docker'
+
+        gretty {
+            servletContainer = 'tomcat10'
+            contextPath = '/'
+        }
 
         dependencies {
             implementation(project(":ch02:recipe_2_shared"))

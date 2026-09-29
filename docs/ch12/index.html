@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 12 — Spring Integration — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 12</div>
+  <h1>Chapter 12 — Spring Integration</h1>
+  <p class="lede">Seventeen small console applications that put the enterprise integration patterns on
+  Spring's own message bus: <code>@EnableIntegration</code>, a Java DSL <code>IntegrationFlow</code> bean, and
+  endpoints (adapters, transformers, splitters, aggregators, routers, gateways) wired through channels. Every
+  recipe is driven by one of three triggers — a JMS message into ActiveMQ Artemis, a file dropped into a
+  directory the flow polls, or a method call on a gateway interface.</p>
+  <div class="chip-row">
+    <span class="chip">17 modules / 77 Java files</span>
+    <span class="chip">spring-integration-core 6.0.0</span>
+    <span class="chip">+ -jms, -file, spring-batch-integration</span>
+    <span class="chip">Java DSL, no XML</span>
+    <span class="chip">ActiveMQ Artemis on tcp://localhost:61616</span>
+    <span class="chip">./gradlew :ch12:recipe_12_2_i:build</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch11/index.html">&larr; Chapter 11 — Spring Messaging</a>
+    <a href="../ch13/index.html">Chapter 13 — Spring Testing &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc">
+    <h2>On this page</h2>
+    <ol>
+      <li><a href="#overview">Overview and module map</a></li>
+      <li><a href="#jms-endpoints">Consuming JMS messages (12-2)</a></li>
+      <li><a href="#file-endpoints">Polling directories and binding headers (12-3, 12-4)</a></li>
+      <li><a href="#transform">Transforming payloads and headers (12-5)</a></li>
+      <li><a href="#errors">Error channels and error routing (12-6)</a></li>
+      <li><a href="#split-aggregate-route">Splitter, aggregator, router (12-7, 12-8)</a></li>
+      <li><a href="#gateways">Messaging gateways and the batch handoff (12-9, 12-10)</a></li>
+      <li><a href="#running">Building and running the recipes</a></li>
+    </ol>
+  </aside>
+  <article>
+
+    <section id="overview">
+      <span class="kicker">Mental model</span>
+      <h2>Overview and module map</h2>
+      <p>Each module is the same shape: one <code>@Configuration @EnableIntegration</code> class, one or more
+      <code>@Bean IntegrationFlow</code> methods built with the fluent DSL, one or more annotated POJOs holding
+      the business method (<code>@Transformer</code>, <code>@ServiceActivator</code>, <code>@Splitter</code>,
+      <code>@Router</code>), and a <code>Main</code> that opens an <code>AnnotationConfigApplicationContext</code>
+      and then either blocks on <code>System.in.read()</code> or sends a trigger. There is no web container and
+      no XML: grep the chapter and the only Spring descriptors are Java annotations.</p>
+      <p>Two toy domains carry all the traffic. The <code>Customer</code> record
+      (<code>id</code>, <code>firstName</code>, <code>lastName</code>, <code>telephone</code>,
+      <code>creditScore</code>) recurs across the JMS, file, transform, split and route recipes; the
+      <code>myholiday</code> package (<code>VacationService</code>, <code>HotelReservationSearch</code>,
+      <code>HotelReservation</code>) carries the request-reply gateway recipe. Messages are Spring
+      <em>Integration</em> messages — <code>org.springframework.messaging.Message</code> with a payload plus a
+      header map — never raw JMS or file objects for long.</p>
+
+      <div class="callout info">
+        <h4>Where this chapter stops and chapters 10 and 11 start</h4>
+        <p>The three chapters share a broker and a vocabulary, so the boundary is worth fixing from the build
+        files rather than from the chapter titles:</p>
+        <ul>
+          <li><strong>Only <code>ch12/build.gradle</code> declares Spring Integration.</strong> It adds
+          <code>spring-integration-core</code> to every subproject, <code>spring-integration-jms</code> to the
+          JMS recipes, <code>spring-integration-file</code> to the file recipes, and
+          <code>spring-batch-integration</code> to <code>recipe_12_9</code>. The platform comes from
+          <code>spring-integration-bom:6.0.0</code> in <code>spring-6-recipes-dependencies/build.gradle</code>.</li>
+          <li><strong>Chapter 11 is plain <code>spring-jms</code>.</strong> Its post-office recipes use
+          <code>JmsTemplate</code>, <code>JmsGatewaySupport</code>, <code>@JmsListener</code> with
+          <code>@EnableJms</code>, and custom <code>MessageConverter</code>s. No flows, no channels, no
+          <code>Message</code> abstraction.</li>
+          <li><strong>Chapter 10 is the older "enterprise integration" toolkit</strong> — JMX,
+          <code>@Scheduled</code>, <code>JavaMailSender</code>, <code>WebServiceTemplate</code>, remoting — not
+          messaging at all.</li>
+          <li>Verification: <code>org.springframework.integration</code> and <code>org.springframework.messaging</code>
+          are imported by Java files in <code>ch12/</code> only; a grep over <code>ch10</code>, <code>ch11</code>,
+          <code>ch13</code> and <code>ch14</code> returns nothing. Chapter 12 is the <em>only</em> Spring
+          Integration chapter in this repository, even though chapter 10's description line reads
+          "Spring Enterprise Integration".</li>
+        </ul>
+      </div>
+
+      <h3>Module map</h3>
+      <table>
+        <thead>
+        <tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes and beans</th></tr>
+        </thead>
+        <tbody>
+        <tr><td class="num">12-1</td><td><em>none committed</em></td>
+            <td>No <code>recipe_12_1_*</code> directory exists in the repo; the chapter's code starts at 12-2. The
+            dependency set that recipe would have introduced is visible in <code>ch12/build.gradle</code>.</td>
+            <td>&mdash;</td></tr>
+        <tr><td class="num">12-2</td><td><code>recipe_12_2_i</code>, <code>recipe_12_2_ii</code></td>
+            <td>A message-driven JMS channel adapter as a flow source; the two variants differ only in
+            <code>extractPayload(true)</code> versus <code>extractPayload(false)</code>.</td>
+            <td><code>IntegrationConfiguration.jmsInbound</code>,
+            <code>InboundHelloWorldJMSMessageProcessor.handleIncomingJmsMessage</code></td></tr>
+        <tr><td class="num">12-3</td><td><code>recipe_12_3_i</code>, <code>_ii</code>, <code>_iii</code></td>
+            <td>Three ways to bind an inbound <code>File</code> message: whole <code>Message</code>, individual
+            <code>@Header</code> arguments, one <code>@Headers</code> map.</td>
+            <td><code>InboundFileMessageServiceActivator.interrogateMessage</code> — the only class shipped per module</td></tr>
+        <tr><td class="num">12-4</td><td><code>recipe_12_4_i</code></td>
+            <td>A polled file inbound adapter: <code>Files.inboundAdapter(dir).patternFilter("*.csv")</code> behind
+            <code>Pollers.fixedRate(Duration.ofSeconds(10))</code>.</td>
+            <td><code>IntegrationConfiguration.inboundFileFlow</code>,
+            <code>InboundHelloWorldFileMessageProcessor</code></td></tr>
+        <tr><td class="num">12-5</td><td><code>recipe_12_5_i</code>, <code>recipe_12_5_ii</code></td>
+            <td>A <code>@Transformer</code> turning a JMS map into a <code>Customer</code>; <code>_ii</code>
+            switches the return type to <code>Message</code> so headers survive and can be added.</td>
+            <td><code>InboundJMSMessageToCustomerTransformer</code>, <code>InboundCustomerServiceActivator</code>,
+            <code>Customer</code> record</td></tr>
+        <tr><td class="num">12-6</td><td><code>recipe_12_6_i</code>, <code>_ii</code>, <code>_iii</code></td>
+            <td>End-to-end error handling: wiring the adapter's <code>errorChannel</code>, subscribing a flow to
+            it, then splitting errors by exception type with <code>ErrorMessageExceptionTypeRouter</code>.</td>
+            <td><code>IntegrationConfiguration</code> (split into <code>ServerMain</code> and
+            <code>ClientMain</code>), <code>DefaultErrorHandlingServiceActivator</code>, <code>MyCustomException</code></td></tr>
+        <tr><td class="num">12-7</td><td><code>recipe_12_7_i</code>, <code>recipe_12_7_ii</code></td>
+            <td>A <code>@Splitter</code> that fans a batch file out line by line; <code>_ii</code> appends
+            <code>.aggregate()</code> and a summary service activator.</td>
+            <td><code>CustomerBatchFileSplitter.splitAFile</code>,
+            <code>CustomerDeletionServiceActivator.deleteCustomer</code>, <code>SummaryServiceActivator.summary</code></td></tr>
+        <tr><td class="num">12-8</td><td><code>recipe_12_8</code></td>
+            <td>Content-based routing on a business field: <code>creditScore</code> above 770 goes to
+            <code>safeCustomerChannel</code>, everything else to <code>riskyCustomerChannel</code>.</td>
+            <td><code>CustomerCreditScoreRouter</code>, <code>LineToCustomerTransformer</code>,
+            <code>safeCustomerFlow</code>, <code>riskyCustomerFlow</code>, <code>customers-0001.txt</code></td></tr>
+        <tr><td class="num">12-9</td><td><code>recipe_12_9</code></td>
+            <td>Spring Integration as the trigger for Spring Batch: file &rarr; <code>JobLaunchRequest</code>
+            &rarr; <code>JobLaunchingMessageHandler</code>.</td>
+            <td><code>FileToJobLaunchRequestTransformer</code>, <code>IntegrationConfiguration.fileToBatchFlow</code></td></tr>
+        <tr><td class="num">12-10</td><td><code>recipe_12_10_i</code>, <code>recipe_12_10_ii</code></td>
+            <td>Two gateway styles: a programmatic <code>MessagingGatewaySupport</code> over two named channels in
+            one JVM, and a declarative <code>@MessagingGateway</code> interface whose flow ends in a JMS request-reply
+            gateway.</td>
+            <td><code>AdditionConfiguration.additionFlow</code>, <code>SimpleMessagingGateway</code>,
+            <code>VacationService</code>, <code>ClientIntegrationConfig</code>, <code>ServerIntegrationContext</code></td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The seventeen modules grouped by pattern cluster</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    ch["ch12 - 17 modules, 77 Java files"]
+    ch --> ep["Endpoints and message sources"]
+    ep --> r2["12-2 i and ii - JMS inbound adapter"]
+    ep --> r3["12-3 i, ii and iii - file message headers"]
+    ep --> r4["12-4 i - polled file inbound adapter"]
+    ch --> msg["Payload and header shaping"]
+    msg --> r5["12-5 i and ii - Map to Customer transformer"]
+    msg --> r9["12-9 - file to JobLaunchRequest"]
+    ch --> ctl["Flow control"]
+    ctl --> r6["12-6 i, ii and iii - error channel routing"]
+    ctl --> r7["12-7 i and ii - splitter then aggregator"]
+    ctl --> r8["12-8 - credit score router"]
+    ch --> gw["Gateways"]
+    gw --> r10a["12-10 i - gateway over two channels"]
+    gw --> r10b["12-10 ii - gateway over JMS"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The four branches are the four things Spring
+      Integration gives you on top of plain messaging: a <em>source</em> that turns an external event into a
+      <code>Message</code> (cluster 12-2 to 12-4), <em>message-shaping</em> steps such as
+      <code>.transform(...)</code> (12-5, 12-9), <em>routing and lifecycle</em> steps such as
+      <code>.split()</code>, <code>.aggregate()</code>, <code>.route()</code> and the error channel (12-6 to 12-8),
+      and <em>gateways</em> that let ordinary Java method calls enter the bus (12-10). Read the clusters in that
+      order: every later recipe reuses the adapter and transformer vocabulary of the earlier ones.</p>
+    </section>
+
+    <section id="jms-endpoints">
+      <span class="kicker">Recipe 12-2</span>
+      <h2>Consuming JMS messages: the adapter decides the payload</h2>
+      <p><code>recipe_12_2_i/src/main/java/.../IntegrationConfiguration.java</code> defines three beans and one
+      flow. The connection beans are pure Spring JMS — an <code>ActiveMQConnectionFactory</code> for
+      <code>tcp://localhost:61616</code> wrapped in a <code>CachingConnectionFactory</code>, plus a
+      <code>JmsTemplate</code> that exists only so <code>Main</code> can produce a message. The interesting line is
+      the flow:</p>
+      <pre><code>IntegrationFlow
+    .from(Jms.messageDrivenChannelAdapter(connectionFactory)
+              .extractPayload(true).destination("recipe-12-2"))
+    .handle(messageProcessor)
+    .get();</code></pre>
+      <p><code>Jms.messageDrivenChannelAdapter</code> builds a <em>message-driven</em> (push) source: it wraps a
+      JMS <code>MessageListener</code> on the Artemis queue, so nothing polls. <code>extractPayload</code> is the
+      whole difference between the two variants. With <code>true</code>, the adapter hands Spring Integration the
+      JMS body, and <code>InboundHelloWorldJMSMessageProcessor.handleIncomingJmsMessage</code> receives
+      <code>Message&lt;Map&lt;String, Object&gt;&gt;</code> and logs the map. With <code>false</code>
+      (<code>recipe_12_2_ii</code>), the <em>jakarta.jms.Message itself</em> becomes the payload — the same handler,
+      renamed <code>handleIncomingJmsMessageWithPayloadNotExtracted</code>, casts
+      <code>msgWithJmsMessageAsPayload.getPayload()</code> to <code>MapMessage</code> and rebuilds the map by
+      reading <code>getString("firstName")</code>, <code>getString("lastName")</code>,
+      <code>getLong("id")</code>. Keeping the JMS message is how you reach JMS-only features (properties,
+      <code>JMSCorrelationID</code>, redelivery); extracting the payload is how you stop JMS types leaking into
+      business code. Note that <code>_ii</code> also adds <code>@ComponentScan</code>, which does nothing here —
+      every handler is already declared with an <code>@Bean</code> method.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Two shapes of the same JMS inbound flow (12-2 i and ii)</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    main["Main - JmsTemplate.convertAndSend"] -->|"map with id, firstName, lastName"| q1[("queue recipe-12-2 in Artemis")]
+    q1 --> ad1["Jms.messageDrivenChannelAdapter - extractPayload true"]
+    ad1 -->|"Message with Map payload"| h1["InboundHelloWorldJMSMessageProcessor.handleIncomingJmsMessage"]
+    h1 --> out1["logs the map"]
+    main2["Main - JmsTemplate.convertAndSend"] -->|"same map"| q2[("queue recipe-16-2 for the adapter, recipe-15-2 for the sender")]
+    q2 --> ad2["same adapter - extractPayload false"]
+    ad2 -->|"Message with a jakarta.jms Message payload"| h2["handleIncomingJmsMessageWithPayloadNotExtracted"]
+    h2 --> cast["payload cast to MapMessage then reconverted to a Map"]
+    cast --> out2["logs the rebuilt map"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Top path: <code>Main.main</code> calls
+      <code>jmsTemplate.convertAndSend("recipe-12-2", customer)</code>; the default
+      <code>SimpleMessageConverter</code> turns the <code>Map</code> into a JMS
+      <code>MapMessage</code>; Artemis delivers it to the listener container behind the message-driven channel
+      adapter; the adapter extracts the body and publishes a Spring <code>Message</code> onto the flow's implicit
+      point-to-point channel; the <code>.handle(...)</code> endpoint (a
+      <code>ServiceActivatingMessageHandler</code> created from the <code>@ServiceActivator</code> method) consumes
+      it and returns <code>void</code>, so the flow ends there. Bottom path: identical until the adapter, which
+      with <code>extractPayload(false)</code> skips conversion and puts the raw JMS message in the payload,
+      forcing the handler to do the conversion itself. <strong>Caveat visible in the source:</strong> in
+      <code>recipe_12_2_ii</code> the flow listens on <code>recipe-16-2</code> while <code>Main</code> sends to
+      <code>recipe-15-2</code>, so as committed the second variant never receives the message its own producer
+      sends.</p>
+    </section>
+
+    <section id="file-endpoints">
+      <span class="kicker">Recipes 12-3 and 12-4</span>
+      <h2>Polling a directory and binding message headers</h2>
+      <p>Recipe 12-4 is the file counterpart of 12-2 and shows the other half of the endpoint model. A file
+      adapter cannot push, so the flow adds a <em>consumer-side poller</em>:</p>
+      <pre><code>IntegrationFlow
+    .from(Files.inboundAdapter(directory).patternFilter("*.csv"),
+          c -&gt; c.poller(Pollers.fixedRate(Duration.ofSeconds(10))))
+    .handle(messageProcessor())
+    .get();</code></pre>
+      <p>The directory is injected with <code>@Value("${user.home}/inboundFiles/new/") File directory</code> and the
+      second <code>.from</code> argument is a <code>Consumer</code> that decorates the endpoint spec — that is how
+      the DSL attaches a <code>SourcePollingChannelAdapter</code> instead of letting the source push. The poller
+      pulls from a <code>FileReadingMessageSource</code>, which lists the directory, applies
+      <code>patternFilter("*.csv")</code> plus its default once-only filter, and returns a
+      <code>java.io.File</code>. That <code>File</code> becomes the message payload, and the adapter decorates it
+      with file headers, which is exactly what recipe 12-3 is about.</p>
+      <p>Recipe 12-3 ships <em>only</em> the handler class in each module — no <code>IntegrationConfiguration</code>,
+      no <code>Main</code>, nothing under <code>src/main/resources</code> — so the three variants are a study in
+      method signatures the same inbound file message can drive, not runnable programs:</p>
+      <ul>
+        <li><code>recipe_12_3_i</code>: <code>interrogateMessage(Message&lt;File&gt; message)</code> — take the whole
+        message and iterate <code>message.getHeaders()</code>.</li>
+        <li><code>recipe_12_3_ii</code>: <code>interrogateMessage(@Header(MessageHeaders.ID) String uuid,
+        @Header(FileHeaders.FILENAME) String fileName, File file)</code> — two headers injected as parameters, the
+        payload by type.</li>
+        <li><code>recipe_12_3_iii</code>: <code>interrogateMessage(@Headers Map&lt;String, Object&gt; headers, File file)</code>
+        — the whole header map injected, then <code>headers.get(MessageHeaders.ID)</code> and
+        <code>headers.get(FileHeaders.FILENAME)</code> looked up manually.</li>
+      </ul>
+      <p>All three are annotated <code>@ServiceActivator</code>, so the same bean could be dropped into any
+      <code>.handle(...)</code> slot; Spring Integration's parameter-mapping resolves the message, the payload and
+      the headers by annotation. Recipe 12-4 uses the fourth option — the plain
+      <code>Message&lt;File&gt;</code> form — and reads only the payload.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">A dropped CSV file becoming a message in recipe_12_4_i</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant OP as Operator
+    participant SP as SourcePollingChannelAdapter
+    participant FS as FileReadingMessageSource
+    participant DC as implicit DirectChannel
+    participant HA as InboundHelloWorldFileMessageProcessor
+
+    OP->>FS: drop a csv file into the inboundFiles new directory
+    SP->>FS: receive once every 10 seconds
+    FS->>FS: list directory, patternFilter csv, skip files already read
+    FS-->>SP: a File object or nothing
+    SP-->>DC: Message with File payload plus file headers
+    DC->>HA: handleIncomingFileMessage
+    HA-->>OP: debug log of absolute path and length
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Nothing is event-driven here: the operator's only act
+      is writing a file, and the <code>SourcePollingChannelAdapter</code> created by
+      <code>Pollers.fixedRate(Duration.ofSeconds(10))</code> does the pulling on a task scheduler. When
+      <code>FileReadingMessageSource.receive()</code> returns a <code>File</code>, the adapter publishes
+      <code>GenericMessage</code> with that <code>File</code> as payload and headers that include
+      <code>FileHeaders.FILENAME</code> alongside the standard <code>MessageHeaders.ID</code>; if the source returns
+      <code>null</code> the poller simply produces no message. The handler returns <code>void</code>, so the file is
+      the end of the line — no reply channel is involved.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The three handler shapes of recipe 12-3 for one inbound file message</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Handler_12_3_i {
+        interrogateMessage(message)
+    }
+    class Handler_12_3_ii {
+        interrogateMessage(uuid, fileName, file)
+    }
+    class Handler_12_3_iii {
+        interrogateMessage(headers, file)
+    }
+    class InboundHelloWorldFileMessageProcessor {
+        handleIncomingFileMessage(message)
+    }
+    class Message
+    class FilePayload
+    class HeaderBinding {
+        Header named parameter
+    }
+    class HeadersBinding {
+        Headers map parameter
+    }
+    Handler_12_3_i -- Message : whole message argument
+    Handler_12_3_ii -- HeaderBinding : id and filename resolved per argument
+    Handler_12_3_iii -- HeadersBinding : whole header map in one argument
+    InboundHelloWorldFileMessageProcessor -- Message : recipe 12-4 form
+    Message -- FilePayload : payload of type File
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the diagram.</strong> The four classes are the four classes named
+      <code>InboundFileMessageServiceActivator</code> or <code>InboundHelloWorldFileMessageProcessor</code> in the
+      chapter; the two right-hand nodes are not classes in the recipes but the Spring annotations
+      <code>@Header</code> and <code>@Headers</code> that make the argument-level bindings work. The mechanism on
+      every edge is the same: the <code>@ServiceActivator</code> endpoint hands the incoming
+      <code>Message</code> to a <code>MethodInvoker</code> that matches parameters by annotation and type —
+      <code>Message</code> gets the message, a <code>File</code> parameter gets the payload, a
+      <code>String</code> parameter annotated <code>@Header("id")</code> or <code>@Header(FileHeaders.FILENAME)</code>
+      gets that header value (and throws if the header is absent), a <code>Map</code> annotated
+      <code>@Headers</code> gets everything.</p>
+    </section>
+
+    <section id="transform">
+      <span class="kicker">Recipe 12-5</span>
+      <h2>Transforming a JMS map into a domain object, headers included</h2>
+      <p>Recipe 12-5 adds one stage to the 12-2 flow and uses it to make a point about <code>Message</code>
+      identity. The flow is
+      <code>.from(Jms.messageDrivenChannelAdapter(...).extractPayload(true).destination("recipe-12-5")).transform(customerTransformer()).handle(customerServiceActivator())</code>.
+      <code>InboundJMSMessageToCustomerTransformer.transformJMSMapToCustomer</code> reads
+      <code>payload.get("id")</code> as a <code>Long</code>, the two names as <code>String</code>s, and defaults
+      <code>telephone</code> to <code>null</code> and <code>creditScore</code> to <code>0f</code> with
+      <code>getOrDefault</code>, to build the <code>Customer</code> record.</p>
+      <p>The variants differ only in the declared return type:</p>
+      <ul>
+        <li><code>recipe_12_5_i</code> returns <code>Customer</code>. Spring Integration wraps the result in a
+        <em>new</em> message, so only the payload survives the stage.</li>
+        <li><code>recipe_12_5_ii</code> returns <code>Message&lt;Customer&gt;</code>, built explicitly:
+        <code>MessageBuilder.withPayload(customer).copyHeadersIfAbsent(inbound.getHeaders())
+        .setHeaderIfAbsent("randomlySelectedForSurvey", Math.random() &gt; .5).build()</code>. Returning a
+        <code>Message</code> from a transformer hands the framework your message as-is — that is the only way to
+        preserve or add headers, and 12-5-ii uses it to stamp a routing flag onto the record.</li>
+      </ul>
+      <p>Downstream, both variants land on the identical
+      <code>InboundCustomerServiceActivator.doSomethingWithCustomer(Message&lt;Customer&gt;)</code>, which only reads
+      the payload — the header work is therefore invisible until something routes on it (which is exactly what
+      12-6 and 12-8 then do with exceptions and with a payload field).</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">What the transform stage hands to the handler in 12-5 i versus 12-5 ii</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    q[("queue recipe-12-5 or recipe-16-5")] --> ad["Jms.messageDrivenChannelAdapter extractPayload true"]
+    ad -->|"Message whose payload is a Map"| tr["InboundJMSMessageToCustomerTransformer.transformJMSMapToCustomer"]
+    tr --> conv["convert reads id, firstName, lastName, telephone, creditScore"]
+    conv -->|"12-5-i returns a plain Customer"| h1["InboundCustomerServiceActivator"]
+    conv -->|"12-5-ii returns a Message"| mb["MessageBuilder - copyHeadersIfAbsent and setHeaderIfAbsent randomlySelectedForSurvey"]
+    mb --> h2["InboundCustomerServiceActivator, headers readable"]
+    h1 --> e1["logger.debug of the Customer record"]
+    h2 --> e1
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Hop 1, the adapter converts and publishes
+      <code>Message&lt;Map&lt;String, Object&gt;&gt;</code>. Hop 2, the <code>.transform(...)</code> endpoint invokes the
+      <code>@Transformer</code> method; because the parameter type is <code>Message</code>, the whole message is
+      passed and the method has access to <code>getHeaders()</code> — which 12-5-ii needs for
+      <code>copyHeadersIfAbsent</code>. Hop 3 is the fork: a non-<code>Message</code> return (12-5-i) is wrapped in a
+      fresh message by the framework, discarding the inbound headers; a <code>Message</code> return (12-5-ii) is
+      forwarded verbatim. Hop 4, the <code>.handle(...)</code> endpoint calls
+      <code>doSomethingWithCustomer(Message&lt;Customer&gt;)</code>, which returns <code>void</code> and therefore ends
+      the flow. Also note the two queue names: <code>recipe-12-5</code> in variant i and the mistyped but
+      self-consistent <code>recipe-16-5</code> in variant ii — both producer and consumer use it, so 12-5-ii still
+      works.</p>
+    </section>
+
+    <section id="errors">
+      <span class="kicker">Recipe 12-6</span>
+      <h2>Error channels: three levels of handling a bad message</h2>
+      <p>Recipe 12-6 is the only recipe in the chapter split into a server context (<code>ServerMain</code> loads
+      <code>IntegrationConfiguration</code>) and a client context (<code>ClientMain</code> loads
+      <code>ClientConfiguration</code> with just a connection factory and a <code>JmsTemplate</code>). The client
+      deliberately sends two messages: a good one with <code>"id", 1234L</code> and a poison one with
+      <code>"id", "1234L"</code> — a <code>String</code> where the transformer casts to <code>Long</code>. That
+      <code>ClassCastException</code> is the subject of all three variants.</p>
+      <ol>
+        <li><strong>12-6_i — wiring.</strong> The adapter spec adds <code>.errorChannel("errorChannel")</code>.
+        Without it, an exception inside an endpoint still becomes an <code>ErrorMessage</code>, but it is published
+        to whatever channel the framework resolves from the <code>errorChannel</code> header; naming it pins the
+        destination. This module wires the route but installs no subscriber of its own.</li>
+        <li><strong>12-6_ii — subscribing.</strong> A second flow, <code>errorFlow()</code>, is
+        <code>IntegrationFlow.from("errorChannel").handle(errorHandlingServiceActivator()).get()</code>. Because
+        <code>errorChannel</code> is the container-wide channel that <code>@EnableIntegration</code> registers (a
+        publish-subscribe channel by default), <code>DefaultErrorHandlingServiceActivator.handleThrowable(Message&lt;Throwable&gt;)</code>
+        now receives the failure and unwraps it: <code>throwable instanceof MessagingException me</code>, then
+        <code>me.getFailedMessage()</code> to get the original payload back.</li>
+        <li><strong>12-6_iii — routing by exception type.</strong> <code>errorFlow()</code> now ends in
+        <code>.route(exceptionTypeRouter())</code>, where the router is an
+        <code>ErrorMessageExceptionTypeRouter</code> configured with
+        <code>Map.of(MyCustomException.class.getName(), "customExceptionChannel", RuntimeException.class.getName(),
+        "runtimeExceptionChannel", MessageHandlingException.class.getName(), "messageHandlingExceptionChannel")</code>.
+        Only <code>customExceptionChannel</code> has a consumer here (<code>customExceptionFlow()</code>); the other
+        two channel names are demonstrated but left unsubscribed. The handler signature also changes to a bare
+        <code>handleThrowable(Throwable throwable)</code>, and the transformer gains a business failure:
+        <code>if (customer.id() == 321L) throw new MyCustomException();</code>.</li>
+      </ol>
+      <div class="callout danger">
+        <h4>Two source-level traps in 12-6_iii</h4>
+        <p>As committed, <code>recipe_12_6_iii/.../IntegrationConfiguration.java</code> listens on destination
+        <code>recipe-12-6</code> (twice calling <code>.extractPayload(true)</code> on the same spec), while
+        <code>ClientMain.java</code> in that same module sends to <code>recipe-1-6</code>. And the
+        <code>MyCustomException</code> trigger is <code>id == 321L</code>, which the client never produces — its two
+        messages use <code>1234L</code> and <code>"1234L"</code>. So the custom-exception route cannot be exercised
+        without editing one of the two files. The exception-type routing itself is still worth reading as the
+        reference shape.</p>
+      </div>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Error-channel topology across the three variants of recipe 12-6</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    q[("queue recipe-12-6")] --> ad["Jms.messageDrivenChannelAdapter with errorChannel set"]
+    ad --> tr["InboundJMSMessageToCustomerTransformer"]
+    tr --> ha["InboundCustomerServiceActivator"]
+    ad -->|"any Throwable raised inside the flow"| ec["errorChannel, container level publish subscribe"]
+    ec -.->|"12-6-i only wires the destination"| nod["no subscriber in this module"]
+    ec -->|"12-6-ii errorFlow"| hs["DefaultErrorHandlingServiceActivator.handleThrowable of a Message"]
+    ec -->|"12-6-iii errorFlow"| rt["ErrorMessageExceptionTypeRouter"]
+    rt -->|"mapped MyCustomException"| c1["customExceptionChannel"]
+    rt -->|"mapped RuntimeException"| c2["runtimeExceptionChannel"]
+    rt -->|"mapped MessageHandlingException"| c3["messageHandlingExceptionChannel"]
+    c1 --> hs2["customExceptionFlow to handleThrowable of a Throwable"]
+    c2 -.->|no flow subscribes it| dead["nothing consumes these channels"]
+    c3 -.->|no flow subscribes it| dead
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The adapter is the only producer of error messages in
+      this recipe: the JMS delivery happens on the listener's thread, so any exception thrown by the transformer or
+      the service activator is caught by the framework, wrapped (usually as
+      <code>MessageHandlingException</code>, with <code>getFailedMessage()</code> pointing at the offending
+      message), stamped into the <code>errorChannel</code> header and published to the named error channel. The
+      <code>from("errorChannel")</code> flow is an ordinary consumer of that channel — Spring Integration's
+      <code>ErrorMessageExceptionTypeRouter</code> then takes the exception carried by the <code>ErrorMessage</code>
+      and resolves a destination from <code>setChannelMappings</code>, whose keys are fully-qualified class names
+      (<code>MyCustomException.class.getName()</code> in the source), and publishes the message to the channel
+      <em>name</em> it returns. All three keys the recipe registers sit in one hierarchy —
+      <code>MessageHandlingException</code> extends <code>MessagingException</code>, which extends
+      <code>NestedRuntimeException</code>, which is a <code>RuntimeException</code> — so the figure is really about
+      the mapping shape, and about the fact that <code>customExceptionChannel</code> is the only one of the three
+      destinations a flow actually subscribes.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">ClientMain's second message travelling to the error flow</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant CM as ClientMain
+    participant AR as Artemis queue
+    participant AD as Jms message driven channel adapter
+    participant TR as InboundJMSMessageToCustomerTransformer
+    participant EC as errorChannel
+    participant RT as ErrorMessageExceptionTypeRouter
+    participant EH as DefaultErrorHandlingServiceActivator
+
+    CM->>AR: convertAndSend map with id as Long 1234
+    AR->>AD: MapMessage delivered on the listener thread
+    AD->>TR: Message with Map payload
+    TR-->>AD: Customer payload, flow completes normally
+    CM->>AR: convertAndSend map with id as String 1234L
+    AR->>AD: second MapMessage
+    AD->>TR: Message with Map payload
+    TR->>TR: cast of a String to Long throws ClassCastException
+    TR->>EC: ErrorMessage wrapping a MessageHandlingException
+    EC->>RT: route by exception class name
+    RT-->>EH: customExceptionChannel only, the other two mappings have no consumer
+    EH->>EH: getFailedMessage recovers the original Map message
+    Note over RT,EH: MyCustomException fires only for id 321, which ClientMain never sends
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Follow the second message: the failure is not detected
+      by validation but by an ordinary Java cast inside
+      <code>transformJMSMapToCustomer</code>. Spring Integration catches it at the endpoint boundary, so the JMS
+      listener never sees the exception and the broker considers the message consumed — the error path is entirely
+      inside the bus. The <code>errorChannel("errorChannel")</code> attribute on the adapter is what guarantees the
+      <code>ErrorMessage</code> is published to a known place instead of relying on the header default, and
+      <code>handleThrowable</code>'s <code>MessagingException</code> branch is where you would write the failed
+      payload to a dead-letter store or a table for replay.</p>
+    </section>
+
+    <section id="split-aggregate-route">
+      <span class="kicker">Recipes 12-7 and 12-8</span>
+      <h2>Splitter, aggregator and content-based router on a batch file</h2>
+      <p>Recipes 12-7 and 12-8 reuse the file-inbound machinery of 12-4 and add the three patterns that make a bus
+      useful. <code>CustomerBatchFileSplitter</code> is identical in both 12-7 modules and in 12-8:</p>
+      <pre><code>@Splitter
+public Collection&lt;String&gt; splitAFile(File file) throws IOException {
+    return Files.readAllLines(file.toPath());
+}</code></pre>
+      <p>Returning a <code>Collection</code> from a <code>@Splitter</code> makes Spring Integration emit one message
+      per element and stamp each with the sequence headers (<code>sequenceNumber</code>,
+      <code>sequenceSize</code>, <code>correlationId</code>) that the framework's default aggregator correlates on.
+      The three flows then differ only in what they do with the fan-out:</p>
+      <table>
+        <thead><tr><th>Module</th><th>Flow</th><th>Pattern</th><th>Directory and filter</th></tr></thead>
+        <tbody>
+        <tr><td><code>recipe_12_7_i</code></td>
+            <td><code>from(Files.inboundAdapter, poller 1s).split(splitter()).handle(customerDeletionServiceActivator())</code></td>
+            <td>Splitter only — one <code>deleteCustomer(String)</code> call per line.</td>
+            <td><code>~/customerstoremove/new/</code>, <code>customerstoremove-*.txt</code></td></tr>
+        <tr><td><code>recipe_12_7_ii</code></td>
+            <td>same, plus <code>.aggregate().handle(summaryServiceActivator())</code></td>
+            <td>Splitter plus aggregator — <code>SummaryServiceActivator.summary(Collection&lt;Customer&gt;)</code>
+            prints <code>Removed N customers.</code></td>
+            <td><code>~/customerstoremove/new/</code>, <code>customerstoremove-*.txt</code></td></tr>
+        <tr><td><code>recipe_12_8</code></td>
+            <td><code>from(...).split(splitter()).transform(transformer()).route(customerCreditScoreRouter())</code></td>
+            <td>Splitter, transformer, content-based router into two named channels, each consumed by its own flow
+            ending in <code>.log()</code>.</td>
+            <td><code>~/customerstoimport/new/</code>, <code>customers-*.txt</code></td></tr>
+        </tbody>
+      </table>
+      <p>12-8's router returns a channel <em>name</em> from a business predicate —
+      <code>customer.creditScore() &gt; 770 ? "safeCustomerChannel" : "riskyCustomerChannel"</code> — and those two
+      names are real beans, because the module also declares <code>safeCustomerFlow()</code> and
+      <code>riskyCustomerFlow()</code> as <code>IntegrationFlow.from("safeCustomerChannel")...log(...)</code>. The
+      sample file <code>recipe_12_8/src/main/resources/customers-0001.txt</code> has exactly the split you would
+      expect: rows <code>1</code> (1000) and <code>3</code> (785) route to the safe channel, rows <code>2</code>
+      (500) and <code>4</code> (432) to the risky one. Two source details to know: the transformer method is
+      literally named <code>transfor</code> (missing <code>m</code>) and reads <code>columns[3]</code> with
+      <code>Long.parseLong</code> into the record's <code>float creditScore</code>, and the
+      <code>Customer</code> record — including its <code>Customer(long id)</code> convenience constructor — is
+      present in <code>recipe_12_7_ii</code> but never constructed there, because that module's splitter still hands
+      raw <code>String</code> lines to a <code>String</code>-taking handler.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The batch-file bus: split, aggregate, route (recipes 12-7 and 12-8)</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph M8["recipe_12_8 fileSplitAndDelete"]
+        d8["directory customerstoimport new"] --> s8["FileReadingMessageSource with customers-*.txt, poller 1 second"]
+        s8 --> sp8["CustomerBatchFileSplitter.splitAFile"]
+        sp8 -->|"one message per line with sequence headers"| t8["LineToCustomerTransformer.transfor"]
+        t8 --> r8["CustomerCreditScoreRouter.routeByCustomerCreditScore"]
+    end
+    r8 -->|"creditScore above 770"| safe["safeCustomerChannel"]
+    r8 -->|"creditScore 770 or lower"| risky["riskyCustomerChannel"]
+    safe --> ls["safeCustomerFlow, log prefixed Safe"]
+    risky --> lr["riskyCustomerFlow, log prefixed Risky"]
+    subgraph M7["recipe_12_7_ii fileSplitAndDelete"]
+        d7["directory customerstoremove new"] --> s7["FileReadingMessageSource with customerstoremove-*.txt, poller 1 second"]
+        s7 --> sp7["CustomerBatchFileSplitter.splitAFile"]
+        sp7 -->|"one message per line"| h7["CustomerDeletionServiceActivator.deleteCustomer"]
+        h7 --> ag7["aggregate"]
+        ag7 --> su7["SummaryServiceActivator.summary"]
+    end
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Both subgraphs begin with the same pair of framework
+      endpoints: a <code>SourcePollingChannelAdapter</code> (<code>Pollers.fixedRate(Duration.ofSeconds(1))</code>)
+      firing a <code>FileReadingMessageSource</code>, whose <code>File</code> payload goes to the next stage. In
+      12-8 the <code>.split(...)</code> endpoint turns <code>Files.readAllLines</code> into <em>N</em> messages,
+      <code>.transform(...)</code> parses each comma-separated line into a <code>Customer</code>, and
+      <code>.route(...)</code> asks <code>routeByCustomerCreditScore</code> for a channel name; the returned string is
+      resolved against the context, so the message physically leaves
+      <code>fileSplitAndDelete</code> and enters <code>safeCustomerFlow</code> or <code>riskyCustomerFlow</code>, each
+      terminating in a logging handler. In 12-7_ii the router slot is taken by <code>.aggregate()</code>, which
+      gathers the per-line messages back into one group and emits a <code>Collection</code> to
+      <code>summary(Collection&lt;Customer&gt;)</code>. <strong>Caveat for anyone running it:</strong> the stage that
+      feeds that aggregator, <code>deleteCustomer(String)</code>, returns <code>void</code>, and a
+      <code>@ServiceActivator</code> with a <code>void</code> return produces no reply message — so on the default
+      behaviour nothing would reach the aggregator. The aggregator only pays off when the preceding stage emits
+      something to collect (as 12-8's transformer does, or with <code>Customer</code> objects the unused record in
+      this module hints at).</p>
+    </section>
+
+    <section id="gateways">
+      <span class="kicker">Recipes 12-9 and 12-10</span>
+      <h2>Gateways: entering the bus from a method call</h2>
+      <p>Everything above is driven by an external event (a JMS message, a file). Recipe 12-10 asks the opposite
+      question: how does ordinary Java code get onto the bus? Two answers, one per variant.</p>
+      <h3>12-10_i — a hand-built gateway over two direct channels</h3>
+      <p><code>AdditionConfiguration</code> holds the simplest flow in the chapter:
+      <code>IntegrationFlow.from("request").handle(additionService(), "add").channel("response").get()</code>. Both
+      <code>request</code> and <code>response</code> are channel names, not beans, and Spring Integration's default
+      channel factory materialises them as point-to-point (<code>DirectChannel</code>) beans — which is why
+      <code>Main</code> can immediately do <code>ctx.getBean("request", MessageChannel.class)</code>. Note
+      <code>.handle(additionService(), "add")</code>: the second argument names the method, because
+      <code>AdditionService</code> is a plain class with no <code>@ServiceActivator</code> on
+      <code>add(Operands)</code>. <code>Main</code> then builds the gateway twice over — once with
+      <code>GatewayProxyFactoryBean</code> (given default request and reply channels,
+      <code>setBeanFactory(ctx)</code>, <code>afterPropertiesSet()</code>, <code>start()</code>, and then never used,
+      since no service interface is set), and once with <code>SimpleMessagingGateway</code>, a three-line subclass of
+      <code>MessagingGatewaySupport</code> that exposes the protected
+      <code>sendAndReceive(Object)</code> as <code>convertSendAndReceive</code>. That call sends the
+      <code>Operands</code> record to <code>request</code>, blocks on <code>response</code>, and prints
+      <code>System.out.printf("Result: %f%n", ...)</code> prints <code>Result: 26.000000</code>. It is the gateway
+      pattern stripped to its mechanics: request channel,
+      <code>replyChannel</code> header, synchronous receive with the framework's default timeout.</p>
+      <h3>12-10_ii — <code>@MessagingGateway</code> all the way out to JMS</h3>
+      <p>The holiday example splits the same JVM into two contexts that <code>Main</code> starts side by side:
+      <code>ServerIntegrationContext</code> and <code>ClientIntegrationConfig</code>. The client side is the pattern
+      everyone copies:</p>
+      <pre><code>@MessagingGateway
+public interface VacationService {
+    @Gateway
+    List&lt;HotelReservation&gt; findHotels(HotelReservationSearch search);
+}</code></pre>
+      <p><code>ClientIntegrationConfig.vacationGatewayFlow()</code> is
+      <code>IntegrationFlow.from(VacationService.class).handle(Jms.outboundGateway(connectionFactory())
+      .requestDestination("inboundHotelReservationSearchDestination")
+      .replyDestination("outboundHotelReservationSearchResultsDestination")).get()</code>. The <code>from</code>
+      variant that takes an interface creates the gateway endpoint from its annotations — the proxy
+      <code>Main</code> retrieves with <code>clientCtx.getBean(VacationService.class)</code>. The server side mirrors
+      it with <code>Jms.inboundGateway(...).requestDestination("inboundHotelReservationSearchDestination")</code>
+      feeding <code>.handle(vacationService())</code>; <code>VacationServiceImpl</code> seeds four reservations in a
+      <code>@PostConstruct</code>, sleeps one second via <code>Utils.sleep</code> (from
+      <code>shared-resources</code>) and filters <code>hr.price() &lt;= search.maxPrice()</code>. Because the reply
+      destination is set explicitly, the reply travels back as a real JMS message rather than a temporary queue.</p>
+      <h3>12-9 — the same idea, aimed at Spring Batch</h3>
+      <p><code>recipe_12_9</code> is the batch handoff: <code>.transform(transformer).handle(handler)</code> where the
+      transformer builds <code>new JobLaunchRequest(job, builder.toJobParameters())</code> with the file path added as
+      the <code>filename</code> job parameter, and the handler is
+      <code>spring-batch-integration</code>'s <code>JobLaunchingMessageHandler</code> around a
+      <code>JobLauncher</code>. Two things must be said about it as committed: <code>IntegrationConfiguration</code>
+      carries no <code>@Configuration</code> and no <code>@EnableIntegration</code> (the <code>@Bean</code> methods
+      still register, but in lite mode), and no <code>Job</code> or <code>JobLauncher</code> bean is defined anywhere
+      in the module, so <code>Main</code> — whose try-with-resources body is empty — cannot start this flow without
+      supplying them.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">VacationService.findHotels crossing two contexts through Artemis (12-10_ii)</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant MA as Main
+    participant GW as VacationService proxy
+    participant CF as vacationGatewayFlow
+    participant OG as Jms outboundGateway
+    participant AR as Artemis
+    participant IG as Jms inboundGateway
+    participant SF as serverIntegrationFlow
+    participant IM as VacationServiceImpl
+
+    MA->>GW: findHotels with a HotelReservationSearch
+    GW->>CF: Message with the search as payload
+    CF->>OG: handle stage
+    OG->>AR: send to inboundHotelReservationSearchDestination
+    AR->>IG: JMS request
+    IG->>SF: Message into the server flow
+    SF->>IM: findHotels, a ServiceActivator method
+    IM->>IM: sleep one second, keep rows with price at or below maxPrice
+    IM-->>SF: list of HotelReservation
+    SF-->>IG: gateway reply
+    IG-->>OG: reply on outboundHotelReservationSearchResultsDestination
+    OG-->>CF: reply Message
+    CF-->>GW: payload converted back to the declared return type
+    GW-->>MA: results, then Main prints the count and each row
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The <code>@MessagingGateway</code> proxy turns
+      <code>findHotels(search)</code> into a <code>GenericMessage</code> whose payload is the
+      <code>HotelReservationSearch</code> record and whose <code>replyChannel</code> header points at a channel the
+      gateway is blocking on. <code>from(VacationService.class)</code> is what binds that proxy to the flow, so the
+      message enters <code>vacationGatewayFlow</code> rather than a named channel. The
+      <code>Jms.outboundGateway</code> handler is a <em>request-reply</em> adapter: it serialises the payload into a
+      JMS message, sends it to the request destination, and correlates the reply from
+      <code>outboundHotelReservationSearchResultsDestination</code> by JMS correlation id. On the far side,
+      <code>Jms.inboundGateway</code> is also request-reply, so the list returned by
+      <code>VacationServiceImpl.findHotels</code> becomes the JMS reply the client gateway is waiting for; the
+      gateway then converts it to <code>List&lt;HotelReservation&gt;</code> and unblocks <code>Main</code>. The
+      one-second <code>Utils.sleep</code> is there to prove the call really is asynchronous across the broker.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Gateway types and payload records of recipes 12-10</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Operands {
+        Number a
+        Number b
+    }
+    class AdditionService {
+        Number add(Operands ops)
+    }
+    class additionFlow {
+        from request
+        handle add by method name
+        channel response
+    }
+    class MessagingGatewaySupport {
+        sendAndReceive(payload)
+        setRequestChannel(channel)
+        setReplyChannel(channel)
+        afterPropertiesSet()
+        start()
+    }
+    class SimpleMessagingGateway {
+        convertSendAndReceive(payload)
+    }
+    class GatewayProxyFactoryBean {
+        setDefaultRequestChannel(channel)
+        setDefaultReplyChannel(channel)
+    }
+    class requestChannel {
+        DirectChannel named request
+    }
+    class responseChannel {
+        DirectChannel named response
+    }
+    class VacationService {
+        findHotels(search)
+    }
+    class VacationServiceImpl {
+        findHotels(search)
+        afterPropertiesSet()
+    }
+    class HotelReservationSearch {
+        int roomsDesired
+        LocalDate start
+        LocalDate stop
+        double maxPrice
+    }
+    class HotelReservation {
+        String id
+        String hotelName
+        double price
+    }
+    SimpleMessagingGateway .. MessagingGatewaySupport : extends
+    GatewayProxyFactoryBean .. requestChannel : configured then unused in Main
+    SimpleMessagingGateway o-- requestChannel : request channel
+    SimpleMessagingGateway o-- responseChannel : reply channel
+    additionFlow o-- requestChannel : consumes
+    additionFlow o-- AdditionService : invokes add
+    additionFlow o-- responseChannel : publishes the sum
+    AdditionService o-- Operands : reads a plus b
+    VacationServiceImpl .. VacationService : implements, ServiceActivator
+    VacationService o-- HotelReservationSearch : gateway argument
+    VacationServiceImpl o-- HotelReservation : filtered reply
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the diagram.</strong> Left half is 12-10_i:
+      <code>SimpleMessagingGateway</code> gains nothing but visibility — the superclass
+      <code>MessagingGatewaySupport</code> already implements the send-and-receive, lifecycle
+      (<code>afterPropertiesSet</code>, <code>start</code>) and header handling; the subclass just re-exposes
+      <code>sendAndReceive</code> through the generic <code>convertSendAndReceive</code>. The <code>additionFlow</code>
+      node is the <code>IntegrationFlow</code> bean mediating between the two channels and
+      <code>AdditionService.add</code>, and <code>GatewayProxyFactoryBean</code> is drawn where the source puts it:
+      fully configured, started, and never called. Right half is 12-10_ii: the <code>@MessagingGateway</code>
+      interface is the contract the client context publishes, <code>VacationServiceImpl</code> is the
+      <code>@ServiceActivator</code> behind the server's inbound gateway, and the two records are the request and
+      reply payloads that cross the broker — <code>HotelReservation</code> generates its <code>id</code> with
+      <code>UUID.randomUUID()</code> in a compact constructor overload, so ids differ on every run.</p>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Practical</span>
+      <h2>Building and running the recipes</h2>
+      <p>Module paths are Gradle project paths of the form <code>:ch12:recipe_12_X_Y</code> (the root
+      <code>settings.gradle</code> walks every <code>ch*</code>/<code>recipe*</code> directory and colon-joins it).
+      Build any single recipe with:</p>
+      <pre><code>./gradlew :ch12:recipe_12_2_i:build
+./gradlew :ch12:recipe_12_8:build</code></pre>
+      <p>No module in this chapter has a <code>src/test</code> directory, so <code>build</code> here means
+      compile plus jar — it proves the DSL code type-checks, nothing more.</p>
+      <p>Chapter 12 does <em>not</em> apply the shadow plugin the way chapters 10 and 11 do, and it declares no
+      <code>Main-Class</code> manifest, so the runnable fat jar comes from the root project's
+      <code>uberJar</code> task and the main class has to be named yourself:</p>
+      <pre><code>./gradlew :ch12:recipe_12_10_i:uberJar
+java --enable-preview -cp ch12/recipe_12_10_i/build/libs/recipe_12_10_i-6.0.0-SNAPSHOT-all.jar \
+     com.apress.spring6recipes.springintegration.Main</code></pre>
+      <p><code>--enable-preview</code> is not decoration: the root <code>build.gradle</code> compiles every recipe
+      with <code>--enable-preview</code> on a Java 19 toolchain, and <code>gradle.properties</code> pins
+      <code>org.gradle.java.home</code> to a JDK 17 path, so expect to let Gradle provision 19 or to align that
+      property with your own JDK.</p>
+      <table>
+        <thead><tr><th>Group</th><th>Modules</th><th>Prerequisite before the flow sees anything</th></tr></thead>
+        <tbody>
+        <tr><td>In-JVM only</td><td><code>recipe_12_10_i</code></td>
+            <td>Nothing. Start it and read <code>Result: 26.000000</code>; the best recipe to run first.</td></tr>
+        <tr><td>File driven</td><td><code>recipe_12_4_i</code></td>
+            <td>Create <code>~/inboundFiles/new/</code> (from <code>${user.home}</code>, not created by the code) and
+            drop <code>*.csv</code> files there; the poller fires every 10 s.</td></tr>
+        <tr><td>File driven</td><td><code>recipe_12_7_i</code>, <code>recipe_12_7_ii</code></td>
+            <td>Create <code>~/customerstoremove/new/</code> and drop <code>customerstoremove-*.txt</code>; 1 s poller,
+            output via <code>System.out.printf</code>.</td></tr>
+        <tr><td>File driven</td><td><code>recipe_12_8</code></td>
+            <td>Create <code>~/customerstoimport/new/</code> and copy
+            <code>ch12/recipe_12_8/src/main/resources/customers-0001.txt</code> into it; the two log flows print at
+            INFO.</td></tr>
+        <tr><td>File to batch</td><td><code>recipe_12_9</code></td>
+            <td>Same directory as 12-8, plus a <code>Job</code> and <code>JobLauncher</code> bean you must supply —
+            the committed configuration has no <code>@Configuration</code>, no <code>@EnableIntegration</code> and no
+            job definition.</td></tr>
+        <tr><td>Broker driven</td><td><code>recipe_12_2_i</code>, <code>recipe_12_2_ii</code>,
+            <code>recipe_12_5_i</code>, <code>recipe_12_5_ii</code>, <code>recipe_12_6_i</code>,
+            <code>recipe_12_6_ii</code>, <code>recipe_12_6_iii</code>, <code>recipe_12_10_ii</code></td>
+            <td>ActiveMQ Artemis listening on <code>tcp://localhost:61616</code>. Every recipe hard-codes that URL
+            with an unauthenticated <code>ActiveMQConnectionFactory</code>.</td></tr>
+        <tr><td>Illustration only</td><td><code>recipe_12_3_i</code>, <code>recipe_12_3_ii</code>,
+            <code>recipe_12_3_iii</code></td>
+            <td>No configuration class and no <code>Main</code> are committed, so there is nothing to launch — read
+            them as handler-shape references for 12-4's adapter.</td></tr>
+        </tbody>
+      </table>
+      <p>Start the broker with the script the repo ships (it is a Docker run of the same image the compose file
+      uses):</p>
+      <pre><code>bin/artemis.sh
+# docker run -e AMQ_USER=admin -e AMQ_PASSWORD=admin --relax-jolokia --name s6r-artemis \
+#   -p 61616:61616 -p 8161:8161 quay.io/artemiscloud/activemq-artemis-broker:artemis.2.27.0
+# or: docker compose -f bin/docker-compose-all.yml up s6r-artemis</code></pre>
+      <div class="callout">
+        <h4>Why your console looks empty</h4>
+        <p>Almost every handler in this chapter logs with <code>logger.debug</code> or <code>logger.info</code>
+        (<code>InboundHelloWorldJMSMessageProcessor</code>, the 12-3 and 12-4 file handlers, both
+        <code>InboundCustomerServiceActivator</code> classes), and the logging setup pulled in by
+        <code>shared-resources/src/main/resources/simplelogger.properties</code> pins
+        <code>org.slf4j.simpleLogger.defaultLogLevel=WARN</code>. Add
+        <code>org.slf4j.simpleLogger.log.com.apress.spring6recipes.springintegration=DEBUG</code> there (or
+        <code>-Dorg.slf4j.simpleLogger.defaultLogLevel=debug</code>) before concluding a flow did not run. That is
+        also why recipes 12-7 and 12-8 fall back to <code>System.out.printf</code>, and why the 12-8 flows use the
+        DSL's <code>.log()</code>, which logs at INFO. Finally, note the credentials mismatch: the broker above is
+        created with <code>AMQ_USER=admin</code> and <code>AMQ_PASSWORD=admin</code>, while the recipes connect with
+        no username and password — expect an authentication error unless your broker instance permits anonymous
+        JMS connections.</p>
+      </div>
+      <p>For a first tour with no infrastructure at all: run <code>recipe_12_10_i</code> to watch a
+      request-reply round trip over two direct channels, then <code>recipe_12_8</code> against a directory to watch
+      one file become four messages and split into two channels by credit score.</p>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch12/</code> &mdash; 17 recipe modules, 77 Java files, Spring Integration 6.0.0.
+  <a href="../index.html">Back to all chapters</a>
+</footer>
+</body>
+</html>

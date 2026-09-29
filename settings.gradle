@@ -30,7 +30,11 @@ def preDir = {
 }
 
 def getProjectName(String dir) {
-    return (dir - (rootDir.toString() + "/")).replaceAll("/", ":")
+    def projName = (dir - (rootDir.toString() + "/")).replaceAll('/', ':')
+    if ( projName.equals(dir) ) {
+        projName = (dir - (rootDir.toString() + "\\")).replaceAll('\\\\', ':')
+    }
+    return projName
 }
 
 file("${rootDir}").traverse( type: DIRECTORIES, preDir: preDir) { dir ->

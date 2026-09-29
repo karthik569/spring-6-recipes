@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 9 — Spring Data Access with NoSQL — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 9</div>
+  <h1>Chapter 9 — Spring Data Access with NoSQL</h1>
+  <p class="lede">Chapter 9 takes one tiny domain — a <code>Vehicle</code> record of four fields,
+  plus a Star Wars <code>Character</code> and <code>Planet</code> pair for the graph store — and
+  walks it up the same six-step ladder against four different databases: MongoDB, Redis, Neo4j and
+  Couchbase. Each step swaps one thing only: the raw client for a bean, the client API for a
+  Spring Data template, the explicit collection name for entity metadata, the template for a
+  repository proxy, and finally the imperative call for a <code>Mono</code>. Nothing in the chapter
+  is mocked or embedded: every module opens a socket to a server you must start yourself.</p>
+  <div class="chip-row">
+    <span class="chip">28 modules, 129 Java files, no shared module</span>
+    <span class="chip">MongoDB 9.1 &amp; Redis 9.2 &amp; Neo4j 9.3 &amp; Couchbase 9.4</span>
+    <span class="chip">spring-data-bom 2022.0.0</span>
+    <span class="chip">mongodb-driver 4.8.1, jedis 4.3.1, lettuce 6.2.2, neo4j-java-driver 5.3.1, couchbase java-client 3.4.1</span>
+    <span class="chip">MongoTemplate / RedisTemplate / Neo4jTemplate / CouchbaseTemplate</span>
+    <span class="chip">every entry point is com.apress.spring6recipes.nosql.Main</span>
+    <span class="chip">./gradlew :ch09:recipe_9_1_i:build</span>
+    <span class="chip">no docker-compose.yml and no Testcontainers in ch09</span>
+    <span class="chip">live servers required: 27017, 6379, 7687, 127.0.0.1</span>
+    <span class="chip">Java 19 toolchain, --enable-preview, -parameters</span>
+  </div>
+
+  <nav class="pager">
+      <a href="../ch08/index.html">&larr; Chapter 8 — Spring Batch</a>
+      <a href="../index.html">All chapters</a>
+      <a href="../ch10/index.html">Chapter 10 — Spring Enterprise Integration &rarr;</a>
+    </nav>
+</header>
+<div class="shell">
+  <aside class="toc">
+    <h2>On this page</h2>
+    <ol>
+      <li><a href="#overview">Chapter map and module index</a></li>
+      <li><a href="#ladder">One ladder, four stores</a></li>
+      <li><a href="#mongo">9.1 — MongoDB: driver, template, repository</a></li>
+      <li><a href="#redis">9.2 — Redis: a hash used as a collection</a></li>
+      <li><a href="#neo4j">9.3 — Neo4j: nodes, relationships, transactions</a></li>
+      <li><a href="#couchbase">9.4 — Couchbase: the document id as the only key</a></li>
+      <li><a href="#reactive">The reactive variants</a></li>
+      <li><a href="#mapping">Relational vocabulary versus NoSQL vocabulary</a></li>
+      <li><a href="#running">Building and running</a></li>
+    </ol>
+  </aside>
+  <article>
+
+    <section id="overview">
+      <span class="kicker">Mental model</span>
+      <h2>Chapter map and module index</h2>
+      <p>Four recipe numbers, four stores, one shape of problem. <code>recipe_9_1_*</code> is
+      MongoDB, <code>recipe_9_2_*</code> is Redis, <code>recipe_9_3_*</code> is Neo4j and
+      <code>recipe_9_4_*</code> is Couchbase — confirmed straight from
+      <code>ch09/build.gradle</code>, which pins <code>mongodb-driver-sync</code> and
+      <code>spring-data-mongodb</code> on 9.1, <code>jedis</code> (plus <code>lettuce-core</code>
+      on 9.2.viii) and <code>spring-data-redis</code> on 9.2, <code>neo4j-java-driver</code> and
+      <code>spring-data-neo4j</code> on 9.3, and <code>java-client</code> with
+      <code>spring-data-couchbase</code> on 9.4. Cassandra and Neo4j-HTTP are absent; there is no
+      Cassandra driver anywhere in the chapter.</p>
+      <p>Three of the four stores are driven by the same <code>Vehicle</code> record
+      (<code>vehicleNo</code>, <code>color</code>, <code>wheel</code>, <code>seat</code>) against a
+      structure named <code>vehicles</code>. Only Neo4j gets a second domain: <code>Character</code>
+      and <code>Planet</code>, because a document or a hash cannot demonstrate a relationship, and
+      the whole point of 9.3 is that a <em>join becomes an edge</em>. Read any group as a diff: line
+      up two variants and find the single annotation, bean or return type that changed.</p>
+
+      <h3>Module Map</h3>
+      <table>
+        <thead>
+          <tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="num">9.1</td>
+            <td><code>recipe_9_1_i</code>, <code>_ii</code>, <code>_iii</code>, <code>_iv</code>,
+            <code>_v</code>, <code>_vi</code></td>
+            <td>MongoDB. i: <code>MongoClients.create()</code> and a hand-written
+            <code>transform</code> in both directions between <code>Vehicle</code> and
+            <code>org.bson.Document</code>. ii: identical repository, but <code>MongoClient</code>
+            and the repository are <code>@Bean</code>s and cleanup moves to <code>@PreDestroy</code>.
+            iii: <code>MongoTemplate</code> plus <code>Query</code> and <code>Criteria</code>, and
+            <code>Vehicle</code> gains a fifth component <code>id</code>. iv: the record is annotated
+            <code>@Document(collection = "vehicles")</code> so every template call drops the explicit
+            collection name. v: <code>@EnableMongoRepositories</code> and
+            <code>MongoRepository&lt;Vehicle, String&gt;</code> with a derived
+            <code>findByVehicleNo</code>. vi: <code>AbstractReactiveMongoConfiguration</code>,
+            <code>ReactiveMongoRepository</code> and a <code>Mono</code>/<code>Flux</code> chain.</td>
+            <td><code>MongoVehicleRepository</code>, <code>MongoConfiguration</code>,
+            <code>MongoTemplate</code>, <code>MongoClientFactoryBean</code>,
+            <code>Vehicle</code></td>
+          </tr>
+          <tr>
+            <td class="num">9.2</td>
+            <td><code>recipe_9_2_i</code> … <code>recipe_9_2_viii</code></td>
+            <td>Redis. i: one <code>SET</code>/<code>GET</code> on key <code>msg</code>. ii: a list
+            <code>rpush</code>/<code>lrange</code> on <code>authors</code> plus
+            <code>hset</code>/<code>hgetAll</code> on <code>sr_5</code> and <code>sr_6</code>. iii:
+            the <code>vehicles</code> hash with <em>binary</em> keys and
+            <code>SerializationUtils.serialize</code>. iv: same hash, String keys, Jackson
+            <code>ObjectMapper</code>. v: <code>RedisTemplate</code> over
+            <code>JedisConnectionFactory</code> with <code>opsForHash()</code>. vi: adds
+            <code>GenericJackson2JsonRedisSerializer</code> and
+            <code>setEnableTransactionSupport(true)</code>. vii: the object mapper becomes a real ODM
+            — <code>@RedisHash</code>, <code>@Id</code>, <code>@Indexed</code>,
+            <code>@EnableRedisRepositories</code>, <code>ListCrudRepository</code>. viii:
+            <code>ReactiveRedisTemplate</code> over <code>LettuceConnectionFactory</code>.</td>
+            <td><code>RedisVehicleRepository</code>, <code>RedisConfig</code>,
+            <code>RedisTemplate</code>, <code>HashOperations</code>,
+            <code>ReactiveRedisTemplate</code></td>
+          </tr>
+          <tr>
+            <td class="num">9.3</td>
+            <td><code>recipe_9_3_i</code> … <code>recipe_9_3_viii</code></td>
+            <td>Neo4j. i: <code>GraphDatabase.driver("bolt://localhost:7687")</code>, a
+            <code>Greetings</code> node, <code>writeTransaction</code> and
+            <code>readTransaction</code>. ii: hand-written Cypher that creates
+            <code>Character</code> and <code>Planet</code> nodes and the
+            <code>LOCATION</code>/<code>FRIENDS_WITH</code>/<code>MASTER_OF</code> edges. iii:
+            <code>Neo4jStarwarsRepository</code> maps objects to those statements and writes the
+            <code>randomUUID()</code> id back into the object. iv: same repository, now a bean built
+            from <code>neo4j.url</code> in <code>application.properties</code>. v:
+            <code>Neo4jTemplate</code> plus <code>@Node</code>, <code>@Id</code>,
+            <code>@GeneratedValue(UUIDStringGenerator.class)</code>,
+            <code>@Relationship</code>, <code>@EnableTransactionManagement</code> and
+            <code>Neo4jTransactionManager</code>. vi: <code>@EnableNeo4jRepositories</code>, two
+            <code>CrudRepository</code> interfaces and a <code>@Service</code> that owns the
+            transaction. vii: identical, except <code>AbstractNeo4jConfig</code> supplies the
+            client, template and transaction manager. viii:
+            <code>AbstractReactiveNeo4jConfig</code> and <code>ReactiveCrudRepository</code>.</td>
+            <td><code>Character</code>, <code>Planet</code>, <code>StarwarsConfig</code>,
+            <code>Neo4jStarwarsRepository</code>, <code>Neo4jStarwarsService</code>,
+            <code>Neo4jTemplate</code></td>
+          </tr>
+          <tr>
+            <td class="num">9.4</td>
+            <td><code>recipe_9_4_i</code>, <code>_ii</code>, <code>_iii</code>, <code>_iv</code>,
+            <code>_v</code>, <code>_vi</code></td>
+            <td>Couchbase. i: <code>Cluster.connect("couchbase://127.0.0.1", "s6r-user",
+            "s6r-password")</code>, then <code>bucket.defaultCollection().upsert</code>,
+            <code>.get(...).contentAs(Vehicle.class)</code> and <code>.remove</code>. ii: the same
+            three calls with <code>Cluster</code>, <code>Bucket</code> and the repository as beans.
+            iii: <code>CouchbaseTemplate</code> fluent operations
+            <code>upsertById</code>/<code>findById</code>/<code>removeById</code> built from
+            <code>SimpleCouchbaseClientFactory(cluster, "vehicles", null)</code> and
+            <code>MappingCouchbaseConverter</code>. iv: <code>AbstractCouchbaseConfiguration</code>
+            overrides replace the explicit beans. v: <code>@EnableCouchbaseRepositories</code> with
+            a bare <code>CrudRepository&lt;Vehicle, String&gt;</code> — and
+            <code>getUserName()</code>/<code>getPassword()</code> return <code>null</code>. vi:
+            <code>@EnableReactiveCouchbaseRepositories</code> with
+            <code>ReactiveCouchbaseRepository</code>.</td>
+            <td><code>CouchbaseVehicleRepository</code>, <code>CouchbaseConfiguration</code>,
+            <code>CouchbaseTemplate</code>, <code>Vehicle</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Which module talks to which store over which client</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph CH09["ch09 - 28 recipe modules"]
+        m91["9.1 MongoDB - 6 modules"]
+        m92["9.2 Redis - 8 modules"]
+        m93["9.3 Neo4j - 8 modules"]
+        m94["9.4 Couchbase - 6 modules"]
+    end
+    subgraph API["Client API the recipe source imports directly"]
+        mds["mongodb-driver-sync - MongoClients"]
+        mdre["mongodb-driver-reactivestreams"]
+        sdm["spring-data-mongodb - MongoTemplate"]
+        jd["jedis - Jedis, JedisConnectionFactory"]
+        ltc["lettuce-core - LettuceConnectionFactory"]
+        sdr["spring-data-redis - RedisTemplate"]
+        bolt["neo4j-java-driver - GraphDatabase over bolt"]
+        sdn["spring-data-neo4j - Neo4jTemplate"]
+        cbj["couchbase java-client - Cluster, Bucket"]
+        sdc["spring-data-couchbase - CouchbaseTemplate"]
+    end
+    subgraph SRV["External servers - nothing in the build starts them"]
+        mongod["mongod on localhost 27017, database vehicledb"]
+        rssrv["redis-server on localhost 6379, hash vehicles"]
+        n4srv["Neo4j on localhost 7687, bolt, no auth token"]
+        cbsrv["Couchbase on 127.0.0.1, bucket vehicles, user s6r-user"]
+    end
+    m91 --> mds
+    m91 --> sdm
+    m91 --> mdre
+    m92 --> jd
+    m92 --> sdr
+    m92 --> ltc
+    m93 --> bolt
+    m93 --> sdn
+    m94 --> cbj
+    m94 --> sdc
+    mds --> mongod
+    sdm --> mongod
+    mdre --> mongod
+    jd --> rssrv
+    sdr --> rssrv
+    ltc --> rssrv
+    bolt --> n4srv
+    sdn --> n4srv
+    cbj --> cbsrv
+    sdc --> cbsrv
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the topology.</strong> Every arrow is an <code>import</code>
+      you can grep for. The middle band is the point of the chapter: the <em>same</em> four
+      recipe numbers each have a bare-driver edge and a Spring Data edge, so
+      <code>recipe_9_1_i</code> reaches <code>mongod</code> through
+      <code>MongoClients</code> while <code>recipe_9_1_iii</code> reaches the same server through
+      <code>MongoTemplate</code>, and only the middle band changed. The right-hand band is the hard
+      prerequisite: <code>ch09</code> contains no <code>docker-compose.yml</code>, no
+      <code>src/test</code> directory and no Testcontainers reference (the repo uses those only in
+      <code>ch13/recipe_13_8_*</code>), so all four servers must already be listening. Redis is the
+      only store where the client itself changes — <code>jedis</code> for 9.2.i–vii and
+      <code>lettuce-core</code> for the reactive 9.2.viii, because
+      <code>LettuceConnectionFactory</code> is the reactive connection implementation.</p>
+    </section>
+
+    <section id="ladder">
+      <span class="kicker">Structure</span>
+      <h2>One ladder, four stores</h2>
+      <p>The chapter is a migration exercise repeated four times. Steps 1 and 2 are pure Spring
+      Framework: <code>AnnotationConfigApplicationContext</code> plus <code>@Bean</code> methods,
+      with the <code>@PreDestroy</code> annotation on <code>cleanUp()</code> doing the teardown
+      when the context closes (for example
+      <code>ch09/recipe_9_1_ii/src/main/java/com/apress/spring6recipes/nosql/MongoVehicleRepository.java</code>
+      drops the whole database there). Steps 3 to 5 are pure Spring Data: a template that owns
+      conversion, entity metadata that removes the repeated structure name, and finally a repository
+      proxy that removes the template call from your code. Step 6 changes the return types to
+      <code>Mono</code> and <code>Flux</code> and swaps the client jar.</p>
+      <p>One build-wide detail makes the wiring in step 2 possible without any
+      <code>@Autowired</code>: the root <code>build.gradle</code> adds <code>-parameters</code> to
+      every <code>JavaCompile</code>, so constructor parameter names such as
+      <code>vehicleRepository(RedisTemplate&lt;String, Vehicle&gt; redis)</code> survive into the
+      class file and Spring can match by name as well as by type.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The six rungs, and which module sits on each</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    L1["Rung 1 - bare client, repository built with new: 9.1_i, 9.2_i, 9.2_ii, 9.3_i, 9.3_ii, 9.3_iii, 9.4_i"]
+    L2["Rung 2 - client and repository become beans of a Configuration class: 9.1_ii, 9.2_iii, 9.2_iv, 9.3_iv, 9.4_ii"]
+    L3["Rung 3 - a Spring Data template replaces the client API: 9.1_iii, 9.2_v, 9.2_vi, 9.3_v, 9.4_iii, 9.4_iv"]
+    L4["Rung 4 - entity metadata names the structure: 9.1_iv, 9.2_vii, 9.3_v, 9.4_iii"]
+    L5["Rung 5 - a repository proxy replaces the template calls: 9.1_v, 9.2_vii, 9.3_vi, 9.3_vii, 9.4_v"]
+    L6["Rung 6 - reactive client, repository and return types: 9.1_vi, 9.2_viii, 9.3_viii, 9.4_vi"]
+    L1 --> L2 --> L3 --> L4 --> L5
+    L3 --> L6
+    L5 --> L6
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the ladder.</strong> Follow a single store up the rungs and
+      count what you delete. From rung 3, <code>getCollection()</code> and the four
+      <code>dbVehicle.getString(...)</code> calls of 9.1.i are gone, replaced by
+      <code>mongo.save(vehicle, collectionName)</code> and
+      <code>mongo.findOne(query, Vehicle.class, collectionName)</code>. Rung 4 is the smallest change
+      with the biggest effect: adding <code>@Document(collection = "vehicles")</code> to the record
+      in 9.1.iv lets the repository drop the third argument on every call, because the template now
+      asks the mapping metadata instead of the caller. The same rung lands differently elsewhere:
+      <code>@RedisHash("vehicles")</code> in 9.2.vii replaces the <code>DB_NAME</code> constant,
+      <code>@Node</code> plus <code>@Relationship</code> in 9.3.v replace the five Cypher constants of
+      9.3.iii, and <code>@Id</code> on <code>vehicleNo</code> in 9.4.iii removes the key argument that
+      9.4.i passes to <code>upsert</code>. Rung 5 is the one that changes your class: in
+      9.1.v <code>MongoVehicleRepository</code> disappears entirely and the
+      <code>findByVehicleNo</code> body is replaced by a method <em>name</em> on an interface that
+      extends <code>MongoRepository</code> — the <code>@EnableMongoRepositories</code> registrar
+      posts a <code>MongoRepositoryFactoryBean</code> for it, so <code>ctx.getBean(VehicleRepository.class)</code>
+      in <code>Main</code> is unchanged. Rung 6 keeps the method names but makes every return type a
+      publisher, which is why the <code>Main</code> classes there grow a
+      <code>CountDownLatch</code>.</p>
+    </section>
+
+    <section id="mongo">
+      <span class="kicker">Recipe 9.1</span>
+      <h2>MongoDB: hand mapping, template, derived query</h2>
+      <p>Recipes 9.1.i and 9.1.ii are the control group: the <em>conversion</em> is the application's
+      job. <code>MongoVehicleRepository</code> holds two private <code>transform</code> overloads —
+      <code>Vehicle</code> to <code>new Document("vehicleNo", ...).append("color", ...)</code> and
+      back again through <code>dbVehicle.getString("color")</code> /
+      <code>dbVehicle.getInteger("wheel")</code> — plus
+      <code>StreamSupport.stream(getCollection().find().spliterator(), false)</code> to turn a
+      <code>FindIterable</code> into a <code>List</code>. From 9.1.iii,
+      <code>MongoTemplate</code> and its <code>MappingMongoConverter</code> do that work, and the
+      record must then carry an <code>id</code> for Mongo's own <code>_id</code> — which is exactly
+      why <code>Vehicle</code> grows a fifth component and every <code>save</code> call in
+      <code>Main</code> starts with <code>null</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The document mapping and the two repository shapes</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Vehicle {
+        String id
+        String vehicleNo
+        String color
+        int wheel
+        int seat
+    }
+    class Document {
+        String vehicleNo
+        String color
+        int wheel
+        int seat
+    }
+    class VehicleRepository {
+        count() long
+        save(Vehicle vehicle) void
+        delete(Vehicle vehicle) void
+        findAll() List
+        findByVehicleNo(String vehicleNo) Vehicle
+    }
+    class MongoVehicleRepository {
+        MongoClient mongo
+        MongoTemplate template
+        String databaseName
+        String collectionName
+        transform(Vehicle) Document
+        transform(Document) Vehicle
+        getCollection() MongoCollection
+        cleanUp() void
+    }
+    class MongoClient {
+        getDatabase(String name) MongoDatabase
+    }
+    class MongoDatabase {
+        getCollection(String name) MongoCollection
+        drop() void
+    }
+    class MongoCollection {
+        insertOne(Document) void
+        find() FindIterable
+        countDocuments() long
+        deleteOne(Document) void
+    }
+    class MongoTemplate {
+        save(Object entity) Object
+        save(Object entity, String collection) Object
+        count(Query, Class) long
+        findAll(Class) List
+        findOne(Query, Class) Object
+        execute(callback) Object
+    }
+    class Query {
+        addCriteria(Criteria)
+    }
+    class MongoRepository {
+        save(Vehicle) Vehicle
+        findByVehicleNo(String) Vehicle
+        deleteAll(Iterable) void
+        count() long
+    }
+    class ReactiveMongoRepository {
+        saveAll(Flux) Flux
+        findByVehicleNo(String) Mono
+        count() Mono
+        deleteAll() Mono
+    }
+    VehicleRepository <|.. MongoVehicleRepository : 9.1_i to 9.1_iv
+    MongoVehicleRepository --> MongoClient : 9.1_i and 9.1_ii
+    MongoVehicleRepository --> MongoTemplate : 9.1_iii onward
+    MongoVehicleRepository --> Document : hand written transform
+    MongoVehicleRepository --> Vehicle : record constructor on read
+    MongoClient --> MongoDatabase : getDatabase vehicledb
+    MongoDatabase --> MongoCollection : getCollection vehicles
+    MongoCollection --> Document : insertOne and find
+    Document --> Vehicle : MappingMongoConverter, from 9.1_iii
+    MongoTemplate --> Query : count, findOne, findAll
+    MongoTemplate --> Vehicle : target type of the conversion
+    Vehicle --> Document : the Document annotation sets collection vehicles in 9.1_iv
+    VehicleRepository --|> MongoRepository : 9.1_v reuses the same simple name
+    VehicleRepository --|> ReactiveMongoRepository : 9.1_vi reuses the same simple name
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the classes.</strong> Two different edges out of
+      <code>MongoVehicleRepository</code> are the whole lesson. On the 9.1.i path the repository holds
+      a <code>MongoClient</code>, walks <code>getDatabase(databaseName).getCollection(collectionName)</code>
+      itself, and calls its own <code>transform</code> on every row in and out — the
+      <code>Document to Vehicle</code> edge is a <code>private</code> method in application code.
+      On the 9.1.iii path the repository holds a <code>MongoTemplate</code> and the same two arrows are
+      taken by <code>MappingMongoConverter</code> inside Spring Data instead; note that
+      <code>MongoTemplate</code> has two <code>save</code> overloads here because 9.1.iii passes
+      <code>collectionName</code> explicitly while 9.1.iv does not. The mechanism that makes the
+      one-argument form legal is metadata: <code>@Document(collection = "vehicles")</code> on the
+      record populates the <code>MongoPersistentEntity</code> that the template consults. The two
+      inheritance edges at the bottom are the trap for readers: in 9.1_v and 9.1_vi the interface is
+      still named <code>VehicleRepository</code>, but it no longer declares the five methods above —
+      it extends <code>MongoRepository&lt;Vehicle, String&gt;</code> (or the reactive flavour) and
+      adds only <code>Vehicle findByVehicleNo(String vehicleNo)</code>, resolved by the derived-query
+      parser from the method name.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">One save and one derived read through MongoTemplate</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main of 9.1_iv
+    participant R as MongoVehicleRepository
+    participant T as MongoTemplate
+    participant C as MappingMongoConverter
+    participant S as mongod, collection vehicles
+    M->>R: save(new Vehicle(null, TEM0001, RED, 4, 4))
+    R->>T: save(vehicle), no collection argument
+    T->>C: convert vehicle using the Document annotation metadata
+    C-->>T: Bson document with vehicleNo, color, wheel, seat
+    T->>S: insert or replace the document
+    S-->>T: acknowledgement, _id generated server side
+    T-->>R: the Vehicle instance that was passed in
+    M->>R: findByVehicleNo(TEM0001)
+    R->>T: findOne(new Query(where vehicleNo is TEM0001), Vehicle.class)
+    T->>S: find with a filter on vehicleNo
+    S-->>T: one stored document
+    T->>C: map the document back to Vehicle.class
+    C-->>T: a new Vehicle built by the canonical record constructor
+    T-->>R: Vehicle with the stored id populated
+    R-->>M: Vehicle
+    M->>R: context close triggers PreDestroy cleanUp
+    R->>T: execute with a callback that drops the database
+    T->>S: drop vehicledb
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the round trip.</strong> Hop 1 is ordinary
+      <code>getBean</code> wiring; nothing about MongoDB is special until hop 2, where the repository
+      hands the <em>object</em> to the template rather than a document. The
+      <code>MappingMongoConverter</code> hop is where <code>id</code> is read as the
+      <code>_id</code> property and the remaining record components become fields; because records are
+      immutable, conversion on <em>read</em> goes through the canonical constructor, which is precisely
+      why <code>Vehicle</code> had to grow an <code>id</code> parameter at 9.1.iii — a four-argument
+      record could not receive it back. The filter in hop 6 comes from
+      <code>Criteria.where("vehicleNo").is(vehicleNo)</code>, so the property name in the Java class and
+      the field name in the document are the same string with no mapping layer between them, and no
+      index exists to serve it. The last two hops are the Spring mechanism, not the store:
+      <code>AnnotationConfigApplicationContext.close()</code> invokes <code>@PreDestroy</code> on the
+      repository bean, and that callback runs <code>mongo.execute(db -&gt; { db.drop(); return null; })</code>
+      — so a failed <code>Main</code> still leaves <code>vehicledb</code> gone.</p>
+    </section>
+
+    <section id="redis">
+      <span class="kicker">Recipe 9.2</span>
+      <h2>Redis: a hash used as a collection</h2>
+      <p>Redis has no documents, so the chapter models the collection as <em>one hash</em> keyed
+      <code>vehicles</code> whose fields are <code>vehicleNo</code> to serialised value. That single
+      decision explains the whole 9.2 series: <code>count()</code> is <code>HLEN</code>
+      (<code>jedis.hkeys(DB_NAME).size()</code> in 9.2.iii/iv,
+      <code>redis.opsForHash().size(DB_NAME)</code> from 9.2.v), <code>findAll()</code> is a cursor
+      over the hash (<code>jedis.hkeys(...).stream().map(this::findByVehicleNo)</code> in 9.2.iii/iv,
+      <code>opsForHash().scan(DB_NAME, ScanOptions.NONE)</code> from 9.2.v), and what changes between
+      the variants is only <em>how the value becomes bytes</em>: JDK serialisation into binary keys in
+      9.2.iii, <code>ObjectMapper</code> into String keys in 9.2.iv, the template's default
+      <code>JdkSerializationRedisSerializer</code> in 9.2.v, an explicit
+      <code>GenericJackson2JsonRedisSerializer</code> in 9.2.vi, and finally the repository abstraction
+      in 9.2.vii where <code>@RedisHash("vehicles")</code> plus <code>@Indexed</code> replace the
+      hand-written hash name entirely.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Template, connection factory and serializer wiring per variant</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class RedisConfig {
+        jedis() Jedis
+        redisTemplate(RedisConnectionFactory) RedisTemplate
+        redisConnectionFactory() RedisConnectionFactory
+        vehicleRepository(RedisTemplate) RedisVehicleRepository
+    }
+    class Jedis {
+        set(String key, String value) String
+        hset(byte array, byte array, byte array) long
+        hget(byte array, byte array) byte array
+        hkeys(String key) Set
+        hdel(String key, String field) long
+    }
+    class RedisTemplate {
+        opsForHash() HashOperations
+        setConnectionFactory(RedisConnectionFactory) void
+        setDefaultSerializer(RedisSerializer) void
+        setEnableTransactionSupport(boolean) void
+    }
+    class HashOperations {
+        put(String hash, Object field, Object value) void
+        get(String hash, Object field) Object
+        size(String hash) long
+        scan(String hash, ScanOptions options) Cursor
+        delete(String hash, Object field) long
+    }
+    class JedisConnectionFactory
+    class LettuceConnectionFactory
+    class ReactiveRedisTemplate {
+        opsForHash() ReactiveHashOperations
+    }
+    class RedisSerializationContext {
+        newSerializationContext(RedisSerializer)
+        hashValue(RedisSerializer) RedisSerializationContext
+    }
+    class GenericJackson2JsonRedisSerializer
+    class Jackson2JsonRedisSerializer
+    class RedisVehicleRepository {
+        String DB_NAME vehicles
+        Jedis jedis
+        RedisTemplate redis
+        ReactiveRedisTemplate reactiveRedis
+        ObjectMapper mapper
+        save(Vehicle) void
+        findByVehicleNo(String) Vehicle
+        findAll() List
+        count() long
+        cleanUp() void
+    }
+    class VehicleRepository {
+        count() long
+        save(Vehicle) void
+        findAll() List
+        findByVehicleNo(String) Vehicle
+    }
+    class ListCrudRepository {
+        save(Vehicle) Vehicle
+        findByVehicleNo(String) Vehicle
+        deleteAll() void
+    }
+    class Vehicle {
+        String id
+        String vehicleNo
+        String color
+        int wheel
+        int seat
+    }
+    RedisVehicleRepository ..|> VehicleRepository : implements
+    RedisVehicleRepository --> Jedis : 9.2_iii and 9.2_iv
+    RedisVehicleRepository --> RedisTemplate : 9.2_v and 9.2_vi
+    RedisVehicleRepository --> ReactiveRedisTemplate : 9.2_viii
+    RedisConfig --> RedisTemplate : declares the bean
+    RedisConfig --> Jedis : declares the bean in 9.2_iii and 9.2_iv
+    RedisTemplate --> JedisConnectionFactory : borrows a RedisConnection
+    RedisTemplate --> HashOperations : opsForHash on hash vehicles
+    RedisTemplate --> GenericJackson2JsonRedisSerializer : default serializer in 9.2_vi
+    ReactiveRedisTemplate --> LettuceConnectionFactory : localhost 6379 in 9.2_viii
+    ReactiveRedisTemplate --> RedisSerializationContext : key String, hashValue Jackson2Json
+    HashOperations --> Vehicle : one hash field per vehicleNo
+    GenericJackson2JsonRedisSerializer --> Vehicle : JSON back through the record constructor
+    VehicleRepository --|> ListCrudRepository : 9.2_vii, with RedisHash and Indexed metadata
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the wiring.</strong> Three different dependency edges mean
+      three different answers to "who writes the bytes". In 9.2.iii the repository calls
+      <code>SerializationUtils.serialize(vehicle)</code> itself and hands raw arrays to
+      <code>jedis.hset(byte[], byte[], byte[])</code> — which is why that module's <code>Vehicle</code>
+      record declares <code>implements Serializable</code>. In 9.2.iv the repository instead injects an
+      <code>ObjectMapper</code> bean and stores a JSON String under a String field. From 9.2.v the
+      repository touches no serializer at all: <code>RedisTemplate</code> applies one per key space, and
+      because <code>RedisConfig</code> there configures only the connection factory, the template falls
+      back to JDK serialisation — again requiring the <code>Serializable</code> marker. 9.2.vi is the
+      one-line diff <code>template.setDefaultSerializer(new GenericJackson2JsonRedisSerializer())</code>
+      plus <code>setEnableTransactionSupport(true)</code>, the latter binding a single connection to the
+      thread so the hash writes can be batched. The bottom-right edge is the real ODM step: 9.2_vii's
+      record is <code>@RedisHash("vehicles")</code> with <code>@Id String id</code> and
+      <code>@Indexed String vehicleNo</code>, and the convenience constructor fills
+      <code>UUID.randomUUID().toString()</code>, so <code>findByVehicleNo</code> is served from an index
+      instead of a scan.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Writing one vehicle into the vehicles hash, both serialisation strategies</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main of 9.2_vi
+    participant R as RedisVehicleRepository
+    participant T as RedisTemplate of String and Vehicle
+    participant H as HashOperations
+    participant F as JedisConnectionFactory
+    participant S as GenericJackson2JsonRedisSerializer
+    participant K as redis-server, hash vehicles
+    M->>R: save(Vehicle TEM0001, RED, 4, 4)
+    R->>T: opsForHash()
+    T->>H: hash view bound to the template serializers
+    H->>F: getConnection
+    F-->>H: a Jedis backed RedisConnection, thread bound because transaction support is on
+    H->>S: serialize the value Vehicle
+    S-->>H: JSON bytes carrying the class name of the record
+    H->>K: HSET vehicles TEM0001 json
+    K-->>H: integer 1
+    M->>R: findByVehicleNo(TEM0001)
+    R->>T: opsForHash().get(vehicles, TEM0001)
+    T->>K: HGET vehicles TEM0001
+    K-->>T: the stored JSON bytes
+    T->>S: deserialize to Object
+    S-->>T: a Vehicle instance
+    T-->>R: Vehicle
+    R-->>M: Vehicle after a cast to Vehicle
+    alt 9.2_v with no serializer configured
+        T->>T: JdkSerializationRedisSerializer, so Vehicle must be Serializable
+    else 9.2_v with an explicit JSON serializer as in 9.2_vi
+        T->>S: type marker in the payload instead of Java serial bytes
+    end
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the calls.</strong> <code>opsForHash()</code> is the pivot: it
+      returns a <code>HashOperations</code> view that inherits the template's key, hash-key and
+      value serializers, which is why the repository source in 9.2.v and 9.2.vi is character for
+      character identical while the bytes on the server differ. The <code>getConnection</code> hop is
+      the part that changes behaviour under load: with
+      <code>setEnableTransactionSupport(true)</code> the connection is bound to the thread, so
+      <code>HSET</code> commands queue in <code>MULTI</code>/<code>EXEC</code> rather than each opening
+      its own connection. The cast in the second to last hop (<code>(Vehicle) redis.opsForHash().get(...)</code>)
+      is the honest cost of that design: the template's value type is <code>Vehicle</code> but
+      <code>HashOperations</code> is untyped on values, and in 9.2.vi the type is recovered from the
+      <code>@class</code> marker that <code>GenericJackson2JsonRedisSerializer</code> writes. Note also
+      that <code>count()</code> and <code>findAll()</code> are served from the same hash, so two runs of
+      the same recipe against one Redis give a non-zero starting count until
+      <code>@PreDestroy cleanUp()</code> deletes the fields.</p>
+    </section>
+
+    <section id="neo4j">
+      <span class="kicker">Recipe 9.3</span>
+      <h2>Neo4j: nodes, relationships, transactions</h2>
+      <p>This is the only group with a second domain model, and the only one where the mapping is not
+      one object per structure. <code>Character</code> has a <code>name</code> property, a generated
+      <code>id</code>, a <code>Planet location</code>, a <code>Character apprentice</code> and a list
+      of <code>friends</code> — four properties plus three <em>edges</em>. Recipes 9.3.iii and 9.3.iv
+      write those edges as literal Cypher held in <code>static final String</code> constants
+      (<code>CREATE (a)-[r:FRIENDS_WITH]-&gt;(b)</code> style), and deduplicate nodes by checking
+      <code>if (charr.getId() != null) return charr;</code> before creating, then writing the id back
+      from <code>res.single().get(0).asString()</code> — a hand-rolled unit of work. From 9.3.v the
+      same graph is declared with <code>@Node</code>, <code>@Id</code>,
+      <code>@GeneratedValue(UUIDStringGenerator.class)</code> and
+      <code>@Relationship(type = "LOCATION")</code> and <code>Neo4jTemplate.save</code> generates the
+      statements.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Graph entity mapping and the three repository generations</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Character {
+        String name
+        String id
+        Planet location
+        Character apprentice
+        List friends
+        addFriend(Character) void
+        setLocation(Planet) void
+        setApprentice(Character) void
+        setId(String) void
+        toString() String
+    }
+    class Planet {
+        String name
+        String id
+        getName() String
+        setId(String) void
+    }
+    class StarwarsRepository {
+        save(Planet) Planet
+        save(Character) Character
+        findAllCharacters() Iterable
+        findAllPlanets() Iterable
+    }
+    class Neo4jStarwarsRepository {
+        Driver db
+        Neo4jTemplate neo4j
+        save(Planet) Planet
+        save(Character) Character
+        cleanUp() void
+    }
+    class StarwarsService {
+        save(Planet) Planet
+        save(Character) Character
+        printAll() void
+    }
+    class Neo4jStarwarsService {
+        PlanetRepository planetRepository
+        CharacterRepository characterRepository
+        printAll() void
+        deleteAll() void
+    }
+    class CharacterRepository
+    class PlanetRepository
+    class CrudRepository {
+        save(S entity) S
+        findAll() Iterable
+        deleteAll() void
+    }
+    class ReactiveCrudRepository {
+        save(entity) Mono
+        findAll() Flux
+        deleteAll() Mono
+    }
+    class Driver {
+        session() Session
+    }
+    class Session {
+        run(String cypher, Map params) Result
+        writeTransaction(callback) Object
+        executeWrite(callback) Object
+        readTransaction(callback) Object
+    }
+    class Neo4jTemplate {
+        save(Object) Object
+        find(Class) Stream
+        deleteAll(Class) void
+    }
+    class Neo4jClient {
+        create(Driver) Neo4jClient
+    }
+    class Neo4jTransactionManager {
+        with(Driver)
+    }
+    class UUIDStringGenerator
+    StarwarsRepository <|.. Neo4jStarwarsRepository : 9.3_iii to 9.3_v
+    Neo4jStarwarsRepository --> Driver : hand written Cypher, 9.3_iii and 9.3_iv
+    Neo4jStarwarsRepository --> Neo4jTemplate : 9.3_v with Transactional
+    Neo4jStarwarsService ..|> StarwarsService : 9.3_vi onward, Service and Transactional
+    Neo4jStarwarsService --> CharacterRepository : injected proxy
+    Neo4jStarwarsService --> PlanetRepository : injected proxy
+    CharacterRepository --|> CrudRepository : 9.3_vi and 9.3_vii
+    PlanetRepository --|> CrudRepository : 9.3_vi and 9.3_vii
+    CharacterRepository --|> ReactiveCrudRepository : 9.3_viii
+    PlanetRepository --|> ReactiveCrudRepository : 9.3_viii
+    Neo4jTemplate --> Neo4jClient : built over it in StarwarsConfig
+    Neo4jClient --> Driver : GraphDatabase.driver on neo4j.url
+    Neo4jTransactionManager --> Driver : binds one session per transaction
+    Driver --> Session : session
+    Session --> Character : Result rows read back
+    Character --> Planet : Relationship type LOCATION
+    Character --> Character : FRIENDS_WITH for friends, MASTER_OF for apprentice
+    Character --> UUIDStringGenerator : GeneratedValue on the id field
+    Planet --> UUIDStringGenerator : GeneratedValue on the id field
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the mapping.</strong> The four edges out of
+      <code>Character</code> are the entity graph, and each has an exact store-side counterpart:
+      <code>@Relationship(type = "LOCATION")</code> on the <code>location</code> field,
+      <code>@Relationship(type = "MASTER_OF")</code> on <code>apprentice</code>, and
+      <code>@Relationship(type = "FRIENDS_WITH")</code> on the <code>friends</code> list — which also
+      carries <code>@AccessType(AccessType.Type.FIELD)</code> because the only setter is
+      <code>addFriend</code> and Spring Data must write the list field rather than look for
+      <code>setFriends</code> (9.3.vi is the one module that adds a package-private
+      <code>setFriends(Iterable)</code>; 9.3.v, vii and viii rely on field access). The transaction
+      edge is the other real difference from Mongo and Couchbase here:
+      <code>Neo4jTransactionManager.with(driver).build()</code> plus
+      <code>@EnableTransactionManagement</code> mean the <code>@Transactional</code> proxy on
+      <code>Neo4jStarwarsRepository</code> (9.3.v) and on <code>Neo4jStarwarsService</code> (9.3.vi–viii)
+      opens one session and reuses it, so saving <code>Yoda</code> writes the character node, the planet
+      link, the friend links and the apprentice link in a single <code>executeWrite</code> unit. In
+      9.3.iii and 9.3.iv that atomicity is manual and imperfect: <code>save(Planet)</code> opens its own
+      <code>db.session()</code> inside the surrounding <code>writeTransaction</code>, so a cascade can
+      span two sessions.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The exact graph instance Main builds in 9.3.iii onward</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    yoda["Character Yoda"]
+    luke["Character Luke Skywalker"]
+    leia["Character Leia Organa"]
+    han["Character Han Solo"]
+    dag["Planet Dagobah"]
+    tat["Planet Tatooine"]
+    ald["Planet Alderaan"]
+    yoda -->|MASTER_OF| luke
+    yoda -->|LOCATION| dag
+    luke -->|LOCATION| tat
+    luke -->|FRIENDS_WITH| han
+    luke -->|FRIENDS_WITH| leia
+    leia -->|LOCATION| ald
+    leia -->|FRIENDS_WITH| han
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the graph.</strong> Four <code>Character</code> nodes and
+      three <code>Planet</code> nodes, seven edges, and every edge is the object call made in
+      <code>Main</code>: <code>yoda.setApprentice(luke)</code> is the only reason a
+      <code>MASTER_OF</code> edge exists, <code>luke.addFriend(han)</code> and
+      <code>luke.addFriend(leia)</code> give the two <code>FRIENDS_WITH</code> edges out of Luke, and
+      <code>leia.addFriend(han)</code> points at the <em>same</em> Han node rather than a copy. Han has
+      no outgoing edge because <code>new Character("Han Solo")</code> never sets a location, an
+      apprentice or a friend — a null reference in Java simply produces no edge in the store, which is
+      the cheapest illustration of schemalessness in the chapter. Direction matters: in 9.3_v+ the
+      mapping metadata is directional too, so reading Yoda back loads Luke as
+      <code>apprentice</code> but reading Luke does not load Yoda as master.</p>
+    </section>
+
+    <section id="couchbase">
+      <span class="kicker">Recipe 9.4</span>
+      <h2>Couchbase: the document id as the only key</h2>
+      <p>Couchbase is the most KV-flavoured of the four. The <code>Vehicle</code> record is annotated
+      <code>@Id String vehicleNo</code>, so the record component <em>is</em> the document key and there
+      is no generated id anywhere in the group — <code>save</code> is an upsert by key
+      (<code>bucket.defaultCollection().upsert(vehicle.vehicleNo(), vehicle)</code> in 9.4.i/ii,
+      <code>couchbase.upsertById(Vehicle.class).one(vehicle)</code> from 9.4.iii), and the read is a
+      get by key whose payload is decoded by <code>.contentAs(Vehicle.class)</code> or by the
+      template's <code>MappingCouchbaseConverter</code>. Because nothing in the group needs a query,
+      no N1QL statement and no index definition appears anywhere in the 9.4 modules — which is why the
+      repository in 9.4.v is a bare <code>CrudRepository</code> with <em>no</em> finder method, unlike
+      9.1.v's <code>findByVehicleNo</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">From Cluster.connect to the fluent template and the repository proxy</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Vehicle {
+        String vehicleNo
+        String color
+        int wheel
+        int seat
+    }
+    class VehicleRepository {
+        save(Vehicle) void
+        delete(Vehicle) void
+        findByVehicleNo(String) Vehicle
+    }
+    class CouchbaseVehicleRepository {
+        Bucket bucket
+        CouchbaseTemplate couchbase
+        save(Vehicle) void
+        delete(Vehicle) void
+        findByVehicleNo(String) Vehicle
+    }
+    class Cluster {
+        connect(String uri, String user, String password) Cluster
+        bucket(String name) Bucket
+    }
+    class Bucket {
+        defaultCollection() Collection
+    }
+    class Collection {
+        upsert(String docId, Object value)
+        get(String docId)
+        remove(String docId)
+    }
+    class CouchbaseTemplate {
+        upsertById(Class)
+        findById(Class)
+        removeById(Class)
+    }
+    class SimpleCouchbaseClientFactory {
+        getCluster() Cluster
+    }
+    class AbstractCouchbaseConfiguration {
+        getConnectionString() String
+        getUserName() String
+        getPassword() String
+        getBucketName() String
+        couchbaseTemplate() CouchbaseTemplate
+        couchbaseConverter() CouchbaseConverter
+    }
+    class CouchbaseConfiguration
+    class MappingCouchbaseConverter
+    class CrudRepository {
+        save(Vehicle) Vehicle
+        findById(String) Optional
+        deleteById(String) void
+    }
+    class ReactiveCouchbaseRepository {
+        saveAll(Flux) Flux
+        findById(String) Mono
+        deleteById(Publisher) Mono
+    }
+    VehicleRepository <|.. CouchbaseVehicleRepository : 9.4_i to 9.4_iv
+    CouchbaseVehicleRepository --> Bucket : defaultCollection in 9.4_i and 9.4_ii
+    CouchbaseVehicleRepository --> CouchbaseTemplate : fluent doc id ops from 9.4_iii
+    Bucket --> Collection : scope default
+    Collection --> Vehicle : contentAs decodes the JSON
+    CouchbaseTemplate --> SimpleCouchbaseClientFactory : built over it in 9.4_iii
+    SimpleCouchbaseClientFactory --> Cluster : bucket vehicles, scope null
+    CouchbaseTemplate --> MappingCouchbaseConverter : explicit converter bean in 9.4_iii
+    CouchbaseConfiguration --|> AbstractCouchbaseConfiguration : 9.4_iv, v and vi
+    CouchbaseConfiguration --> Cluster : declares the bean in 9.4_ii and 9.4_iii
+    Vehicle --> Collection : Id annotation puts vehicleNo in the document key
+    VehicleRepository --|> CrudRepository : 9.4_v with EnableCouchbaseRepositories
+    VehicleRepository --|> ReactiveCouchbaseRepository : 9.4_vi with EnableReactiveCouchbaseRepositories
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the generations.</strong> The top path (
+      <code>CouchbaseVehicleRepository</code> to <code>Bucket</code> to <code>Collection</code>) is
+      9.4.i and 9.4.ii: the SDK's KV API, with the object-to-JSON step done by the client's own
+      encoder. The middle path is 9.4.iii and 9.4.iv, where the repository never sees a
+      <code>Bucket</code>: it asks the template for a <em>fluent operation</em> scoped to a type
+      (<code>findById(Vehicle.class).one(vehicleNo)</code>), and the returned builder executes when you
+      call <code>one</code>. The configuration inheritance edge at the bottom is the diff between those
+      two modules — 9.4.iii writes five <code>@Bean</code> methods by hand, 9.4.iv overrides four
+      getters and lets <code>AbstractCouchbaseConfiguration</code> build the client factory, converter
+      and template for it. Two source facts worth knowing before you run this group: 9.4_v returns
+      <code>null</code> from <code>getUserName()</code> and <code>getPassword()</code>, which will not
+      authenticate against a normal Couchbase Server, and 9.4_iii additionally carries a stray
+      <code>src/main/java/Vehicle.java</code> in the default package that duplicates the mapped record.</p>
+    </section>
+
+    <section id="reactive">
+      <span class="kicker">Rung 6</span>
+      <h2>The reactive variants</h2>
+      <p>Exactly one module per store is reactive — 9.1.vi, 9.2.viii, 9.3.viii and 9.4.vi — and in
+      each case the change is the same three things at once: the client jar
+      (<code>mongodb-driver-reactivestreams</code>, <code>lettuce-core</code>), the abstract
+      configuration class (<code>AbstractReactiveMongoConfiguration</code>,
+      <code>AbstractReactiveNeo4jConfig</code>) or reactive connection factory, and the repository
+      interface (<code>ReactiveMongoRepository</code>, <code>ReactiveCrudRepository</code>,
+      <code>ReactiveCouchbaseRepository</code>, or a hand-written repository returning
+      <code>Mono</code>/<code>Flux</code> as in 9.2.viii). Because <code>main</code> returns before the
+      publisher completes, all four reactive <code>Main</code> classes end in
+      <code>countDownLatch.await()</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The publisher chain each reactive Main assembles</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph MG["9.1_vi ReactiveMongoRepository"]
+        a1["count, a Mono of Long"] --> a2["saveAll over a Flux of 2 Vehicles"] --> a3["last"] --> a4["count again"] --> a5["findByVehicleNo, a Mono"] --> a6["deleteAll"] --> a7["count once more"]
+    end
+    subgraph RD["9.2_viii hand written reactive repository"]
+        b1["count"] --> b2["flatMap of repository save over a Flux"] --> b3["count"] --> b4["findByVehicleNo"] --> b5["count"]
+    end
+    subgraph N4["9.3_viii ReactiveCrudRepository"]
+        c1["planets flatMap save"] --> c2["characters concatMap save"] --> c3["printAll"] --> c4["deleteAll"]
+    end
+    subgraph CB["9.4_vi ReactiveCouchbaseRepository"]
+        d1["saveAll over a Flux"] --> d2["last"] --> d3["findById TEM0001"] --> d4["findById TEM0004"] --> d5["deleteById over a Flux of two keys"]
+    end
+    a7 --> L["doOnTerminate counts down the latch, then subscribe starts the chain"]
+    b5 --> L
+    c4 --> L
+    d5 --> L
+    L --> W["main blocks on CountDownLatch.await"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the chains.</strong> Nothing is executed while the chain is
+      being built — <code>repository.count()</code> in <code>recipe_9_1_vi</code> returns a cold
+      <code>Mono</code>, and only the terminal <code>subscribe()</code> opens the cursor; that is also
+      why the print callbacks hang off <code>doOnSuccess</code> rather than being ordinary
+      <code>System.out</code> statements. Two ordering choices in the source are deliberate: 9.1.vi
+      inserts <code>last()</code> after <code>saveAll</code> to collapse the write flux to a single
+      completion signal before counting again, and 9.3.viii uses <code>concatMap</code> for characters
+      but <code>flatMap</code> for planets, so the four character saves — each of which cascades
+      relationships through <code>@Relationship</code> metadata — are ordered rather than interleaved.
+      The cleanup semantics diverge, and the reactive ones are the weakest: 9.4.vi hands
+      <code>Flux.just("TEM0001", "TEM00004")</code> to <code>deleteById</code>, and the second key does
+      not exist (it is a typo for <code>TEM0004</code>), so that document stays in the bucket; in
+      9.3.viii <code>deleteAll()</code> is also annotated <code>@PreDestroy</code> but returns a
+      <code>Mono</code>, which the lifecycle infrastructure would call without subscribing — the
+      graph is only cleaned because <code>Main</code> puts <code>service.deleteAll()</code> in the
+      chain itself.</p>
+    </section>
+
+    <section id="mapping">
+      <span class="kicker">Vocabulary</span>
+      <h2>Relational vocabulary versus NoSQL vocabulary</h2>
+      <p>Chapters 6 and 7 of the book map the same kind of object onto tables with JDBC and JPA. The
+      table below is restricted to what is actually observable in <code>ch09</code> — including two
+      relational habits that <em>have</em> no counterpart here (no <code>@Version</code> appears in any
+      of the 129 files, and no index or schema DDL is created apart from Redis's
+      <code>@Indexed</code>).</p>
+      <table>
+        <thead>
+          <tr><th>Relational idea</th><th>Chapter 9 equivalent</th><th>Where to see it in source</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Table</td>
+            <td>MongoDB collection <code>vehicles</code>; Redis hash key <code>vehicles</code> holding
+            one field per row; Neo4j node labels <code>Character</code> and <code>Planet</code>;
+            Couchbase bucket <code>vehicles</code> with its default scope and collection.</td>
+            <td><code>@Document(collection = "vehicles")</code> in
+            <code>ch09/recipe_9_1_iv/.../Vehicle.java</code>; <code>DB_NAME = "vehicles"</code> in
+            <code>ch09/recipe_9_2_*/.../RedisVehicleRepository.java</code>; <code>@Node</code> on
+            <code>ch09/recipe_9_3_v/.../Character.java</code>; <code>getBucketName()</code> in
+            <code>ch09/recipe_9_4_iv/.../CouchbaseConfiguration.java</code>.</td>
+          </tr>
+          <tr>
+            <td>Row</td>
+            <td>A BSON document; a hash field whose value is serialised bytes or JSON; a graph node
+            with properties; a JSON document keyed by document id.</td>
+            <td><code>new Document("vehicleNo", ...).append(...)</code> in
+            <code>ch09/recipe_9_1_i/.../MongoVehicleRepository.java</code>;
+            <code>jedis.hset(DB_NAME.getBytes(), key.getBytes(), bytes)</code> in 9.2.iii;
+            <code>CREATE (a:Character {id: randomUUID(), name: $name})</code> in 9.3.iii;
+            <code>bucket.defaultCollection().upsert(vehicle.vehicleNo(), vehicle)</code> in 9.4.i.</td>
+          </tr>
+          <tr>
+            <td>Primary key, auto-increment</td>
+            <td>Mongo generates <code>_id</code> when the <code>id</code> component is null; Neo4j uses
+            a UUID either from Cypher's <code>randomUUID()</code> or from
+            <code>UUIDStringGenerator</code>; Redis's ODM variant fills <code>UUID.randomUUID()</code>;
+            Couchbase uses the business key, so there is no generated id at all.</td>
+            <td>the <code>id</code> component added in <code>recipe_9_1_iii</code>;
+            <code>@GeneratedValue(UUIDStringGenerator.class)</code> in <code>recipe_9_3_v</code>;
+            <code>this(UUID.randomUUID().toString(), vehicleNo, ...)</code> in
+            <code>recipe_9_2_vii/Vehicle.java</code>; <code>@Id String vehicleNo</code> in
+            <code>recipe_9_4_iii/Vehicle.java</code>.</td>
+          </tr>
+          <tr>
+            <td>Foreign key plus JOIN</td>
+            <td>Reference, not embed, everywhere in this chapter: Mongo's <code>vehicleNo</code> is
+            looked up by a filter, Couchbase by document key, Neo4j by a typed edge that is traversed
+            instead of joined. The only <em>embedding</em> in the chapter is Redis, where the whole
+            record — <code>vehicleNo</code> included — is one JSON value inside one hash field.</td>
+            <td><code>Criteria.where("vehicleNo").is(vehicleNo)</code> in 9.1.iii/iv;
+            <code>get(vehicleNo).contentAs(Vehicle.class)</code> in 9.4.i;
+            <code>MATCH (a:Character), (b:Planet) WHERE a.id=$aid AND b.id=$bid CREATE
+            (a)-[r:LOCATION]-&gt;(b)</code> in 9.3.ii/iii;
+            <code>mapper.writeValueAsString(vehicle)</code> in <code>recipe_9_2_iv</code>.</td>
+          </tr>
+          <tr>
+            <td>Secondary index, <code>CREATE INDEX</code></td>
+            <td>Only Redis creates one, and implicitly: <code>@Indexed</code> makes Spring Data Redis
+            maintain keyspace index entries that back the derived finder. Mongo's filter on
+            <code>vehicleNo</code>, Neo4j's <code>WHERE a.id=$aid</code> and Couchbase's get-by-key run
+            without any index statement in this chapter.</td>
+            <td><code>@Indexed String vehicleNo</code> in
+            <code>ch09/recipe_9_2_vii/src/main/java/com/apress/spring6recipes/nosql/Vehicle.java</code>;
+            the only other index-adjacent API in the chapter is <code>ScanOptions.NONE</code> in
+            9.2.v–viii.</td>
+          </tr>
+          <tr>
+            <td>SQL statement</td>
+            <td>Mongo query objects; Redis is command based with a server-side cursor over the hash;
+            Neo4j speaks Cypher, written by hand in 9.3.i–iv and generated in 9.3.v–viii; Couchbase
+            would speak N1QL for queries, but these recipes stay on the key/value path.</td>
+            <td><code>new Query(where("vehicleNo").is(vehicleNo))</code> in 9.1.iii;
+            <code>opsForHash().scan(DB_NAME, ScanOptions.NONE)</code> in 9.2.v; the Cypher constants in
+            9.3.ii/iii/iv; no <code>@Query</code> annotation anywhere in <code>ch09</code>.</td>
+          </tr>
+          <tr>
+            <td>Transaction, <code>PlatformTransactionManager</code></td>
+            <td>Only Neo4j and Redis get one in this chapter. Mongo and Couchbase rely on single
+            document atomicity, and their repositories carry no <code>@Transactional</code>.</td>
+            <td><code>Neo4jTransactionManager.with(driver).build()</code> plus
+            <code>@EnableTransactionManagement</code> and <code>@Transactional</code> in
+            <code>ch09/recipe_9_3_v/.../StarwarsConfig.java</code>;
+            <code>template.setEnableTransactionSupport(true)</code> in <code>recipe_9_2_vi</code>;
+            session callbacks <code>writeTransaction</code> and <code>executeWrite</code> in 9.3.i–iv.</td>
+          </tr>
+          <tr>
+            <td>Optimistic locking, <code>@Version</code></td>
+            <td>Absent. The nearest thing is the "already persisted" guard in the hand-written graph
+            repository, which is an identity check rather than a lock.</td>
+            <td>no <code>@Version</code> in <code>ch09</code>; <code>if (charr.getId() != null) return
+            charr;</code> in <code>ch09/recipe_9_3_iii/.../Neo4jStarwarsRepository.java</code>.</td>
+          </tr>
+          <tr>
+            <td>Repository / DAO layer</td>
+            <td>Five different abstractions with the same intent: <code>MongoRepository</code>,
+            <code>ReactiveMongoRepository</code>, <code>ListCrudRepository</code>,
+            <code>CrudRepository</code> (Neo4j and Couchbase), <code>ReactiveCrudRepository</code>,
+            <code>ReactiveCouchbaseRepository</code> — each switched on by its own
+            <code>@Enable…Repositories</code> annotation.</td>
+            <td><code>@EnableMongoRepositories</code> in 9.1.v, <code>@EnableRedisRepositories</code>
+            in 9.2.vii, <code>@EnableNeo4jRepositories</code> in 9.3.vi/vii,
+            <code>@EnableCouchbaseRepositories</code> in 9.4_v, and the reactive counterparts in
+            9.1.vi, 9.3.viii and 9.4.vi.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Practice</span>
+      <h2>Building and running</h2>
+      <p>Build one module at a time; the Gradle path is the directory path with colons.</p>
+      <pre><code>cd C:/Users/sahuk/IdeaProjects/spring-6-recipes
+./gradlew :ch09:recipe_9_1_i:build          # compile and jar one recipe
+./gradlew :ch09:recipe_9_1_i:uberJar        # fat jar, root build.gradle registers uberJar per recipe
+java --enable-preview -cp ch09/recipe_9_1_i/build/libs/recipe_9_1_i-6.0.0-SNAPSHOT-all.jar ^
+     com.apress.spring6recipes.nosql.Main    # every module's entry point is this class</code></pre>
+      <p>The toolchain is pinned to <code>JavaLanguageVersion.of(19)</code> in the root
+      <code>build.gradle</code> and every compile/test/exec task adds
+      <code>--enable-preview</code>, so run the jar on a JDK 19 with the same flag (note that the
+      checked-in <code>org.gradle.java.home</code> points at JDK 17, so Gradle must provision or
+      locate 19). Use <code>-cp</code> plus the class name rather than <code>-jar</code>: the
+      <code>Main-Class</code> manifest entry set in <code>ch09/build.gradle</code> belongs to the
+      plain <code>jar</code> task, not to <code>uberJar</code>.</p>
+
+      <h3>Prerequisites per store, taken from the source</h3>
+      <table>
+        <thead>
+          <tr><th>Group</th><th>Server you must have running</th><th>Exact settings found in code</th><th>Cleanup the recipe performs</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="num">9.1</td>
+            <td>A <code>mongod</code> reachable with no credentials. Nothing in <code>ch09</code>
+            supplies a URI, port, username or password, and <code>recipe_9_1_i/ii</code> call
+            <code>MongoClients.create()</code> with no argument while iii–v use
+            <code>MongoClientFactoryBean</code> with no properties set.</td>
+            <td>default host and port, i.e. <code>localhost:27017</code>; database
+            <code>vehicledb</code> (<code>MongoConfiguration.DB_NAME</code>); collection
+            <code>vehicles</code>. Authentication must be off, or the drivers must be edited.</td>
+            <td>9.1.i drops the database in <code>Main</code>; 9.1.ii–iv drop it from
+            <code>@PreDestroy cleanUp()</code>; 9.1.v deletes the listed vehicles; 9.1.vi ends with
+            <code>deleteAll()</code>. The database itself is created implicitly on first insert.</td>
+          </tr>
+          <tr>
+            <td class="num">9.2</td>
+            <td>A <code>redis-server</code> on the default port with no password and no database index
+            selection.</td>
+            <td><code>new Jedis("localhost", Protocol.DEFAULT_PORT)</code> i.e. 6379 (9.2.i–iv);
+            <code>new JedisConnectionFactory()</code> with no properties (9.2.v–vii);
+            <code>new LettuceConnectionFactory("localhost", 6379)</code> (9.2.viii). One key: the hash
+            <code>vehicles</code>; also <code>msg</code>, <code>authors</code>, <code>sr_5</code>,
+            <code>sr_6</code> in 9.2.i/ii.</td>
+            <td>9.2.iii–vi delete every field via <code>cleanUp()</code>; 9.2.vii calls
+            <code>deleteAll()</code> in <code>Main</code>; 9.2.viii deletes per field on
+            <code>@PreDestroy</code>. 9.2.i and 9.2.ii delete nothing, so <code>msg</code>,
+            <code>authors</code>, <code>sr_5</code> and <code>sr_6</code> stay in the keyspace; and in
+            9.2.iii–vi <code>count()</code> is the size of the <code>vehicles</code> hash, so any field
+            left by an aborted run makes the next run start above zero.</td>
+          </tr>
+          <tr>
+            <td class="num">9.3</td>
+            <td>A Neo4j 5.x server exposing Bolt. The <code>org.neo4j:neo4j</code> dependency is on the
+            classpath of all eight modules but nothing uses an embedded database — every module calls
+            <code>GraphDatabase.driver(url)</code> with a single argument, so <strong>no auth token is
+            ever passed</strong>.</td>
+            <td>9.3.i–iii hard-code <code>bolt://localhost:7687</code>; 9.3.iv–viii read
+            <code>neo4j.url=bolt://localhost:7687</code> from
+            <code>src/main/resources/application.properties</code> through
+            <code>@PropertySource</code> and <code>@Value</code>. Run the server with authentication
+            disabled (e.g. <code>NEO4J_AUTH=none</code>) or add an <code>AuthToken</code>.</td>
+            <td>9.3.i/ii run <code>MATCH (n) DETACH DELETE n</code>; 9.3.iii/iv delete nodes and
+            relationships in <code>cleanUp()</code>; 9.3.v–vii call <code>deleteAll</code>. Every
+            module wipes the <em>entire</em> database, so never point these at a server holding data
+            you want.</td>
+          </tr>
+          <tr>
+            <td class="num">9.4</td>
+            <td>A Couchbase Server 7.x on <code>127.0.0.1</code> with the KV/data service reachable.
+            You must create, in the console, a bucket named <code>vehicles</code> and a user
+            <code>s6r-user</code> with password <code>s6r-password</code> granted read/write on that
+            bucket — the SDK cannot create either.</td>
+            <td><code>Cluster.connect("couchbase://127.0.0.1", "s6r-user", "s6r-password")</code>
+            (9.4.i–iii), the same four values as overrides of
+            <code>AbstractCouchbaseConfiguration</code> (9.4.iv, 9.4.vi), and
+            <code>SimpleCouchbaseClientFactory(cluster, "vehicles", null)</code> where the null scope
+            means the default scope.</td>
+            <td>9.4.i–iv remove the two documents they wrote (<code>TEM0001</code>,
+            <code>TEM0004</code>); 9.4.v calls <code>deleteById</code> for both. 9.4.vi leaves
+            <code>TEM0004</code> in the bucket because its delete list contains the misspelled key
+            <code>TEM00004</code>.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout danger">
+        <h4>Two modules will not run as checked in</h4>
+        <p><code>ch09/recipe_9_4_v/.../CouchbaseConfiguration.java</code> returns <code>null</code>
+        from <code>getUserName()</code> and <code>getPassword()</code> while every other module in the
+        group uses <code>s6r-user</code>/<code>s6r-password</code>; a secured Couchbase rejects the
+        connection, so supply the credentials yourself before running it. And
+        <code>recipe_9_4_iii</code>/<code>recipe_9_4_iv</code> call
+        <code>vehicle.getVehicleNo()</code> on a record whose accessor is
+        <code>vehicleNo()</code>, which does not compile; that is the only place in the chapter where
+        the fix is in your hands rather than in the server you start.</p>
+      </div>
+      <div class="callout info">
+        <h4>Running without a server at all</h4>
+        <p>9.2.i and 9.2.ii are the only modules that use no Spring Data type, but they still open a
+        socket to Redis in their first statement, so nothing in Chapter 9 degrades to an in-memory
+        substitute. If you cannot start a store, read the 9.1 group as the reference implementation —
+        the template, metadata and repository mechanisms it demonstrates are the same ones the other
+        three groups re-use.</p>
+      </div>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch09/</code> — 28 Gradle modules, 129 Java files, Spring Data 2022.0.0.
+</footer>
+</body>
+</html>

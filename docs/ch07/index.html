@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 7 — Spring Transaction Management — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 7</div>
+  <h1>Chapter 7 — Spring Transaction Management</h1>
+  <p class="lede">The whole chapter is one domain example — a bookshop that decrements <code>BOOK_STOCK</code> and debits <code>ACCOUNT</code> for the price of a book — replayed with seven different ways of obtaining a transaction. It starts at bare <code>java.sql.Connection</code> auto-commit, walks through <code>PlatformTransactionManager</code>, <code>TransactionTemplate</code> and the declarative <code>@Transactional</code> proxy, then spends the rest of the chapter on the three things that actually decide whether money is lost: propagation, the rollback exception rule, and isolation. Every recipe is a <code>Main</code> class against a live PostgreSQL database, so the outcome you see is the real commit boundary, not a mock.</p>
+  <div class="chip-row">
+    <span class="chip">17 modules, 114 Java files</span>
+    <span class="chip">spring-tx, spring-jdbc, spring-r2dbc, spring-aspects</span>
+    <span class="chip">DataSourceTransactionManager / R2dbcTransactionManager</span>
+    <span class="chip">needs PostgreSQL on localhost:5432, database bookstore</span>
+    <span class="chip">./gradlew :ch07:recipe_7_5_i:build</span>
+    <span class="chip">recipe_7_10_i needs -javaagent spring-instrument</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch06/index.html">&larr; Chapter 6 — Spring Data Access</a>
+    <a href="../ch08/index.html">Chapter 8 — Spring Batch &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc"><h2>On this page</h2><ol>
+    <li><a href="#overview">Overview and module map</a></li>
+    <li><a href="#no-spring">Recipe 7.1 — transactions without Spring</a></li>
+    <li><a href="#programmatic">Recipes 7.3 and 7.4 — programmatic transactions</a></li>
+    <li><a href="#declarative">Recipe 7.5 — declarative transactions and the proxy</a></li>
+    <li><a href="#propagation">Recipe 7.6 — propagation across two beans</a></li>
+    <li><a href="#isolation">Recipe 7.7 — isolation levels and a racing writer</a></li>
+    <li><a href="#rollback">Recipes 7.8 and 7.9 — which exceptions roll back</a></li>
+    <li><a href="#aspectj">Recipe 7.10 — AspectJ weaving, and the XML nobody loads</a></li>
+    <li><a href="#attributes">Attribute table for every recipe</a></li>
+    <li><a href="#running">Running the recipes</a></li>
+  </ol></aside>
+  <article>
+
+  <section id="overview">
+    <span class="kicker">Mental model</span>
+    <h2>Overview and module map</h2>
+    <p>Spring's transaction support has exactly two moving parts, and every recipe in <span class="path">ch07/</span> is a different combination of them. The first is a <code>PlatformTransactionManager</code> (or its reactive twin <code>ReactiveTransactionManager</code>) that knows how to turn a resource — a JDBC <code>Connection</code>, an R2DBC <code>ConnectionFactory</code> session — into a transaction: switch auto-commit off, set the isolation level, commit, roll back, hand the resource back. The second is <em>who calls those methods</em>. Recipes 7.1 do it with raw JDBC calls. Recipes 7.3 call the manager by hand. Recipes 7.4 hand the call to <code>TransactionTemplate</code>. Recipes 7.5–7.9 let a proxy call it via <code>TransactionInterceptor</code>. Recipe 7.10 lets a woven AspectJ aspect call it, with no proxy at all.</p>
+    <p>Two facts about the data explain almost every run in the chapter. <span class="path">ch07/recipe_7_1_i/src/main/resources/bookstore.sql</span> seeds book <code>0001</code> at <code>PRICE = 30</code> and <code>user1</code> at <code>BALANCE = 20</code>, and the <code>ACCOUNT</code> table carries <code>CONSTRAINT positive_balance CHECK (BALANCE &gt;= 0)</code>. So the third statement of every <code>purchase</code> — <code>UPDATE ACCOUNT SET BALANCE = BALANCE - 30</code> — violates a database constraint and blows up. The chapter is deliberately built so the <em>failure</em> path is the default path: the interesting question is never "did the money move" but "how much of the damage survived". Second, the checkout recipes pass <code>List.of("0001", "0002")</code> but <code>0002</code> is never inserted anywhere in the chapter, so the second loop iteration would fail on the <code>SELECT PRICE</code> read instead of the balance write.</p>
+    <table>
+      <thead><tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr></thead>
+      <tbody>
+        <tr><td class="num">7.1</td><td><code>recipe_7_1_i</code>, <code>recipe_7_1_ii</code></td><td>Raw JDBC: auto-commit damage, then manual <code>setAutoCommit(false)</code> plus <code>commit</code>/<code>rollback</code>. No Spring transaction classes at all.</td><td><code>JdbcBookShop</code>, <code>BookShop</code>, <code>BookstoreConfiguration</code>, <code>DriverManagerDataSource</code></td></tr>
+        <tr><td class="num">7.2</td><td><em>no module</em></td><td>There is no <code>recipe_7_2_*</code> directory in <span class="path">ch07/</span>. The XML declarative configuration that occupies this part of the book survives only as three unused resource files inside <code>recipe_7_7_*</code> — see <a href="#aspectj">Recipe 7.10 and the XML</a>.</td><td><code>spring-beans.xml</code>, <code>classic-beans.xml</code>, <code>aspectj-beans.xml</code></td></tr>
+        <tr><td class="num">7.3</td><td><code>recipe_7_3_i</code></td><td>Calling <code>PlatformTransactionManager.getTransaction</code>/<code>commit</code>/<code>rollback</code> by hand, plus the same shape on <code>ReactiveTransactionManager</code> returning <code>Mono</code>.</td><td><code>TransactionalJdbcBookShop</code>, <code>DataSourceTransactionManager</code>, <code>DefaultTransactionDefinition</code>, <code>TransactionalR2dbcBookShop</code>, <code>R2dbcTransactionManager</code></td></tr>
+        <tr><td class="num">7.4</td><td><code>recipe_7_4_i</code>, <code>recipe_7_4_ii</code></td><td><code>TransactionTemplate</code> with <code>TransactionCallbackWithoutResult</code>; then the template as an injected bean. Reactive counterpart is <code>TransactionalOperator</code>.</td><td><code>TransactionalJdbcBookShop</code>, <code>TransactionTemplate</code>, <code>TransactionCallbackWithoutResult</code>, <code>TransactionalOperator</code>, <code>ReactiveBookstoreConfiguration</code></td></tr>
+        <tr><td class="num">7.5</td><td><code>recipe_7_5_i</code></td><td>Declarative transactions: <code>@EnableTransactionManagement</code> on the config, <code>@Transactional</code> on <code>purchase</code>, business code with no transaction vocabulary left in it.</td><td><code>JdbcBookShop</code>, <code>BookstoreConfiguration</code>, <code>TransactionalR2dbcBookShop</code> (reactive)</td></tr>
+        <tr><td class="num">7.6</td><td><code>recipe_7_6_i</code>, <code>recipe_7_6_ii</code>, <code>recipe_7_6_iii</code></td><td>Propagation between <code>Cashier.checkout</code> and <code>BookShop.purchase</code>: all defaults, then <code>REQUIRES_NEW</code> on the outer method, then <code>REQUIRES_NEW</code> on the inner one.</td><td><code>BookShopCashier</code>, <code>Cashier</code>, <code>JdbcBookShop</code>, <code>Propagation</code></td></tr>
+        <tr><td class="num">7.7</td><td><code>recipe_7_7_i</code> … <code>recipe_7_7_v</code></td><td>Isolation. Two threads: <code>increaseStock</code> writes, sleeps 10 s and rolls back; <code>checkStock</code> reads, and its <code>isolation</code> attribute is the only thing that changes across <code>_i</code>, <code>_ii</code>, <code>_iv</code>, <code>_v</code>. <code>_iii</code> re-runs the dirty-read case with the threads started in the opposite order.</td><td><code>JdbcBookShop</code>, <code>BookShop</code>, <code>Book</code>, <code>Isolation</code>, <code>Utils</code></td></tr>
+        <tr><td class="num">7.8</td><td><code>recipe_7_8_i</code></td><td>Rollback rules written explicitly: <code>rollbackFor = IOException.class</code> and <code>noRollbackFor = ArithmeticException.class</code>, on a <code>REQUIRES_NEW</code> method.</td><td><code>JdbcBookShop</code>, <code>BookShopCashier</code></td></tr>
+        <tr><td class="num">7.9</td><td><code>recipe_7_9_i</code></td><td>The 7.8 attributes again, plus the remaining knobs on the read method: <code>timeout = 30</code> and <code>readOnly = true</code> alongside <code>SERIALIZABLE</code>.</td><td><code>JdbcBookShop</code>, <code>Propagation</code>, <code>Isolation</code></td></tr>
+        <tr><td class="num">7.10</td><td><code>recipe_7_10_i</code></td><td>The same annotations, advised by a woven AspectJ aspect instead of a proxy: <code>@EnableTransactionManagement(mode = AdviceMode.ASPECTJ)</code> plus <code>@EnableLoadTimeWeaving</code>, run under the <code>spring-instrument</code> java agent.</td><td><code>BookstoreConfiguration</code>, <code>BookShopCashier</code>, <code>JdbcBookShop</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout info"><h4>Not in the source</h4>
+    <p>Only <code>REQUIRED</code> and <code>REQUIRES_NEW</code> appear anywhere in <span class="path">ch07/</span>. <code>Propagation.NESTED</code>, <code>SUPPORTS</code>, <code>MANDATORY</code>, <code>NOT_SUPPORTED</code> and <code>NEVER</code> are never used, and no module uses <code>rollbackForClassName</code>, <code>noRollbackForClassName</code>, <code>value</code> (transaction manager qualifier) or a custom <code>TransactionManager</code> bean name. There is no <code>src/test</code> directory in any of the 17 modules, so nothing here is verified by an automated test — the proof is the database.</p>
+    </div>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">Flowchart</span>
+        <span class="dtitle">Every recipe funnels into the same four manager calls</span></figcaption>
+      <pre class="mermaid">
+flowchart LR
+    r1["7.1_i and 7.1_ii - you write the commit calls"]
+    r3["7.3_i - you call the manager"]
+    r4["7.4_i and 7.4_ii - the template calls the manager"]
+    r5["7.5 to 7.9 - the TransactionInterceptor calls the manager"]
+    r10["7.10 - an AspectJ aspect calls the manager"]
+    ptm["DataSourceTransactionManager"]
+    conn["one JDBC Connection, autoCommit off, bound to the thread"]
+    db[("PostgreSQL bookstore schema")]
+    r1 --> conn
+    r3 --> ptm
+    r4 --> ptm
+    r5 --> ptm
+    r10 -.->|"no proxy, advice woven into the bytecode"| ptm
+    ptm --> conn
+    conn --> db
+      </pre>
+    </figure>
+    <p class="reading"><strong>Reading the map.</strong> The right-hand side never changes: something obtains a <code>Connection</code> from the <code>DataSource</code> the manager holds, calls <code>setAutoCommit(false)</code>, and later calls <code>commit()</code> or <code>rollback()</code> on it. What the chapter varies is the left-hand side — who is allowed to make that call. Follow the arrows from <code>7.1</code> to <code>7.10</code> and the amount of code you own shrinks: in <code>7.1_i</code> you hold the <code>Connection</code> yourself; in <code>7.3_i</code> you hold a <code>TransactionStatus</code> and hand it back; in <code>7.4</code> you hold nothing but a callback; in <code>7.5</code>–<code>7.9</code> you hold nothing at all, because <code>TransactionInterceptor</code> invokes the manager around your method. The dashed arrow to <code>7.10</code> marks the one structural break: <code>AdviceMode.ASPECTJ</code> replaces the container-supplied proxy with advice woven into the class itself, so the arrow bypasses bean creation entirely.</p>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">Class</span>
+        <span class="dtitle">The cast of classes and the bean graph they are wired into</span></figcaption>
+      <pre class="mermaid">
+classDiagram
+    class Cashier {
+        +checkout(isbns, username)
+    }
+    class BookShop {
+        +purchase(isbn, username)
+    }
+    class BookShopCashier {
+        +BookShop bookShop
+        +checkout(isbns, username)
+    }
+    class JdbcBookShop {
+        +purchase(isbn, username)
+        +increaseStock(isbn, stock)
+        +checkStock(isbn)
+    }
+    class TransactionalJdbcBookShop {
+        +PlatformTransactionManager transactionManager
+        +purchase(isbn, username)
+    }
+    class TransactionalR2dbcBookShop {
+        +ReactiveTransactionManager txManager
+        +TransactionalOperator txOperator
+        +DatabaseClient client
+        +purchase(isbn, username)
+    }
+    class JdbcDaoSupport {
+        +setDataSource(ds)
+        +getJdbcTemplate()
+    }
+    class PlatformTransactionManager {
+        +getTransaction(def)
+        +commit(status)
+        +rollback(status)
+    }
+    class DataSourceTransactionManager
+    class TransactionTemplate {
+        +execute(callback)
+    }
+    class TransactionCallbackWithoutResult {
+        +doInTransactionWithoutResult(status)
+    }
+    class TransactionalOperator {
+        +transactional(publisher)
+    }
+    class R2dbcTransactionManager
+    class DriverManagerDataSource
+    class ConnectionFactory
+    class Book {
+        +String isbn
+        +String name
+        +int price
+    }
+    BookShopCashier ..|> Cashier : implements, from 7.6 on
+    JdbcBookShop ..|> BookShop : implements, 7.1 and 7.5 to 7.10
+    TransactionalJdbcBookShop ..|> BookShop : implements, 7.3 and 7.4
+    TransactionalR2dbcBookShop ..|> BookShop : also implements it, as the reactive BookShop of 7.3 to 7.5
+    JdbcBookShop --|> JdbcDaoSupport : extends
+    TransactionalJdbcBookShop --|> JdbcDaoSupport : extends
+    BookShopCashier --> BookShop : purchase, always across the proxy
+    TransactionalJdbcBookShop --> PlatformTransactionManager : getTransaction, commit, rollback
+    TransactionalJdbcBookShop ..> TransactionCallbackWithoutResult : the body of the callback
+    TransactionTemplate --> PlatformTransactionManager : drives it
+    TransactionalOperator --> R2dbcTransactionManager : the reactive template
+    TransactionalR2dbcBookShop --> TransactionalOperator : 7.4_ii and 7.5_i wrap the publisher
+    TransactionalR2dbcBookShop --> R2dbcTransactionManager : 7.3_i calls getReactiveTransaction
+    DataSourceTransactionManager --> DriverManagerDataSource : holds the DataSource
+    R2dbcTransactionManager --> ConnectionFactory : holds the factory
+    JdbcBookShop --> DriverManagerDataSource : borrows Connections
+    note for Book "plain POJO, shipped from 7.7 on, read by no transactional method"
+      </pre>
+    </figure>
+    <p class="reading"><strong>Reading the graph.</strong> The important edge is <code>BookShopCashier --&gt; BookShop</code>. The cashier is constructed with the <em>bean</em>, and from recipe 7.5 on that bean is a proxy, so every <code>purchase</code> call inside <code>checkout</code> re-enters the transaction advice — which is why propagation is even a question. Note the two shapes the abstraction takes: <code>JdbcBookShop</code> and <code>TransactionalJdbcBookShop</code> both extend <code>JdbcDaoSupport</code>, which supplies the <code>JdbcTemplate</code> and forces <code>setDataSource</code>; the difference is that the second one carries a <code>PlatformTransactionManager</code> field, which recipe 7.5 removes. On the reactive side there is no <code>JdbcDaoSupport</code> equivalent — <code>TransactionalR2dbcBookShop</code> holds a <code>DatabaseClient</code> and either a <code>ReactiveTransactionManager</code> (7.3) or a <code>TransactionalOperator</code> (7.4). <code>Book</code> is in the graph only because it is in the source: from <code>recipe_7_7_i</code> on every module ships a <code>Book</code> bean class that nothing in the transactional path reads.</p>
+  </section>
+
+  <section id="no-spring">
+    <span class="kicker">Recipe 7.1 — ch07/recipe_7_1_i, ch07/recipe_7_1_ii</span>
+    <h2>Recipe 7.1 — transactions without Spring</h2>
+    <p><code>recipe_7_1_i</code> is the control experiment. <span class="path">ch07/recipe_7_1_i/src/main/java/com/apress/spring6recipes/bookshop/JdbcBookShop.java</span> opens one connection with <code>try (var conn = dataSource.getConnection())</code> and issues three statements through it. <code>DriverManagerDataSource</code> does not pool or wrap anything, so the connection arrives with PostgreSQL's auto-commit on: the <code>SELECT PRICE</code> is its own transaction, the <code>UPDATE BOOK_STOCK</code> is its own transaction and is durable the instant <code>executeUpdate</code> returns, and only then does the <code>UPDATE ACCOUNT</code> run — and fail, because <code>20 - 30</code> violates <code>positive_balance</code>. The <code>SQLException</code> is wrapped in a <code>RuntimeException</code> and thrown, and the book is one copy short of what the customer paid nothing for.</p>
+    <p><code>recipe_7_1_ii</code> fixes it with three JDBC calls and nothing else: <code>conn.setAutoCommit(false)</code> at the top, <code>conn.commit()</code> after the third statement, and a nested <code>catch (SQLException ex) { conn.rollback(); throw ex; }</code>. Same connection, same statements, same failure — but now the stock decrement is a pending change on a transaction that gets rolled back, so the database ends exactly where it started.</p>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">State</span>
+        <span class="dtitle">Connection transaction state: 7.1_i versus 7.1_ii</span></figcaption>
+      <pre class="mermaid">
+stateDiagram-v2
+    [*] --> AutoCommitOn : 7.1_i, DriverManagerDataSource gives a fresh connection
+    AutoCommitOn --> StockGone : SELECT price 30, then UPDATE BOOK_STOCK, each committed alone
+    StockGone --> RuntimeException : UPDATE ACCOUNT hits positive_balance, SQLException wrapped
+    RuntimeException --> [*] : stock 9, balance 20 - inconsistent, and permanent
+
+    [*] --> Manual : 7.1_ii, conn.setAutoCommit(false)
+    Manual --> Pending : all three statements run, nothing durable yet
+    Pending --> RolledBack : catch SQLException, conn.rollback then rethrow
+    Pending --> Committed : conn.commit after the third update
+    RolledBack --> [*] : stock 10, balance 20 - unchanged
+    Committed --> [*] : the happy path, only reachable with a funded account
+      </pre>
+    </figure>
+    <p class="reading"><strong>Reading the states.</strong> Trace the top lane: with auto-commit on, each arrow is a separate transaction, so "StockGone" is a <em>committed</em> fact by the time the balance update throws — the damage is not recoverable by any amount of later error handling. That is the whole argument for the bottom lane. In <code>7.1_ii</code> the state that matters is "Pending": <code>setAutoCommit(false)</code> turns the connection into a transaction, so the constraint violation on statement three can be undone by <code>conn.rollback()</code>. Two details worth carrying into the Spring recipes. First, <code>7.1_ii</code>'s rollback is keyed on <code>SQLException</code>; had the failing statement thrown a <code>RuntimeException</code> — a null <code>ResultSet</code> dereference, say — <code>conn.rollback()</code> would be skipped and the outer <code>try</code>-with-resources would silently close the connection. Second, both variants read the price with <code>rs.next(); price = rs.getInt("PRICE")</code> and never check the return value, so a missing ISBN gives <code>price = 0</code> rather than an error. Spring's <code>JdbcTemplate.queryForObject</code>, used from recipe 7.3 on, throws <code>EmptyResultDataAccessException</code> in that case instead.</p>
+  </section>
+
+  <section id="programmatic">
+    <span class="kicker">Recipe 7.3 and 7.4 — ch07/recipe_7_3_i, ch07/recipe_7_4_i, ch07/recipe_7_4_ii</span>
+    <h2>Recipes 7.3 and 7.4 — programmatic transactions</h2>
+    <p>Recipe 7.3 hands the job to Spring but keeps the ceremony in your code. <span class="path">ch07/recipe_7_3_i/src/main/java/com/apress/spring6recipes/bookshop/TransactionalJdbcBookShop.java</span> builds a <code>DefaultTransactionDefinition</code> (so: <code>REQUIRED</code>, <code>ISOLATION_DEFAULT</code>, read-write, no timeout), asks the injected <code>DataSourceTransactionManager</code> for a <code>TransactionStatus</code>, runs three <code>getJdbcTemplate()</code> calls, and then calls <code>commit(status)</code> — or, in <code>catch (DataAccessException e)</code>, calls <code>rollback(status)</code> and rethrows. The manager and the DAO support are pointed at the <em>same</em> <code>DriverManagerDataSource</code> bean in <code>BookstoreConfiguration</code>, which is what makes this work at all: <code>DataSourceTransactionManager.doBegin</code> binds a <code>ConnectionHolder</code> to the current thread in <code>TransactionSynchronizationManager</code>, and <code>DataSourceUtils.getConnection</code> — which is what <code>JdbcTemplate</code> calls — finds that bound holder instead of opening a second connection. Change nothing else and the updates are in the manager's transaction; bind the manager to a different <code>DataSource</code> and you get three independent auto-commit transactions and a very convincing illusion of correctness.</p>
+    <p>Recipe 7.4 replaces the hand-rolled begin/commit/rollback with <code>TransactionTemplate</code>. In <code>recipe_7_4_i</code> the template is created inside <code>purchase</code> — <code>new TransactionTemplate(transactionManager)</code> per call — and the body is an anonymous <code>TransactionCallbackWithoutResult</code> whose <code>doInTransactionWithoutResult(TransactionStatus ts)</code> receives the status but ignores it. In <code>recipe_7_4_ii</code> the only change is structural: <code>BookstoreConfiguration</code> declares a <code>transactionTemplate</code> bean and the service takes it in the constructor. The transaction semantics are identical, and both are now safer than 7.3 — <code>TransactionTemplate.execute</code> rolls back on <em>any</em> <code>RuntimeException</code> or <code>Error</code> escaping the callback, not only on the <code>DataAccessException</code> that 7.3's catch clause happens to name.</p>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">Sequence</span>
+        <span class="dtitle">Recipe 7.3_i — getTransaction, work, commit, and the rollback branch</span></figcaption>
+      <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant M as Main
+    participant S as TransactionalJdbcBookShop
+    participant TM as DataSourceTransactionManager
+    participant TSM as TransactionSynchronizationManager
+    participant C as JDBC Connection
+    M->>S: purchase 0001, user1
+    S->>TM: getTransaction(new DefaultTransactionDefinition())
+    TM->>C: dataSource.getConnection(), setAutoCommit(false)
+    TM->>TSM: bind ConnectionHolder to this thread
+    TM-->>S: TransactionStatus, isNewTransaction true
+    S->>C: SELECT PRICE FROM BOOK WHERE ISBN = ?
+    C-->>S: 30, and the same Connection is reused
+    S->>C: UPDATE BOOK_STOCK SET STOCK = STOCK - 1
+    Note over S,C: JdbcTemplate calls DataSourceUtils.getConnection, finds the bound holder
+    S->>C: UPDATE ACCOUNT SET BALANCE = BALANCE - 30
+    C--xS: SQLException, positive_balance violated
+    Note over S: caught as DataAccessException, not as RuntimeException
+    S->>TM: rollback(status)
+    TM->>C: connection.rollback(), restore autoCommit, unbind holder, close
+    S-->>M: the DataAccessException is rethrown
+      </pre>
+    </figure>
+    <p class="reading"><strong>Reading the calls.</strong> Hop 2 is the whole transaction: <code>getTransaction</code> returns a <code>TransactionStatus</code> that is a token, not a resource — you never touch the <code>Connection</code> directly again. Hop 4 is the mechanism people forget: the <code>ConnectionHolder</code> is a <em>thread</em>-bound object, which is why the three <code>JdbcTemplate</code> calls at hops 6, 8 and 9 share one transaction without being passed it, and why moving work to another thread silently moves it out of the transaction. Note that <code>TransactionalJdbcBookShop.purchase</code> catches <code>DataAccessException</code> only; a <code>RuntimeException</code> from anywhere else in the body would skip <code>rollback(status)</code> and leave the transaction open on the way out — the connection would be closed by <code>DriverManagerDataSource</code>'s caller-side cleanup with an undecided transaction, i.e. a database-side implicit rollback that the code never asked for. The final hop is the reason the chapter keeps pushing toward declarative transactions: rethrowing after rollback is correct here, but the pair <code>rollback</code> + <code>throw</code> is exactly what the proxy does for you later.</p>
+
+    <h3>The reactive twins in the same modules</h3>
+    <p>Recipes 7.3, 7.4 and 7.5 each ship a second, parallel implementation under <span class="path">.../bookshop/reactive/</span> that swaps <code>PlatformTransactionManager</code> for <code>ReactiveTransactionManager</code> and JDBC for R2DBC. <code>TransactionalR2dbcBookShop</code> in <code>recipe_7_3_i</code> calls <code>txManager.getReactiveTransaction(def)</code>, which returns <code>Mono&lt;TransactionStatus&gt;</code>, then chains <code>balance.then(txManager.commit(status))</code> with <code>.onErrorResume(ex -&gt; txManager.rollback(status).then(Mono.error(ex)))</code> — the same begin/commit/rollback shape, but the rollback is an operator in the pipeline rather than a catch clause, because there is no thread to bind a resource to. <code>recipe_7_4_i</code> collapses that into <code>TransactionalOperator.create(txManager)</code> plus <code>balance.as(tx::transactional)</code>; <code>recipe_7_4_ii</code> injects the <code>TransactionalOperator</code> as a bean, mirroring the JDBC change. <code>recipe_7_5_i</code> drops the operator and puts <code>@Transactional</code> on a method returning <code>Mono&lt;Void&gt;</code>.</p>
+    <div class="callout danger"><h4>Three defects in the reactive variants, straight from source</h4>
+    <ul>
+      <li>None of the four reactive <code>Main</code> classes loads its own configuration. <span class="path">ch07/recipe_7_3_i/src/main/java/com/apress/spring6recipes/bookshop/reactive/Main.java</span> imports <code>com.apress.spring6recipes.bookshop.config.BookstoreConfiguration</code> — the JDBC one — and then asks the context for <code>reactive.BookShop</code>. There is no such bean in that config, so it ends in <code>NoSuchBeanDefinitionException</code>. You have to point it at <code>ReactiveBookstoreConfiguration</code> yourself.</li>
+      <li>Each of those mains does <code>purchase(...).subscribe(x -&gt; counter.countDown())</code> on a <code>Mono&lt;Void&gt;</code>. A <code>Mono&lt;Void&gt;</code> completes without emitting, so the onNext consumer never runs and <code>counter.await()</code> blocks forever. Use <code>doOnSuccess</code> or <code>block()</code>.</li>
+      <li><span class="path">ch07/recipe_7_5_i/.../reactive/ReactiveBookstoreConfiguration.java:60</span> calls <code>new TransactionalR2dbcBookShop(to, cf)</code> while the class declares a single-argument <code>TransactionalR2dbcBookShop(ConnectionFactory cf)</code>. That module does not compile — the checked-in <code>bin/main/.../ReactiveBookstoreConfiguration.class</code> still carries an "Unresolved compilation" marker from the IDE compiler.</li>
+    </ul>
+    <p>Only the JDBC half of the chapter is runnable as committed. Everything below describes the JDBC path unless it says otherwise.</p>
+    </div>
+  </section>
+
+  <section id="declarative">
+    <span class="kicker">Recipe 7.5 — ch07/recipe_7_5_i</span>
+    <h2>Recipe 7.5 — declarative transactions and the proxy</h2>
+    <p>Recipe 7.5 is where the chapter stops being about API calls. <code>BookstoreConfiguration</code> gains <code>@EnableTransactionManagement</code> (which is <code>@Import(TransactionManagementConfigurationSelector.class)</code>, defaulting to <code>AdviceMode.PROXY</code> and <code>proxyTargetClass = false</code>), and <code>JdbcBookShop.purchase</code> is annotated <code>@Transactional</code> with no attributes. The <code>TransactionTemplate</code> bean declared in the same config is left over from 7.4 and unused. The business method now contains no transaction code whatsoever, and the price of that cleanliness is a proxy: because <code>JdbcBookShop</code> implements <code>BookShop</code> and <code>proxyTargetClass</code> is false, <code>context.getBean(BookShop.class)</code> returns a JDK dynamic proxy, <em>not</em> a <code>JdbcBookShop</code>.</p>
+    <p>That has two consequences the recipes lean on. First, the transaction only exists where the proxy is crossed: an internal <code>this.purchase(...)</code> call would bypass the advice entirely, which is why every variant in 7.6 routes through the injected <code>BookShop</code> <em>bean</em> rather than a locally created instance. Second, asking the container for the concrete type would fail — <code>getBean(JdbcBookShop.class)</code> has no match, so <code>context.getBean(BookShop.class)</code> is not a style preference but a requirement.</p>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">Sequence</span>
+        <span class="dtitle">Declarative path through the proxy, with the rollback branch that 7.5 through 7.9 all take</span></figcaption>
+      <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant M as Main
+    participant P as JDK proxy implementing BookShop
+    participant TI as TransactionInterceptor
+    participant TA as TransactionAspectSupport
+    participant TM as DataSourceTransactionManager
+    participant T as JdbcBookShop target
+    participant DB as PostgreSQL
+    M->>P: purchase 0001, user1
+    P->>TI: invoke on the interceptor chain
+    TI->>TA: determineTransactionAttribute, reads the Transactional annotation
+    TA-->>TI: RuleBasedTransactionAttribute, REQUIRED, ISOLATION_DEFAULT, readWrite
+    TI->>TM: getTransaction(attribute)
+    TM->>DB: no tx on this thread, so doBegin takes a Connection and sets autoCommit false
+    TM-->>TI: TransactionStatus, new physical tx
+    TI->>T: purchase proceeds, with no transaction code inside it
+    T->>DB: SELECT PRICE, UPDATE BOOK_STOCK, UPDATE ACCOUNT
+    DB--xT: positive_balance violated
+    T-->>TI: DataAccessException propagates out of the target
+    Note over TI: DataAccessException is unchecked, and no noRollbackFor matches it
+    TI->>TM: completeTransactionAfterThrowing, so rollbackOn matches, call rollback
+    TM->>DB: connection.rollback(), clear thread binding, restore autoCommit
+    TI-->>M: the proxy rethrows the same DataAccessException to Main
+      </pre>
+    </figure>
+    <p class="reading"><strong>Reading the proxy path.</strong> Hops 2–4 are the annotation becoming a plan: <code>TransactionAspectSupport.determineTransactionAttribute</code> builds a <code>RuleBasedTransactionAttribute</code> from the annotation, and with an attribute-less <code>@Transactional</code> you get <code>REQUIRED</code> with <code>ISOLATION_DEFAULT</code> and no rollback rules, so the defaults in <a href="#rollback">the rollback section</a> apply unchanged. The decision at hop 12 is the only interesting branch: <code>transactionAttribute.rollbackOn(ex)</code> answers yes for this unchecked exception, <code>DefaultTransactionStatus</code> is marked rollback-only, and <code>rollback(status)</code> is called. Had the target returned normally, hop 12 becomes <code>commitTransactionAfterReturning</code> and the physical commit happens <em>after</em> your method has finished but <em>before</em> control reaches <code>Main</code> at hop 14 — so anything you log at the end of <code>purchase</code> is logging work that is not yet durable. The exception you get back in <code>Main</code> is the target's own exception, untranslated and unwrapped: the proxy never converts a rollback into a different failure, which matters when you are tempted to catch it.</p>
+  </section>
+
+  <section id="propagation">
+    <span class="kicker">Recipe 7.6 — ch07/recipe_7_6_i, recipe_7_6_ii, recipe_7_6_iii</span>
+    <h2>Recipe 7.6 — propagation across two beans</h2>
+    <p>Now there are two proxies in the call chain: <code>BookShopCashier.checkout</code> and, inside its <code>isbns.forEach(isbn -&gt; bookShop.purchase(isbn, username))</code>, the injected <code>BookShop</code> proxy. The three modules change only the pair of <code>propagation</code> values.</p>
+    <ul>
+      <li><code>recipe_7_6_i</code> — <code>checkout</code> is a bare <code>@Transactional</code>, <code>purchase</code> is a bare <code>@Transactional</code>. Both <code>REQUIRED</code>. One physical transaction, begun by the cashier and merely <em>joined</em> by each purchase; the inner <code>TransactionStatus</code> is a participating one whose <code>flush</code>/<code>commit</code> request is a no-op. If any book fails, everything the whole checkout did is undone at the cashier's boundary.</li>
+      <li><code>recipe_7_6_ii</code> — <code>checkout</code> becomes <code>@Transactional(propagation = Propagation.REQUIRES_NEW)</code> while <code>purchase</code> stays <code>REQUIRED</code>. Because <code>Main</code> calls <code>checkout</code> from outside any transaction, "requires a new one, suspending any existing one" and "create one if none exists" produce <em>the same physical outcome</em>: one transaction, still shared with the participating purchases. The propagation change is real but unobservable from this entry point — which is the point of the variant.</li>
+      <li><code>recipe_7_6_iii</code> — now <code>purchase</code> is <code>REQUIRES_NEW</code> too, and the difference bites: the cashier's transaction is suspended, unbound from the thread, and each purchase gets its own connection and its own commit boundary. A purchase that succeeds is durable even when a later purchase throws and even when the cashier's own transaction rolls back.</li>
+    </ul>
+    <p>Wiring note, because it is easy to misread: <code>recipe_7_6_i</code>'s config declares the bean as <code>Cashier cashier(BookShop)</code> and <code>JdbcBookShop bookShop(DataSource)</code>, while <code>_ii</code> and <code>_iii</code> declare <code>BookShopCashier cashier(BookShop)</code> and <code>_iii</code> declares the shop as <code>BookShop bookShop(DataSource)</code>. All three mains do <code>getBean(Cashier.class)</code>, which is safe in every case — the declared return type of the bean method is never the runtime type once the proxy wraps it.</p>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">Flowchart</span>
+        <span class="dtitle">Propagation decision tree, restricted to the two values used in ch07</span></figcaption>
+      <pre class="mermaid">
+flowchart TD
+    entry["an advised method is entered, from a proxy or a woven aspect"]
+    entry --> q1{"is a transaction already bound to this thread"}
+    q1 -->|"no"| create["doBegin, take a Connection, autoCommit off, bind the holder"]
+    q1 -->|"yes, and the attribute is REQUIRED"| join["7.6_i inner call: no new Connection, the existing holder is reused, this TransactionStatus reports isNewTransaction false"]
+    q1 -->|"yes, and the attribute is REQUIRES_NEW"| susp["7.6_iii inner call: doSuspend unbinds the outer holder, it becomes a SuspendedResourcesHolder on the stack"]
+    create --> body["method body runs"]
+    join --> body
+    susp --> body
+    body --> q2{"how does the body end"}
+    q2 -->|"returned normally, and this status participates"| noop["commit is a no-op, the outer status owns the real commit"]
+    q2 -->|"returned normally, and this status is new"| ic["commit here - the inner work is now durable and cannot be undone by the caller"]
+    q2 -->|"rollback-worthy exception"| mark["rollbackOn matches, status marked rollbackOnly"]
+    mark --> q3{"participating or standalone"}
+    q3 -->|"participating, REQUIRED"| gpo["global rollbackOnly on the outer transaction, the outer boundary will roll back everything"]
+    q3 -->|"standalone, REQUIRES_NEW"| iro["the inner transaction alone rolls back, the suspended outer is untouched so far"]
+    iro --> resume["doResume rebinds the outer holder, the outer transaction is still open and will roll back when the exception reaches it"]
+    join --> resume2["the outer scope is unaffected as long as nothing marks rollbackOnly"]
+    neverused["NESTED, SUPPORTS, MANDATORY, NOT_SUPPORTED, NEVER: no savepoint is taken anywhere in ch07"]
+      </pre>
+    </figure>
+    <p class="reading"><strong>Walking the tree.</strong> The only edge that decides a commit boundary is whether the status was <em>created</em> or <em>joined</em>. Take <code>7.6_i</code>: <code>checkout</code> arrives at "no transaction bound", goes left to <code>doBegin</code>, and the two <code>purchase</code> calls take the <code>REQUIRED</code> branch into "join" — so their apparent <code>commit</code> is the no-op at the bottom left, and the single real commit is the cashier's. Take <code>7.6_iii</code>: the same two <code>purchase</code> calls instead take the <code>REQUIRES_NEW</code> branch, the cashier's holder is unbound before the body runs, and each purchase terminates at "commit here", which is drawn as irreversible on purpose — the arrow labelled <em>cannot be undone by the caller</em> is the difference between a checkout that is atomic and one that is not. The <code>global rollbackOnly</code> leaf is the trap in <code>7.6_i</code>: because a participating status cannot roll back a physical transaction on its own, a failure in book two marks the whole cashier transaction doomed even if the cashier catches the exception, and the later <code>commit</code> then throws. The dangling node at the bottom records what the chapter does <em>not</em> do: <code>NESTED</code> (a JDBC savepoint inside the same transaction) is never configured, so nothing here suspends-and-resumes at a savepoint.</p>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">Sequence</span>
+        <span class="dtitle">Recipe 7.6_iii — REQUIRES_NEW on purchase, suspend, independent commit, doomed outer</span></figcaption>
+      <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant M as Main
+    participant CP as cashier proxy, checkout REQUIRES_NEW
+    participant BP as bookShop proxy, purchase REQUIRES_NEW
+    participant TM as DataSourceTransactionManager
+    participant A as Connection A, tx A
+    participant B as Connection B, tx B
+    M->>CP: checkout List of 0001 and 0002, user1
+    CP->>TM: getTransaction REQUIRES_NEW
+    TM->>A: doBegin, autoCommit false, bind holder A
+    loop over the isbn list, calling the injected proxy each time
+        CP->>BP: purchase isbn, user1
+        BP->>TM: getTransaction REQUIRES_NEW
+        TM->>TM: doSuspend, unbind holder A into a SuspendedResourcesHolder
+        TM->>B: doBegin on a second Connection, autoCommit false
+        BP->>B: SELECT PRICE, UPDATE BOOK_STOCK, UPDATE ACCOUNT
+        alt the purchase would succeed
+            BP->>TM: commit status B
+            TM->>B: connection B commit, now durable, not shared with tx A
+            TM->>TM: doResume, rebind holder A
+            TM-->>CP: control returns inside the still open checkout transaction
+        else the purchase throws a DataAccessException
+            BP->>TM: rollback status B
+            TM->>B: connection B rollback, stock and balance for this isbn undone
+            TM->>TM: doResume, rebind holder A
+            BP-->>CP: exception propagates, tx A is now marked rollbackOnly
+        end
+    end
+    CP->>TM: the cashier cannot commit, rollback tx A
+    TM->>A: connection A rollback, it held no writes, so nothing further is lost
+    TM-->>M: DataAccessException reaches Main
+      </pre>
+    </figure>
+    <p class="reading"><strong>Reading the suspend.</strong> Two connections are open simultaneously between <code>doSuspend</code> and <code>doResume</code> — that is the cost of <code>REQUIRES_NEW</code>, and with <code>DriverManagerDataSource</code> (no pool) it is invisible only because Postgres has connections to spare. Watch the two <code>doResume</code> arrows, one per branch: after each inner transaction finishes, holder A is rebound, so <code>checkout</code>'s transaction continues as if nothing happened. Now the asymmetric outcome, which is the lesson: in the success branch the inner commit is already durable when control returns to the loop, so a <em>later</em> failure cannot take it back — with <code>7.6_i</code> the same later failure would have erased both books. And at the bottom, <code>checkout</code>'s own rollback destroys nothing, because the cashier's transaction never executed a statement; it only ever suspended one. A useful corollary for safety-critical code: if the outer transaction <em>did</em> write before calling a <code>REQUIRES_NEW</code> method, the row locks it holds would block the second connection, and the suspended transaction would deadlock against its own continuation — <code>7.6_iii</code> avoids that purely because <code>checkout</code> delegates all its writes.</p>
+  </section>
+
+  <section id="isolation">
+    <span class="kicker">Recipe 7.7 — ch07/recipe_7_7_i through recipe_7_7_v</span>
+    <h2>Recipe 7.7 — isolation levels and a racing writer</h2>
+    <p>The five modules of 7.7 are one program with two dials. <code>JdbcBookShop.increaseStock</code> is annotated with a bare <code>@Transactional</code>: it does <code>UPDATE BOOK_STOCK SET STOCK = STOCK + ?</code>, prints the new value, sleeps 10 seconds via <code>Utils.sleep(10000)</code>, prints "Book stock rolled back" and throws <code>new RuntimeException("Increased by mistake")</code> — a rollback the program <em>demands</em>, driven straight out of the default rule for unchecked exceptions. <code>JdbcBookShop.checkStock</code> is annotated <code>@Transactional(isolation = ...)</code>, reads the stock, and sleeps 10 seconds too. <code>Main</code> starts one thread, waits 5 seconds, starts the other, so the two transactions overlap for about 5 seconds while one of them holds a decision the other wants to read.</p>
+    <table>
+      <thead><tr><th>Module</th><th><code>checkStock</code> isolation</th><th>Thread order in <code>Main</code></th><th>What the overlap is meant to expose</th></tr></thead>
+      <tbody>
+        <tr><td><code>recipe_7_7_i</code></td><td><code>Isolation.READ_UNCOMMITTED</code></td><td>Thread 1 = <code>increaseStock</code>, Thread 2 = <code>checkStock</code></td><td>the reader sees the writer's uncommitted +5 (a dirty read)</td></tr>
+        <tr><td><code>recipe_7_7_ii</code></td><td><code>Isolation.READ_COMMITTED</code></td><td>Thread 1 = <code>increaseStock</code>, Thread 2 = <code>checkStock</code></td><td>the same window, but the reader must not see the pending value</td></tr>
+        <tr><td><code>recipe_7_7_iii</code></td><td><code>Isolation.READ_UNCOMMITTED</code></td><td>Thread 1 = <code>checkStock</code>, Thread 2 = <code>increaseStock</code></td><td>dirty read with the reader started first</td></tr>
+        <tr><td><code>recipe_7_7_iv</code></td><td><code>Isolation.REPEATABLE_READ</code></td><td>Thread 1 = <code>checkStock</code>, Thread 2 = <code>increaseStock</code></td><td>the second read inside one transaction must match the first</td></tr>
+        <tr><td><code>recipe_7_7_v</code></td><td><code>Isolation.SERIALIZABLE</code></td><td>Thread 1 = <code>checkStock</code>, Thread 2 = <code>increaseStock</code></td><td>full serialisation, at the price of blocking or a serialisation failure</td></tr>
+      </tbody>
+    </table>
+    <p>Spring does not implement any of these itself. <code>DataSourceTransactionManager.doBegin</code> translates the attribute into exactly two JDBC calls on the borrowed connection — <code>setTransactionIsolation(TRANSACTION_READ_UNCOMMITTED)</code> and, for <code>readOnly</code> in 7.9/7.10, <code>setReadOnly(true)</code> — plus <code>setAutoCommit(false)</code>, and then gets out of the way. Every guarantee, and every missing guarantee, belongs to the database.</p>
+    <div class="callout"><h4>Why 7.7_i and 7.7_ii look identical on the shipped PostgreSQL setup</h4>
+    <p>PostgreSQL does not implement <code>READ UNCOMMITTED</code>: asking for it silently gives you <code>READ COMMITTED</code>, so the dirty read the recipe is written to demonstrate cannot occur there. The book's own XML leftovers in these modules point at <code>jdbc:derby://localhost:1527/bookshop</code>, a DBMS where it can. Treat "which anomaly appears" as a database property, confirmed here only as far as the <code>isolation</code> constant in the annotation; <code>recipe_7_7_iv</code>'s <code>REPEATABLE_READ</code> and <code>recipe_7_7_v</code>'s <code>SERIALIZABLE</code> are the two levels PostgreSQL honours, and the SERIALIZABLE run is the one where the writer may be aborted with a <code>40001</code> serialization error rather than simply blocked. <code>7.7_iii</code> is a duplicate of <code>7.7_i</code> with the thread order flipped, so it changes nothing on Postgres either.</p>
+    </div>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">Sequence</span>
+        <span class="dtitle">The 7.7 race: a writer that rolls back overlapping a reader whose isolation is the dial</span></figcaption>
+      <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant M as Main
+    participant W as Thread 1, increaseStock transaction
+    participant PG as PostgreSQL BOOK_STOCK row 0001
+    participant R as Thread 2, checkStock transaction
+    M->>W: start the writer at t0
+    W->>PG: doBegin, autoCommit false, isolation left at the database default
+    W->>PG: UPDATE BOOK_STOCK SET STOCK = STOCK + 5
+    PG-->>W: row 0001 write-locked, the change is not committed
+    W->>W: sleep 10 s, holding the lock and the pending value
+    M->>R: start the reader at t0 plus 5 s, while the writer is still open
+    R->>PG: doBegin, then setTransactionIsolation to the module constant
+    R->>PG: SELECT STOCK FROM BOOK_STOCK WHERE ISBN = 0001
+    PG-->>R: 10 at READ COMMITTED and above, 15 only where READ UNCOMMITTED is honoured
+    R->>R: sleep 10 s
+    W->>PG: RuntimeException escapes increaseStock, the proxy calls rollback
+    PG-->>W: STOCK is 10 again, the lock is released
+    R->>PG: commit, and returns the value it printed
+      </pre>
+    </figure>
+    <p class="reading"><strong>Reading the interleaving.</strong> The writer's <code>increaseStock</code> is annotated with a bare <code>@Transactional</code>, i.e. <code>Isolation.DEFAULT</code>, which tells Spring to leave the connection's isolation level alone — so hop 3 runs at whatever PostgreSQL defaults to (<code>READ COMMITTED</code>) and holds an exclusive lock on the row for its whole 10-second sleep. The reader's isolation, set at hop 7 by <code>setTransactionIsolation</code> inside its own <code>doBegin</code>, decides what hop 9 returns. In <code>7.7_i</code> and <code>7.7_iii</code> the annotation says <code>READ_UNCOMMITTED</code> and the intended printed answer is 15 — a value that is then destroyed at hop 11 — which is precisely the anomaly the recipe exists to show, and precisely the one PostgreSQL refuses to let you have. In <code>7.7_ii</code>, <code>7.7_iv</code> and <code>7.7_v</code> the reader prints 10, the rollback is invisible, and the transaction has behaved. The two sleeps are the point of the design: without a 10-second body and a 5-second stagger there is no window, and the recipe would appear to prove nothing. Finally, note the exception never reaches <code>Main</code>: <code>7.7</code> wraps the writer in <code>try { ... } catch (RuntimeException e) { }</code>, so the only evidence of the rollback is the printed line and the database afterwards.</p>
+  </section>
+
+  <section id="rollback">
+    <span class="kicker">Recipes 7.8 and 7.9 — ch07/recipe_7_8_i, ch07/recipe_7_9_i</span>
+    <h2>Recipes 7.8 and 7.9 — which exceptions roll back</h2>
+    <p>Both modules put the same three attributes on <code>JdbcBookShop.purchase</code>:</p>
+    <pre><code>@Transactional(propagation = Propagation.REQUIRES_NEW,
+             rollbackFor = IOException.class,
+             noRollbackFor = ArithmeticException.class)</code></pre>
+    <p>(<code>recipe_7_8_i</code> spreads it over four lines, <code>recipe_7_9_i</code> puts <code>propagation</code> on one line with the rest; <code>recipe_7_10_i</code> keeps the same two rollback rules but downgrades <code>REQUIRES_NEW</code> to <code>REQUIRED</code>, because with the AspectJ weaver the point is advising the call, not the boundary.)</p>
+    <p>The default rule that these two attributes invert is: <code>RuntimeException</code> and <code>Error</code> roll back, checked exceptions commit. <code>rollbackFor = IOException.class</code> adds a rule for a <em>checked</em> exception, so an <code>IOException</code> now forces a rollback instead of a quiet commit. <code>noRollbackFor = ArithmeticException.class</code> removes an <em>unchecked</em> one, so a divide-by-zero in <code>purchase</code> would leave the stock decrement and the balance debit <strong>committed</strong> — the exception still propagates to the caller, and the caller sees a stack trace over data that was written. Rules are matched with <code>instanceof</code> walking up the class hierarchy, and when both a rollback rule and a no-rollback rule match, Spring picks the one whose exception type is closest to the thrown class; a subclass of <code>IOException</code> such as <code>FileNotFoundException</code> would still roll back, and a subclass of <code>ArithmeticException</code> such as the <code>stack</code>-overflowing ones would still commit. Note also that neither rule is reachable from these sources: nothing in <code>ch07</code> throws <code>IOException</code> or <code>ArithmeticException</code>, and the only exception that actually fires is the <code>DataAccessException</code> from the violated check constraint, which is unchecked and unmatched by any rule.</p>
+    <p>Recipe 7.9's real addition is on the read method:</p>
+    <pre><code>@Transactional(isolation = Isolation.SERIALIZABLE, timeout = 30, readOnly = true)
+public int checkStock(String isbn) { ... Utils.sleep via Thread.sleep(10000) ... }</code></pre>
+    <p><code>timeout = 30</code> is not a watchdog that aborts a slow transaction. For <code>DataSourceTransactionManager</code> it is carried into the <code>TransactionDefinition</code> and applied as a JDBC statement timeout by <code>DataSourceUtils.applyTransactionTimeout</code> on statements that participate in the transaction; time spent in Java between statements — such as the 10-second sleep inside <code>checkStock</code> — is not metered, so the shipped bodies cannot reach 30 seconds of <em>database</em> work and the timeout never fires. <code>readOnly = true</code> becomes <code>Connection.setReadOnly(true)</code>; Spring does not police it, so writing from a read-only transaction is refused by the driver and the database, or accepted, depending on the pair you are using. It is an optimisation hint, not a security boundary.</p>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">Flowchart</span>
+        <span class="dtitle">Rollback decision in TransactionAspectSupport.rollbackOn, as the 7.8 and 7.9 attributes change it</span></figcaption>
+      <pre class="mermaid">
+flowchart TD
+    ex["an exception escapes the advised method body"]
+    ex --> caught{"did the caller catch it before the proxy boundary"}
+    caught -->|"yes, as in 7.7 Main wrapping increaseStock"| invisible["the proxy sees a normal return, so it commits whatever is still pending"]
+    caught -->|"no"| rules{"a RollbackRule or NoRollbackRule from the annotation matches, closest type wins"}
+    rules -->|"rollbackFor matched: IOException and its subclasses"| rb["rollback, even though IOException is checked"]
+    rules -->|"noRollbackFor matched: ArithmeticException and its subclasses"| cm["COMMIT, even though it is unchecked - the damage is durable and the trace still reaches the caller"]
+    rules -->|"no explicit rule matched"| def{"is it a RuntimeException or an Error"}
+    def -->|"yes"| rb
+    def -->|"no, it is checked"| cm
+    rb --> q4{"participating in an outer transaction"}
+    q4 -->|"yes, REQUIRED inner"| gpo["rollbackOnly marked on the shared transaction, the outer boundary does the real rollback"]
+    q4 -->|"no, or REQUIRES_NEW"| solo["this transaction rolls back alone"]
+    gpo --> rethrow["the proxy always rethrows the original exception to the caller"]
+    solo --> rethrow
+    cm --> rethrow2["the proxy commits, then rethrows"]
+    real["in ch07 every actual rollback goes down the unchecked branch: DataAccessException from the positive_balance violation, or the deliberate RuntimeException in increaseStock"]
+      </pre>
+    </figure>
+    <p class="reading"><strong>Walking the rules.</strong> Start at the top: a caught exception is a committed transaction. That is why <code>recipe_7_6_i</code>'s <code>checkout</code> must <em>not</em> catch anything — the moment it swallows a purchase failure, the surviving writes commit. Then the two annotation-derived lists are consulted before the default rule, which is the counter-intuitive part: <code>rollbackFor</code> and <code>noRollbackFor</code> do not merely refine the default, they can <em>reverse</em> it in both directions, and the <code>COMMIT</code> leaf on the <code>noRollbackFor</code> branch is the one that costs money. Only if neither list matches does the platform default apply — <code>RuleBasedTransactionAttribute.rollbackOn</code> returns true for <code>RuntimeException</code> and <code>Error</code>, false for anything else. The bottom-right node keeps the picture honest: the rollback rules declared in <code>7.8</code> and <code>7.9</code> are never triggered by their own code paths, so if you run those modules you are watching the unchecked default branch, not the attribute you configured. And note the "rethrow" at both exits — the proxy changes the transaction outcome, never the exception identity, so <code>Main</code>'s <code>catch</code> still has to name the right type.</p>
+  </section>
+
+  <section id="aspectj">
+    <span class="kicker">Recipe 7.10 — ch07/recipe_7_10_i, plus the XML in ch07/recipe_7_7_*</span>
+    <h2>Recipe 7.10 — AspectJ weaving, and the XML nobody loads</h2>
+    <p><code>recipe_7_10_i</code>'s configuration is three lines different from 7.9's:</p>
+    <pre><code>@Configuration
+@EnableTransactionManagement(mode = AdviceMode.ASPECTJ)
+@EnableLoadTimeWeaving
+public class BookstoreConfiguration { ... }</code></pre>
+    <p><code>AdviceMode.ASPECTJ</code> makes the annotation registrar import the AspectJ configuration instead of the proxy one, so there is no <code>TransactionInterceptor</code> advisor and no JDK proxy: <code>AnnotationTransactionAspect</code> is woven into <code>BookShopCashier</code> and <code>JdbcBookShop</code> as they are <em>loaded</em>, and the beans the container hands back are plain instances. That buys two things the proxy cannot give — self-invocation inside a bean is advised, and non-public methods can be — at the price of a JVM-level requirement, spelled out in <span class="path">ch07/recipe_7_10_i/src/main/java/com/apress/spring6recipes/bookshop/Main.java</span>'s javadoc: run with <code>-javaagent:build/lib/spring-instrument-6.0.x.jar</code> so that <code>InstrumentationLoadTimeWeaver</code> can hand the JVM's <code>Instrumentation</code> to AspectJ. Without the agent the weaving silently does not happen and the annotations do nothing. <span class="path">ch07/build.gradle</span> is what adds <code>spring-aspects</code>, <code>spring-instrument</code> and <code>aspectjweaver</code> to this one module.</p>
+    <p>The three XML files under <span class="path">ch07/recipe_7_7_*/src/main/resources/</span> are byte-identical across all five 7.7 modules and are <strong>loaded by nothing</strong> — no class in <code>ch07</code> mentions <code>ClassPathXmlApplicationContext</code> or any of the three filenames, and every <code>Main</code> builds an <code>AnnotationConfigApplicationContext</code> over <code>BookstoreConfiguration</code>. They are reference material rather than live configuration: <code>spring-beans.xml</code> is the declarative equivalent of 7.5 (<code>&lt;tx:annotation-driven/&gt;</code>, pointing at <code>jdbc:derby://localhost:1527/bookshop</code> with <code>org.apache.derby.jdbc.ClientDriver</code>, which is not on the ch07 classpath); <code>aspectj-beans.xml</code> is the XML form of 7.10 (<code>&lt;tx:annotation-driven mode="aspectj"/&gt;</code> with <code>&lt;context:load-time-weaver/&gt;</code> and <code>&lt;context:spring-configured/&gt;</code>); and <code>classic-beans.xml</code> is the pre-annotation style, hand-wrapping each target in a <code>TransactionProxyFactoryBean</code>.</p>
+
+    <figure class="diagram">
+      <figcaption><span class="tag">Flowchart</span>
+        <span class="dtitle">Proxy mode versus AspectJ load-time weaving, and what the XML files would have done</span></figcaption>
+      <pre class="mermaid">
+flowchart LR
+    subgraph proxyMode["7.5 to 7.9, AdviceMode.PROXY, the default"]
+      a1["EnableTransactionManagement"] --> a2["ProxyTransactionManagementConfiguration"]
+      a2 --> a3["InfrastructureAdvisorAutoProxyCreator plus BeanFactoryTransactionAttributeSourceAdvisor"]
+      a3 --> a4["bean returned from getBean is a JDK proxy implementing BookShop or Cashier"]
+      a4 --> a5["only public methods, only calls crossing the proxy, self-invocation is not advised"]
+    end
+    subgraph aspectMode["7.10, AdviceMode.ASPECTJ"]
+      b1["EnableLoadTimeWeaving"] --> b2["InstrumentationLoadTimeWeaver, supplied by the spring-instrument java agent"]
+      b3["EnableTransactionManagement mode ASPECTJ"] --> b4["AspectJTransactionManagementConfiguration and AnnotationTransactionAspect"]
+      b2 --> b5["class bytecode rewritten as it loads"]
+      b4 --> b5
+      b5 --> b6["bean is the real BookShopCashier instance, no proxy in the graph"]
+      b6 --> b7["self-invocation and non-public methods are advised, but the run silently does nothing without the agent"]
+    end
+    xml["spring-beans.xml, aspectj-beans.xml, classic-beans.xml in 7.7 resources"] -.->|"not loaded by any Main"| dead["TransactionProxyFactoryBean and tx annotation-driven, kept as reference, Derby driver absent"]
+      </pre>
+    </figure>
+    <p class="reading"><strong>Reading the two lanes.</strong> The left lane is what happens when <code>Main</code> asks for <code>BookShop.class</code> in 7.5–7.9: the auto-proxy creator post-processes the bean definition, the advisor's pointcut finds the <code>@Transactional</code> method, and the container hands back a <code>java.lang.reflect.Proxy</code> — which is why a request for the concrete <code>JdbcBookShop</code> type would fail and why <code>bookShop.purchase(...)</code> called from inside <code>JdbcBookShop</code> itself would not be advised. The right lane removes the container from the loop: the weaving happens at class-load time, driven by an <code>Instrumentation</code> instance that only the <code>-javaagent</code> can supply, so the advice is unconditional on how the object was created. That is the honest trade the recipe makes, and the reason <code>7.10</code>'s <code>purchase</code> can safely be <code>REQUIRED</code>. The dashed edge at the bottom records a dead path: <code>classic-beans.xml</code> would have wired <code>cashier</code>'s <code>bookShop</code> property to <code>bookShopTransactional</code> (a <code>TransactionProxyFactoryBean</code> with <code>PROPAGATION_REQUIRES_NEW</code> on <code>purchase</code>) — which is 7.6_iii's propagation expressed in XML — but <code>BookShopCashier</code> has a final field and a constructor and no setter, and <code>JdbcBookShop</code> has no default constructor, so that file would not start even if something loaded it.</p>
+  </section>
+
+  <section id="attributes">
+    <span class="kicker">Reference</span>
+    <h2>Attribute table for every recipe</h2>
+    <p>Read this table with the commit boundary in mind: "physical transaction" says how many times <code>doBegin</code> runs, and "durable on failure" says what survives the exception the shipped data always produces.</p>
+    <table>
+      <thead><tr><th>Module</th><th>Method</th><th><code>propagation</code></th><th><code>isolation</code></th><th>other attributes</th><th>Physical transaction</th></tr></thead>
+      <tbody>
+        <tr><td><code>recipe_7_1_i</code></td><td><code>JdbcBookShop.purchase</code></td><td>n/a — no Spring tx</td><td>n/a — driver default, auto-commit on</td><td>none</td><td>three separate implicit ones; the stock update survives the balance failure</td></tr>
+        <tr><td><code>recipe_7_1_ii</code></td><td><code>JdbcBookShop.purchase</code></td><td>n/a — <code>setAutoCommit(false)</code></td><td>driver default</td><td>manual <code>commit</code>, <code>rollback</code> in <code>catch SQLException</code></td><td>one; nothing survives</td></tr>
+        <tr><td><code>recipe_7_3_i</code></td><td><code>TransactionalJdbcBookShop.purchase</code></td><td><code>REQUIRED</code> by <code>DefaultTransactionDefinition</code></td><td><code>ISOLATION_DEFAULT</code></td><td>hand-called <code>commit</code>/<code>rollback</code>, catch is <code>DataAccessException</code></td><td>one</td></tr>
+        <tr><td><code>recipe_7_3_i</code> reactive</td><td><code>TransactionalR2dbcBookShop.purchase</code></td><td><code>REQUIRED</code>, on <code>ReactiveTransactionManager</code></td><td>default</td><td><code>onErrorResume</code> instead of a catch</td><td>one R2DBC session; entry point is mis-wired</td></tr>
+        <tr><td><code>recipe_7_4_i</code></td><td><code>TransactionalJdbcBookShop.purchase</code></td><td><code>REQUIRED</code> (template default)</td><td>default</td><td><code>new TransactionTemplate(ptm)</code> per call, <code>TransactionCallbackWithoutResult</code></td><td>one; rollback on any unchecked exception</td></tr>
+        <tr><td><code>recipe_7_4_ii</code></td><td>same body</td><td><code>REQUIRED</code></td><td>default</td><td><code>TransactionTemplate</code> injected as a bean</td><td>one, identical to <code>_i</code></td></tr>
+        <tr><td><code>recipe_7_4_ii</code> reactive</td><td><code>TransactionalR2dbcBookShop.purchase</code></td><td><code>REQUIRED</code></td><td>default</td><td><code>TransactionalOperator</code> bean, <code>as(txOperator::transactional)</code></td><td>one session</td></tr>
+        <tr><td><code>recipe_7_5_i</code></td><td><code>JdbcBookShop.purchase</code></td><td><code>REQUIRED</code> (attribute default)</td><td><code>DEFAULT</code></td><td>none; <code>@EnableTransactionManagement</code> adds the proxy</td><td>one, committed by <code>TransactionInterceptor</code></td></tr>
+        <tr><td><code>recipe_7_6_i</code></td><td><code>checkout</code>, then <code>purchase</code></td><td><code>REQUIRED</code>, then <code>REQUIRED</code></td><td>default, default</td><td>none</td><td>one, shared; a failure in any book erases all books</td></tr>
+        <tr><td><code>recipe_7_6_ii</code></td><td><code>checkout</code>, then <code>purchase</code></td><td><code>REQUIRES_NEW</code>, then <code>REQUIRED</code></td><td>default, default</td><td>none</td><td>one when entered from <code>Main</code>; outcome equals <code>_i</code></td></tr>
+        <tr><td><code>recipe_7_6_iii</code></td><td><code>checkout</code>, then each <code>purchase</code></td><td><code>REQUIRES_NEW</code>, then <code>REQUIRES_NEW</code></td><td>default, default</td><td>none</td><td>one outer plus one per book; earlier books stay committed</td></tr>
+        <tr><td><code>recipe_7_7_i</code>, <code>_iii</code></td><td><code>checkStock</code></td><td><code>REQUIRED</code></td><td><code>READ_UNCOMMITTED</code></td><td>—</td><td>one per thread; PostgreSQL downgrades the level</td></tr>
+        <tr><td><code>recipe_7_7_ii</code></td><td><code>checkStock</code></td><td><code>REQUIRED</code></td><td><code>READ_COMMITTED</code></td><td>—</td><td>one per thread</td></tr>
+        <tr><td><code>recipe_7_7_iv</code></td><td><code>checkStock</code></td><td><code>REQUIRED</code></td><td><code>REPEATABLE_READ</code></td><td>—</td><td>one per thread</td></tr>
+        <tr><td><code>recipe_7_7_v</code>, <code>7_8_i</code></td><td><code>checkStock</code></td><td><code>REQUIRED</code></td><td><code>SERIALIZABLE</code></td><td>—</td><td>one per thread; the writer may be serialisation-aborted</td></tr>
+        <tr><td>all of 7.7</td><td><code>increaseStock</code></td><td><code>REQUIRED</code> (default)</td><td>default</td><td>none — relies on the unchecked default to roll back its deliberate <code>RuntimeException</code></td><td>one, always rolled back</td></tr>
+        <tr><td><code>recipe_7_8_i</code>, <code>7_9_i</code></td><td><code>purchase</code></td><td><code>REQUIRES_NEW</code></td><td>default</td><td><code>rollbackFor = IOException.class</code>, <code>noRollbackFor = ArithmeticException.class</code></td><td>one per call; both rules declared but unreachable in these sources</td></tr>
+        <tr><td><code>recipe_7_9_i</code></td><td><code>checkStock</code></td><td><code>REQUIRED</code></td><td><code>SERIALIZABLE</code></td><td><code>timeout = 30</code>, <code>readOnly = true</code></td><td>one; the timeout never fires, the 10 s sleep is not database time</td></tr>
+        <tr><td><code>recipe_7_10_i</code></td><td><code>purchase</code></td><td><code>REQUIRED</code></td><td>default</td><td>same two rollback rules as 7.9, advised by AspectJ</td><td>one shared with <code>checkout</code>, so a book-two failure erases book one</td></tr>
+        <tr><td><code>recipe_7_10_i</code></td><td><code>checkout</code></td><td><code>REQUIRED</code></td><td>default</td><td><code>@EnableLoadTimeWeaving</code> on the config</td><td>one</td></tr>
+        <tr><td><code>recipe_7_10_i</code></td><td><code>checkStock</code></td><td><code>REQUIRED</code></td><td><code>SERIALIZABLE</code></td><td><code>timeout = 30</code>, <code>readOnly = true</code> — identical to 7.9, but woven rather than proxied</td><td>one per thread</td></tr>
+      </tbody>
+    </table>
+    <div class="callout info"><h4>7.10 is the quiet regression to watch</h4>
+    <p><code>recipe_7_10_i</code> copies 7.9's <code>purchase</code> but changes <code>REQUIRES_NEW</code> to <code>REQUIRED</code>. Combined with <code>checkout</code>'s <code>REQUIRED</code>, the whole checkout is once again a single transaction — the same topology as <code>7.6_i</code>, reached by a different mechanism. So the AspectJ recipe tests <em>where the advice comes from</em>, not the propagation, and its data outcome differs from <code>7.9_i</code>, where each purchase commits alone.</p>
+    </div>
+  </section>
+
+  <section id="running">
+    <span class="kicker">Practice</span>
+    <h2>Running the recipes</h2>
+    <h3>1. Database first — nothing in the chapter creates it</h3>
+    <p>Every ch07 configuration points at <code>jdbc:postgresql://localhost:5432/bookstore</code> with <code>postgres</code> / <code>password</code>. The repo's own helpers do not provision that database: <span class="path">bin/postgres.sh</span> starts a container with <code>POSTGRES_DB=vehicle</code> and <span class="path">bin/docker-compose-all.yml</span> uses <code>POSTGRES_DB=vehicles</code> with a ch09 <code>vehicle.sql</code> init script. So no <code>ConnectionFactoryInitializer</code> and no gradle task will build the schema for the JDBC recipes — you run it yourself:</p>
+    <pre><code>docker run --name s6r-postgres -e POSTGRES_PASSWORD=password -p 5432:5432 -d postgres:14-alpine
+docker exec -it s6r-postgres psql -U postgres -c 'CREATE DATABASE bookstore'
+docker exec -i s6r-postgres psql -U postgres -d bookstore &lt; ch07/recipe_7_1_i/src/main/resources/bookstore.sql</code></pre>
+    <p>The <code>bookstore.sql</code> files are identical in all 17 modules except <code>recipe_7_3_i</code> and <code>recipe_7_5_i</code>, which use <code>CREATE TABLE IF NOT EXISTS</code> so their reactive initializer can re-run. They do not drop or truncate, so a second run does not reset <code>BALANCE</code> and <code>STOCK</code> — re-seed between recipes or you will be reading leftovers.</p>
+    <h3>2. Build</h3>
+    <pre><code>./gradlew :ch07:recipe_7_5_i:build          # compile one module
+./gradlew :ch07:build                        # the whole chapter
+./gradlew :ch07:recipe_7_6_iii:uberJar       # runnable fat jar</code></pre>
+    <p>Module paths come from <span class="path">settings.gradle</span>, which includes every <code>recipe_*</code> directory it walks, so <code>ch07:recipe_7_6_iii</code> is the real project path. <span class="path">ch07/build.gradle</span> gives all ch07 subprojects <code>spring-context</code>, <code>spring-jdbc</code> and the PostgreSQL driver, adds <code>spring-r2dbc</code> plus <code>r2dbc-postgresql</code> to 7.3, 7.4 and 7.5, adds <code>spring-aspects</code>, <code>spring-instrument</code> and <code>aspectjweaver</code> to 7.10, and sets <code>Main-Class</code> to <code>com.apress.spring6recipes.bookshop.Main</code> on every <code>uberJar</code>. There is no <code>application</code> plugin and no <code>run</code> task in this repository, and no module has tests, so <code>build</code> means "compile". Java 19 is the configured toolchain in the root build with <code>--enable-preview</code> on compile, test and exec, and <span class="path">spring-6-recipes-dependencies/build.gradle</span> pins the Spring version to 6.0.3 through <code>spring-framework-bom</code>. One machine-specific trap: <span class="path">gradle.properties</span> hard-codes <code>org.gradle.java.home=C:/Program Files/Java/jdk-17.0.4.1</code>, so if that JDK is not where it says, Gradle will not even start — override it with <code>-Dorg.gradle.java.home=...</code> or your own <code>~/.gradle/gradle.properties</code>.</p>
+    <h3>3. Run</h3>
+    <pre><code>java -jar ch07/recipe_7_6_iii/build/libs/recipe_7_6_iii-6.0.0-SNAPSHOT-all.jar</code></pre>
+    <p>Then inspect the damage, which is the actual output of every recipe in this chapter:</p>
+    <pre><code>docker exec -it s6r-postgres psql -U postgres -d bookstore \
+  -c 'SELECT * FROM BOOK_STOCK' -c 'SELECT * FROM ACCOUNT'</code></pre>
+    <ul>
+      <li><strong>7.1_i</strong> leaves <code>STOCK = 9, BALANCE = 20</code>; every other module leaves both at their seeded values, because the balance update fails on <code>positive_balance</code> before anything can commit. To see the happy path you must fund the account: <code>UPDATE ACCOUNT SET BALANCE = 100 WHERE USERNAME = 'user1'</code> and insert the second book the checkout recipes ask for, <code>INSERT INTO BOOK (ISBN, BOOK_NAME, PRICE) VALUES ('0002','The Second Book', 10)</code> with matching <code>BOOK_STOCK</code>. Without that, <code>7.6_i</code> and <code>7.6_iii</code> produce the same visible result and the propagation difference stays hypothetical.</li>
+      <li><strong>7.7, 7.8, 7.9</strong> are timed, not instant: each transactional body sleeps 10 seconds and <code>Main</code> staggers the threads by 5, so expect roughly 15–20 seconds of console output per run and no exit code to read. Their exceptions are swallowed by design (<code>catch (RuntimeException e) { }</code>), so the printed "Book stock rolled back" line is your only signal.</li>
+      <li><strong>7.10</strong> needs the agent or nothing happens. <code>spring-instrument</code> is a runtime dependency of this module, not something <code>uberJar</code> leaves lying around as a standalone jar, so take it from the Gradle cache and pass it before <code>-jar</code>: <code>java -javaagent:"$HOME/.gradle/caches/modules-2/files-2.1/org.springframework/spring-instrument/6.0.3/spring-instrument-6.0.3.jar" -jar ch07/recipe_7_10_i/build/libs/recipe_7_10_i-6.0.0-SNAPSHOT-all.jar</code>. That is the instruction the module's own <code>Main</code> javadoc gives (<code>-javaagent:build/lib/spring-instrument-6.0.x.jar</code>, assuming you collected the dependency jars there yourself). Without the agent the annotations are inert and the writes commit as in 7.1_i.</li>
+      <li><strong>7.2 does not exist</strong> as a module; if you are following the book, the XML it describes is in <span class="path">ch07/recipe_7_7_*/src/main/resources/</span> and is inert, as explained in <a href="#aspectj">Recipe 7.10</a>.</li>
+    </ul>
+  </section>
+
+  <footer class="pagefoot">
+    Generated from source in <span class="path">ch07/</span> &mdash; <a href="../index.html">Spring 6 Recipes diagram index</a>
+  </footer>
+</body>
+</html>

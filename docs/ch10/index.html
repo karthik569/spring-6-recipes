@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 10 — Spring Enterprise Integration — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 10</div>
+  <h1>Chapter 10 — Spring Enterprise Integration</h1>
+  <p class="lede">Every recipe in this chapter wires one Spring bean to one thing that lives outside the JVM: an
+  MBeanServer, an SMTP host, a scheduler thread, a SOAP dispatcher, a metrics registry. The thread running through
+  them is the <em>endpoint/gateway</em> shape — a Spring abstraction that owns the connection details and a thin
+  bean of yours that only expresses intent. All of it is demonstrated on the same two domain examples: the
+  <code>replicator</code> folder-copy service (JMX, mail, scheduling) and the <code>weather</code> temperature
+  service (Spring Web Services), plus the <code>court</code> REST app borrowed from Chapter 3 for metrics.</p>
+  <div class="chip-row">
+    <span class="chip">33 recipe modules / 215 Java files</span>
+    <span class="chip">technologies: JMX, JavaMail, Quartz, Spring WS, Micrometer, JFR</span>
+    <span class="chip">artifacts: MBeanExporter, JavaMailSenderImpl, SchedulerFactoryBean, WebServiceTemplate, JmxMeterRegistry</span>
+    <span class="chip">build: ./gradlew :ch10:recipe_10_1_vii:build</span>
+    <span class="chip">ports 1099 (RMI), 3025 (SMTP), 8080 (Tomcat)</span>
+    <span class="chip">no JMS, AMQP, LDAP or FTP in this chapter</span>
+  </div>
+
+  <nav class="pager">
+    <a href="../ch09/index.html">&larr; Chapter 9 — Spring Data Access with NoSQL</a>
+    <a href="../ch11/index.html">Chapter 11 — Spring Messaging &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc">
+    <h2>On this page</h2>
+    <ol>
+      <li><a href="#overview">The chapter at a glance</a></li>
+      <li><a href="#jmx">Exposing a bean as an MBean</a></li>
+      <li><a href="#notify">Publishing JMX notifications</a></li>
+      <li><a href="#remote">Driving the MBeanServer from another JVM</a></li>
+      <li><a href="#mail">Sending mail through JavaMail</a></li>
+      <li><a href="#sched">Triggering work on a timer</a></li>
+      <li><a href="#ws">Document-driven web services</a></li>
+      <li><a href="#metrics">Publishing metrics over JMX</a></li>
+      <li><a href="#matrix">Technology and abstraction matrix</a></li>
+      <li><a href="#running">Building and running for real</a></li>
+    </ol>
+  </aside>
+  <article>
+
+    <section id="overview">
+      <span class="kicker">Mental model</span>
+      <h2>The chapter at a glance</h2>
+      <p>Chapter 10 is not about messaging brokers. Read the imports and <code>ch10/build.gradle</code> and the
+      external surfaces are exactly five: the <strong>JMX platform MBeanServer</strong> (recipes 10.1–10.3 and
+      10.11), an <strong>SMTP host</strong> (10.4), a <strong>quartz scheduler</strong> or Spring's own
+      <strong>TaskScheduler</strong> (10.5, 10.6, 10.10), a <strong>SOAP endpoint</strong> hosted by Spring WS in a
+      servlet container (10.7–10.9), and the <strong>JFR event stream</strong> (10.10). There is no
+      <code>spring-jms</code>, no <code>spring-rabbit</code>, no <code>spring-ldap</code> and no
+      <code>jsch</code>/<code>commons-net</code> dependency anywhere in the chapter, so no broker, directory or
+      file server needs to be installed.</p>
+      <p>What each recipe teaches is the same structural move: pick the Spring gateway class
+      (<code>MBeanExporter</code>, <code>JavaMailSenderImpl</code>, <code>SchedulerFactoryBean</code>,
+      <code>WebServiceTemplate</code>, <code>JmxMeterRegistry</code>), declare it as a <code>@Bean</code>, and let it
+      convert your method calls into protocol traffic. The eight 10.1 variants are the clearest illustration — one
+      behaviour, eight progressively less verbose ways of reaching the same MBeanServer.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart LR</span>
+          <span class="dtitle">The five external surfaces chapter 10 touches</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph jvm["Application JVM -- ch10 replicator recipes"]
+        dr["documentReplicator -- JMXFileReplicator"]
+        ns["errorNotifier -- EmailErrorNotifier"]
+        sc["SchedulerFactoryBean or ScheduledAnnotationBeanPostProcessor"]
+        mr["meterRegistry -- JmxMeterRegistry"]
+    end
+    exp["MBeanExporter -- AnnotationMBeanExporter"]
+    pms["Platform MBeanServer"]
+    con["JMX console -- JConsole or jcmd"]
+    mail["SMTP sink -- localhost port 3025"]
+    reg["RMI registry -- localhost port 1099"]
+    tom["Tomcat -- localhost port 8080"]
+    ep["TemperatureEndpoint"]
+    wsx["WeatherServiceImpl"]
+    dr -- export --> exp
+    exp -- register --> pms
+    con -- attach --> pms
+    pms -- invoke replicate --> dr
+    mr -- publish meters --> pms
+    ns -- Transport.send --> mail
+    sc -- fire --> dr
+    reg -- JMX RMI connector --> pms
+    tom -- route payload --> ep
+    ep -- getTemperatures --> wsx
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the topology.</strong> Everything left of <code>pms</code> is an
+      <em>outbound</em> adapter: <code>MBeanExporter.register</code> pushes
+      <code>bean:name=documentReplicator</code> into the platform server, <code>Transport.send</code> in
+      <code>recipe_10_4_i/src/main/java/com/apress/spring6recipes/replicator/EmailErrorNotifier.java</code> pushes a
+      <code>MimeMessage</code> at port 3025, and <code>JmxMeterRegistry</code> in
+      <code>ch10/recipe_10_11_i/src/main/java/com/apress/spring6recipes/court/MemberClient.java</code> registers one
+      MBean per meter. Everything right of <code>pms</code> is <em>inbound</em>: a console attaches, calls
+      <code>setAttribute</code>/<code>invoke</code>, and the MBeanServer reflectively calls
+      <code>JMXFileReplicator.replicate()</code> on your bean. The dotted paths to <code>reg</code> and
+      <code>tom</code> are the two places where a second JVM must be reachable — the RMI registry for recipe 10.3 and
+      a servlet container for 10.8/10.9.</p>
+
+      <h3>Module map</h3>
+      <p>All 33 modules under <code>ch10/</code>, grouped by recipe number. There is no
+      <code>recipe_10_shared</code>; the 10.11 modules reuse <code>:ch03:recipe_3_shared</code> for the
+      <code>Member</code>/<code>Members</code>/<code>MemberService</code> types.</p>
+      <table>
+        <thead>
+          <tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes actually referenced</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="num">10.1</td>
+            <td><code>recipe_10_1_i</code> … <code>recipe_10_1_viii</code></td>
+            <td>Expose <code>documentReplicator</code> as an MBean, eight ways: hand-built ModelMBean, plain
+            exporter, three <code>MBeanInfoAssembler</code> strategies, annotation-driven exporter, custom default
+            domain, and finally a remote connector server.</td>
+            <td><code>RequiredModelMBean</code>, <code>ModelMBeanInfoSupport</code>, <code>MBeanExporter</code>,
+            <code>MethodNameBasedMBeanInfoAssembler</code>, <code>InterfaceBasedMBeanInfoAssembler</code>,
+            <code>MetadataMBeanInfoAssembler</code>, <code>AnnotationJmxAttributeSource</code>,
+            <code>AnnotationMBeanExporter</code>, <code>ConnectorServerFactoryBean</code>,
+            <code>@ManagedResource</code></td>
+          </tr>
+          <tr>
+            <td class="num">10.2</td>
+            <td><code>recipe_10_2_i</code>, <code>recipe_10_2_ii</code></td>
+            <td>Emit a JMX notification when a replication run finishes, and consume it in-process.</td>
+            <td><code>@EnableMBeanExport</code>, <code>NotificationPublisherAware</code>,
+            <code>NotificationPublisher</code>, <code>javax.management.Notification</code>,
+            <code>AnnotationMBeanExporter.setNotificationListenerMappings</code>,
+            <code>ReplicationNotificationListener</code></td>
+          </tr>
+          <tr>
+            <td class="num">10.3</td>
+            <td><code>recipe_10_3_i</code>, <code>recipe_10_3_ii</code></td>
+            <td>Two JVMs: a server publishing its MBeanServer over an RMI connector, a client either using the raw
+            connection or a typed proxy.</td>
+            <td><code>MBeanServerConnectionFactoryBean</code>, <code>MBeanProxyFactoryBean</code>,
+            <code>ConnectorServerFactoryBean</code>, <code>Server</code>, <code>Client</code></td>
+          </tr>
+          <tr>
+            <td class="num">10.4</td>
+            <td><code>recipe_10_4_i</code> … <code>recipe_10_4_v</code></td>
+            <td>Mail an error report: raw Jakarta Mail, then <code>MailSender</code>, then a
+            <code>SimpleMailMessage</code> template, then a MIME multipart with an attachment, then a preparator
+            callback.</td>
+            <td><code>Session</code>, <code>Transport</code>, <code>JavaMailSenderImpl</code>,
+            <code>SimpleMailMessage</code>, <code>MimeMessageHelper</code>,
+            <code>MimeMessagePreparator</code>, <code>MailParseException</code>, <code>ErrorNotifier</code></td>
+          </tr>
+          <tr>
+            <td class="num">10.5</td>
+            <td><code>recipe_10_5_i</code> … <code>recipe_10_5_iv</code></td>
+            <td>Quartz scheduling: plain Quartz builders with a simple and a cron trigger, then the same two triggers
+            rebuilt as Spring factory beans.</td>
+            <td><code>StdSchedulerFactory</code>, <code>JobBuilder</code>, <code>TriggerBuilder</code>,
+            <code>SimpleScheduleBuilder</code>, <code>CronScheduleBuilder</code>, <code>JobDetailFactoryBean</code>,
+            <code>SimpleTriggerFactoryBean</code>, <code>CronTriggerFactoryBean</code>,
+            <code>SchedulerFactoryBean</code>, <code>QuartzJobBean</code></td>
+          </tr>
+          <tr>
+            <td class="num">10.6</td>
+            <td><code>recipe_10_6_i</code>, <code>recipe_10_6_ii</code></td>
+            <td>Drop Quartz: annotation <code>@Scheduled</code> on the bean, then the same task registered
+            programmatically through <code>SchedulingConfigurer</code>.</td>
+            <td><code>@EnableScheduling</code>, <code>ThreadPoolTaskScheduler</code>,
+            <code>SchedulingConfigurer</code>, <code>ScheduledTaskRegistrar</code>,
+            <code>addFixedDelayTask</code></td>
+          </tr>
+          <tr>
+            <td class="num">10.7</td>
+            <td><code>recipe_10_7</code></td>
+            <td>No Java at all — <code>request.xml</code>, <code>response.xml</code> and the
+            <code>README.txt</code> for deriving <code>temperature.xsd</code> with the XMLBeans
+            <code>inst2xsd</code> tool before writing the service in 10.8.</td>
+            <td><code>temperature.xsd</code> (target namespace
+            <code>http://springrecipes.apress.com/weather/schemas</code>)</td>
+          </tr>
+          <tr>
+            <td class="num">10.8</td>
+            <td><code>recipe_10_8_SpringWS_Server</code>, <code>recipe_10_8_SpringWS_Client</code></td>
+            <td>Contract-first SOAP with raw DOM payloads: <code>@PayloadRoot</code> matching, XPath extraction,
+            dom4j response building; client uses a <code>Source</code>/<code>Result</code> round trip.</td>
+            <td><code>@Endpoint</code>, <code>@PayloadRoot</code>, <code>DefaultWsdl11Definition</code>,
+            <code>SimpleXsdSchema</code>, <code>EnableWs</code>,
+            <code>AbstractAnnotationConfigMessageDispatcherServletInitializer</code>,
+            <code>WebServiceTemplate</code>, <code>DefaultXPath</code>, <code>DocumentSource</code>,
+            <code>DocumentResult</code></td>
+          </tr>
+          <tr>
+            <td class="num">10.9</td>
+            <td><code>recipe_10_9_SpringWS_Server</code>, <code>recipe_10_9_SpringWS_Client</code></td>
+            <td>The same contract, but JAXB-generated request/response objects are marshalled by
+            <code>Jaxb2Marshaller</code> instead of touching DOM. Registering <code>MarshallingPayloadMethodProcessor</code>
+            in <code>WsConfigurerAdapter</code> callbacks <em>replaces</em> 10.8's <code>DefaultXPath</code>
+            <code>TemperatureEndpoint</code>; the client's <code>WebServiceTemplate</code> is built with a
+            <code>Marshaller</code> so <code>marshalSendAndReceive</code> does both directions.</td>
+            <td><code>Jaxb2Marshaller</code>, <code>MarshallingPayloadMethodProcessor</code>,
+            <code>WsConfigurerAdapter</code>, <code>GetTemperaturesRequest</code>,
+            <code>GetTemperaturesResponse</code>, <code>ObjectFactory</code></td>
+          </tr>
+          <tr>
+            <td class="num">10.10</td>
+            <td><code>recipe_10_10_i</code> … <code>recipe_10_10_iii</code></td>
+            <td>Feed Spring's startup timings into Java Flight Recorder, then add a custom step around task
+            registration, then tag that step.</td>
+            <td><code>FlightRecorderApplicationStartup</code>, <code>ApplicationStartupAware</code>,
+            <code>ApplicationStartup.start</code>, <code>StartupStep.tag</code></td>
+          </tr>
+          <tr>
+            <td class="num">10.11</td>
+            <td><code>recipe_10_11_i</code>, <code>recipe_10_11_ii</code></td>
+            <td>HTTP server and client observations published to JMX by Micrometer; 10.11_ii adds
+            <code>MeterBinder</code> auto-registration for JVM/system metrics.</td>
+            <td><code>JmxMeterRegistry</code>, <code>JmxConfig</code>, <code>ObservationRegistry</code>,
+            <code>DefaultMeterObservationHandler</code>, <code>ServerHttpObservationFilter</code>,
+            <code>DelegatingFilterProxy</code>, <code>RestTemplate.setObservationRegistry</code>,
+            <code>MeterBinderRegistrar</code>, <code>UptimeMetrics</code>, <code>JvmThreadMetrics</code>,
+            <code>JvmMemoryMetrics</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout info">
+        <h4>Two domain examples, reused on purpose</h4>
+        <p><code>com.apress.spring6recipes.replicator</code> carries 10.1–10.6 and 10.10: the same
+        <code>FileReplicator</code>/<code>FileCopier</code> pair with <code>srcDir</code> and <code>destDir</code>
+        injected from SpEL against system properties —
+        <code>@Value("#{systemProperties['user.home']}/docs")</code> in every
+        <code>FileReplicatorConfig</code>. <code>com.apress.spring6recipes.weather</code> carries 10.7–10.9.
+        <code>ch10/build.gradle</code> bakes this in: the default jar manifest
+        <code>Main-Class</code> for every subproject is
+        <code>com.apress.spring6recipes.replicator.Main</code>, overridden only for <code>recipe_10_3_i</code>,
+        <code>recipe_10_3_ii</code> (<code>Client</code>) and the two Spring WS clients
+        (<code>weather.SpringWSInvokerClient</code>).</p>
+      </div>
+    </section>
+
+    <section id="jmx">
+      <span class="kicker">Recipe 10.1</span>
+      <h2>Exposing a bean as an MBean</h2>
+      <p>The management bean you want is an <code>ObjectName</code>, a description, a set of readable/writable
+      attributes and a set of operations. Spring's <code>MBeanExporter</code> derives all four from an
+      <code>MBeanInfoAssembler</code>, and the eight variants of 10.1 are simply eight assemblers — starting from
+      doing the whole job by hand in <code>Main</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart TD</span>
+          <span class="dtitle">The eight 10.1 variants, in the order the book adds them</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    a["10_1_i -- RequiredModelMBean built by hand in Main, no Spring exporter"]
+    b["10_1_ii -- MBeanExporter.setBeans with ObjectName to bean name map"]
+    c["10_1_iii -- MethodNameBasedMBeanInfoAssembler, five managed method names"]
+    d["10_1_iv -- InterfaceBasedMBeanInfoAssembler on FileReplicator"]
+    e["10_1_v -- MetadataMBeanInfoAssembler plus AnnotationJmxAttributeSource"]
+    f["10_1_vi -- AnnotationMBeanExporter, setBeans no longer needed"]
+    g["10_1_vii -- AnnotationMBeanExporter.setDefaultDomain bean"]
+    h["10_1_viii -- plus ConnectorServerFactoryBean for remote access"]
+    i["10_2_i -- @EnableMBeanExport replaces the exporter bean"]
+    a --> b --> c --> d --> e --> f --> g --> h
+    g --> i
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the ladder.</strong> Only <code>10_1_i</code> uses the JMX API directly: its
+      <code>Main</code> builds <code>DescriptorSupport</code>/<code>ModelMBeanAttributeInfo</code> objects, wires
+      <code>getSrcDir</code>/<code>setSrcDir</code> descriptors onto the <code>SrcDir</code> attribute, and calls
+      <code>ManagementFactory.getPlatformMBeanServer().registerMBean(...)</code> itself
+      (<code>ch10/recipe_10_1_i/src/main/java/com/apress/spring6recipes/replicator/Main.java</code>, lines 26–72).
+      From <code>10_1_ii</code> the exporter takes over, and note the deliberate
+      <code>Map&lt;String, Object&gt;</code> value <code>"documentReplicator"</code> — a <em>bean name string</em>, not
+      the instance, so the exporter resolves it lazily from the context. The next three rungs only change how the
+      management interface is discovered: hard-coded method names (<code>setManagedMethods</code>), the
+      <code>FileReplicator</code> interface (<code>setManagedInterfaces(FileReplicator.class)</code>), and finally
+      annotations. The annotations are only read from <code>10_1_v</code> onwards —
+      <code>@ManagedResource</code>/<code>@ManagedAttribute</code>/<code>@ManagedOperation</code> first appear in
+      <code>recipe_10_1_v/.../JMXFileReplicator.java</code> and are absent from variants <code>i</code> through
+      <code>iv</code>. <code>10_1_vi</code> swaps in <code>AnnotationMBeanExporter</code>, which autodetects
+      annotated beans, so the explicit <code>setBeans</code> map disappears; <code>10_1_vii</code> adds
+      <code>setDefaultDomain("bean")</code> so the generated <code>ObjectName</code> is deterministic, and
+      <code>10_1_viii</code> pins it outright with
+      <code>@ManagedResource(objectName = "bean:name=fileCopier,type=JMXFileReplicator")</code> while adding the
+      connector server.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Exporter, assembler and managed-resource collaborators</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class FileReplicator {
+        getSrcDir
+        setSrcDir
+        getDestDir
+        setDestDir
+        replicate
+    }
+    class JMXFileReplicator {
+        srcDir
+        destDir
+        fileCopier
+        notificationPublisher
+        replicate
+        setNotificationPublisher
+    }
+    class NotificationPublisherAware
+    class MBeanExporter {
+        setBeans
+        setAssembler
+        setNotificationListenerMappings
+    }
+    class AnnotationMBeanExporter
+    class MBeanInfoAssembler
+    class MethodNameBasedMBeanInfoAssembler {
+        setManagedMethods
+    }
+    class InterfaceBasedMBeanInfoAssembler {
+        setManagedInterfaces
+    }
+    class MetadataMBeanInfoAssembler
+    class AnnotationJmxAttributeSource
+    class ConnectorServerFactoryBean {
+        setObjectName
+        setServiceUrl
+    }
+    class EnableMBeanExport
+    JMXFileReplicator ..|> FileReplicator
+    JMXFileReplicator ..|> NotificationPublisherAware
+    MBeanExporter <|-- AnnotationMBeanExporter
+    MBeanInfoAssembler <|-- MethodNameBasedMBeanInfoAssembler
+    MBeanInfoAssembler <|-- InterfaceBasedMBeanInfoAssembler
+    MBeanInfoAssembler <|-- MetadataMBeanInfoAssembler
+    MBeanExporter --> MBeanInfoAssembler : chooses the visible surface
+    MetadataMBeanInfoAssembler --> AnnotationJmxAttributeSource : reads Managed tags
+    EnableMBeanExport ..> AnnotationMBeanExporter : registers one
+    ConnectorServerFactoryBean ..> MBeanExporter : exposes over RMI
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the collaborators.</strong> The only hard dependency of the exporter on your
+      code is the assembler: <code>JmxConfig.mbeanExporter(MBeanInfoAssembler assembler)</code> in
+      <code>recipe_10_1_iii</code> … <code>_v</code> takes it as a method parameter, so
+      <code>@Bean</code> ordering guarantees the assembler exists before <code>setAssembler</code> is called.
+      <code>MetadataMBeanInfoAssembler</code> is useless without <code>AnnotationJmxAttributeSource</code> — the
+      <code>assembler.setAttributeSource(new AnnotationJmxAttributeSource())</code> line in
+      <code>recipe_10_1_v/.../config/JmxConfig.java</code> is what teaches it to look for
+      <code>@ManagedAttribute</code>. <code>@EnableMBeanExport</code> (used by <code>10_1_viii</code>,
+      <code>10_2_i</code>, <code>10_3_i</code>, <code>10_3_ii</code>) is the end state of the same idea: a context-level
+      switch that contributes an <code>AnnotationMBeanExporter</code>, so no <code>JmxConfig</code> class is needed at
+      all — which is exactly why <code>recipe_10_2_i</code> has no <code>config/JmxConfig.java</code> while
+      <code>recipe_10_2_ii</code> does (it must call <code>setNotificationListenerMappings</code>, which the annotation
+      cannot express).</p>
+    </section>
+
+    <section id="notify">
+      <span class="kicker">Recipe 10.2</span>
+      <h2>Publishing JMX notifications</h2>
+      <p>A management bean that only exposes operations is write-blind: the console cannot see what happened while it
+      was not looking. 10.2 makes <code>JMXFileReplicator</code> a notification source by implementing
+      <code>NotificationPublisherAware</code>, and 10.2_ii then binds an in-process
+      <code>NotificationListener</code> to the exported <code>ObjectName</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">One replicate() call, and the notification that comes back out</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant CL as JMX console
+    participant MS as MBeanServer
+    participant EX as AnnotationMBeanExporter
+    participant RE as JMXFileReplicator
+    participant CO as NioFileCopier
+    participant LN as ReplicationNotificationListener
+    CL->>MS: invoke replicate on bean name documentReplicator
+    MS->>RE: reflective call to replicate
+    RE->>CO: copyFile for each regular file under srcDir
+    CO-->>RE: file written into destDir
+    RE->>EX: sendNotification with type replication.complete
+    EX->>MS: publish notification for the exported ObjectName
+    MS->>LN: handleNotification plus handback
+    LN->>LN: print source and type and sequence number
+    RE-->>MS: replicate returns void
+    MS-->>CL: invoke completes
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the round trip.</strong> Two hand-offs matter. First, hop 2: the caller is not
+      your code but the <code>MBeanServer</code>, which invokes <code>replicate()</code> reflectively on the managed
+      resource — that is why the method is <code>synchronized</code> in every 10.1/10.2 variant. Second, hops
+      5–7: <code>notificationPublisher</code> is not injected by the Spring container but by the exporter itself,
+      through the <code>setNotificationPublisher(NotificationPublisher)</code> callback at the bottom of
+      <code>recipe_10_2_ii/.../JMXFileReplicator.java</code>; the exporter forwards the
+      <code>new Notification("replication.complete", this, sequenceNumber.incrementAndGet())</code> to the server,
+      which then dispatches to any listener registered for that <code>ObjectName</code>. The registration is the one
+      line that makes 10.2_ii different from 10.2_i:
+      <code>mbeanExporter.setNotificationListenerMappings(Map.of("bean:name=documentReplicator,type=JMXFileReplicator", nl))</code>
+      — and notice the <code>type=JMXFileReplicator</code> key. Because <code>@ManagedResource</code> declares no
+      explicit <code>objectName</code> here, the default naming strategy builds
+      <code>domain:name=beanId,type=ShortClassName</code> from <code>setDefaultDomain("bean")</code> plus the bean id
+      <code>documentReplicator</code>. Get either of those wrong and the mapping silently never fires.</p>
+    </section>
+
+    <section id="remote">
+      <span class="kicker">Recipe 10.3</span>
+      <h2>Driving the MBeanServer from another JVM</h2>
+      <p>Recipes 10.1 and 10.2 manage the JVM they run in. 10.3 splits the application in two:
+      <code>Server.main</code> publishes its platform MBeanServer over a JMX RMI connector, and
+      <code>Client.main</code> connects back. Variant <code>_i</code> works with the raw
+      <code>MBeanServerConnection</code>; variant <code>_ii</code> wraps the same connection in
+      <code>MBeanProxyFactoryBean</code> so the remote bean looks like the local <code>FileReplicator</code>
+      interface.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart LR</span>
+          <span class="dtitle">Two JVMs joined by an RMI registry and one JMX connector</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph cJvm["Client JVM -- Client.main"]
+        cf["mbeanServerConnection -- MBeanServerConnectionFactoryBean, 10_3_i"]
+        pf["fileReplicatorProxy -- MBeanProxyFactoryBean, 10_3_ii"]
+        lis["ReplicationNotificationListener"]
+    end
+    reg["RMI registry -- localhost port 1099"]
+    subgraph sJvm["Server JVM -- Server.main"]
+        cs["connectorServerFactoryBean -- ConnectorServerFactoryBean"]
+        ex["AnnotationMBeanExporter from EnableMBeanExport"]
+        rep["documentReplicator -- JMXFileReplicator"]
+        pms["Platform MBeanServer"]
+        fc["NioFileCopier"]
+    end
+    cf -- jndi lookup of replicator --> reg
+    pf -- jndi lookup of replicator --> reg
+    cs -- binds the connector to replicator --> reg
+    reg -- hands back the stub --> cf
+    cf -- getAttribute and invoke and addNotificationListener --> pms
+    pms -- dispatches to --> rep
+    rep -- copyFile --> fc
+    ex -- register --> pms
+    pms -- replication.complete --> lis
+        </pre>
+      </figure>
+      <p class="reading"><strong>Walking the arrows.</strong> Both ends use one identical service URL, defined in
+      <code>recipe_10_3_i/.../config/JmxServerConfiguration.java</code> and
+      <code>recipe_10_3_i/.../config/JmxClientConfiguration.java</code> and pinned in
+      <code>recipe_10_3_ii/.../config/JmxServerConfiguration.java</code> as
+      <code>service:jmx:rmi://localhost/jndi/rmi://localhost:1099/replicator</code>. The
+      <code>ConnectorServerFactoryBean</code> is a <code>FactoryBean</code> whose product is a JMX
+      <code>JMXConnectorServer</code>; on <code>afterPropertiesSet</code> it starts the connector and rebinds the
+      <code>JMXServiceURL</code> into the RMI registry under the name <code>replicator</code> — so the registry must
+      already be listening on 1099 when the server starts. On the client side
+      <code>MBeanServerConnectionFactoryBean</code> also implements <code>FactoryBean</code>, and its product is the
+      <code>MBeanServerConnection</code> that <code>Client.main</code> fetches with
+      <code>context.getBean(MBeanServerConnection.class)</code>. From there it is plain JMX:
+      <code>getAttribute(mbeanName, "SrcDir")</code>, then
+      <code>setAttribute(mbeanName, new Attribute("DestDir", srcDir + "_backup"))</code>, then
+      <code>invoke(mbeanName, "replicate", null, null)</code>, with
+      <code>addNotificationListener(mbeanName, listener, null, null)</code> registered <em>before</em> the invoke so
+      the <code>replication.complete</code> event is not missed. In 10.3_ii all four calls collapse into
+      <code>fileReplicatorProxy.getSrcDir()</code> / <code>setDestDir(...)</code> / <code>replicate()</code>: the
+      <code>MBeanProxyFactoryBean</code> combines a connection factory, an <code>ObjectName</code> and a
+      <code>proxyInterface</code>, and its <code>InvocationHandler</code> translates a getter into
+      <code>getAttribute</code>, a setter into <code>setAttribute</code> and everything else into <code>invoke</code>.</p>
+    </section>
+
+    <section id="mail">
+      <span class="kicker">Recipe 10.4</span>
+      <h2>Sending mail through JavaMail</h2>
+      <p>The task is fixed — report a copy failure to <code>admin@localhost</code> — and the five variants are a
+      countdown of how much of Jakarta Mail Spring is willing to hide. <code>ch10/build.gradle</code> adds
+      <code>com.sun.mail:jakarta.mail</code> to <code>recipe_10_4_i</code> through <code>_v</code> and to nothing else,
+      so mail is the only place in the chapter where <code>jakarta.mail.*</code> types appear.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The abstraction ladder from raw Transport to MimeMessagePreparator</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class ErrorNotifier {
+        notifyCopyError
+    }
+    class EmailErrorNotifier
+    class MailSender {
+        send
+    }
+    class JavaMailSender {
+        createMimeMessage
+        send
+    }
+    class JavaMailSenderImpl
+    class SimpleMailMessage {
+        setFrom
+        setTo
+        setSubject
+        setText
+    }
+    class MimeMessageHelper {
+        setFrom
+        setTo
+        setSubject
+        setText
+        addAttachment
+    }
+    class MimeMessagePreparator
+    class Session
+    class Transport
+    class ClassPathResource
+    EmailErrorNotifier ..|> ErrorNotifier
+    JavaMailSender --|> MailSender
+    JavaMailSenderImpl ..|> JavaMailSender
+    EmailErrorNotifier ..> Session : 10_4_i raw
+    EmailErrorNotifier ..> Transport : 10_4_i raw
+    EmailErrorNotifier --> MailSender : 10_4_ii
+    EmailErrorNotifier --> SimpleMailMessage : 10_4_iii template copy
+    EmailErrorNotifier --> JavaMailSender : 10_4_iv
+    EmailErrorNotifier ..> MimeMessageHelper : 10_4_iv
+    EmailErrorNotifier ..> MimeMessagePreparator : 10_4_v
+    MimeMessageHelper ..> ClassPathResource : attachment source
+    JavaMailSenderImpl ..> SimpleMailMessage : sends
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the ladder.</strong> In <code>recipe_10_4_i</code> the bean is pure Jakarta
+      Mail: <code>Session.getDefaultInstance(props, null)</code> with
+      <code>mail.smtp.host=localhost</code>/<code>mail.smtp.port=3025</code>, a hand-built
+      <code>MimeMessage</code>, and a static <code>Transport.send(message)</code>. Nothing is injectable, so the
+      connection details live inside the method. <code>10_4_ii</code> moves them to
+      <code>JavaMailSenderImpl.setHost/setPort/setUsername/setPassword</code> in
+      <code>config/MailConfiguration.java</code> and narrows the injection point to the
+      <code>MailSender</code> interface, so only <code>send(SimpleMailMessage)</code> is reachable — enough for plain
+      text, not enough for attachments. <code>10_4_iii</code> adds a second collaborator, the
+      <code>copyErrorMailMessage</code> <code>SimpleMailMessage</code> template, and the notifier becomes
+      <code>new SimpleMailMessage(template)</code> followed by <code>setText(String.format(template.getText(), ...))</code>
+      — a copy-then-fill idiom, because <code>SimpleMailMessage</code> is mutable and shared. <code>10_4_iv</code>
+      widens the dependency to <code>JavaMailSender</code> so it can call <code>createMimeMessage()</code>, wraps the
+      result in <code>MimeMessageHelper(message, true)</code> for multipart, and attaches
+      <code>new ClassPathResource("beans.xml")</code> — that attachment is why <code>beans.xml</code> survives in the
+      resources of <code>10_4_iii</code>, <code>_iv</code> and <code>_v</code>, although only <code>_iv</code> and
+      <code>_v</code> actually read it. Finally <code>10_4_v</code> hands the
+      whole build to a <code>MimeMessagePreparator</code> lambda and calls <code>mailSender.send(preparator)</code>,
+      so the sender owns session creation, message assembly and the send, and the helper never escapes the callback.</p>
+      <div class="note">
+        <h4>Where these recipes go wrong as committed</h4>
+        <p><code>recipe_10_4_ii/Main.java</code> and <code>recipe_10_4_v/Main.java</code> scan
+        <code>"com.apress.springrecipes.replicator.config"</code> — note the missing <code>6</code> — and the actual
+        package is <code>com.apress.spring6recipes.replicator.config</code>. No beans are found, so
+        <code>context.getBean(ErrorNotifier.class)</code> throws. The same typo appears in the leftover
+        <code>beans-jmx.xml</code>/<code>beans.xml</code> component-scan lines of 10.1, 10.2_ii, 10.5 and 10.6 (all of
+        which use Spring 3.2-era schema locations and are not loaded by the Java <code>Main</code> classes at all).
+        <code>recipe_10_4_iii/_iv/_v</code> use <code>MailConfiguration.class</code> and are fine.</p>
+      </div>
+    </section>
+
+    <section id="sched">
+      <span class="kicker">Recipes 10.5, 10.6, 10.10</span>
+      <h2>Triggering work on a timer</h2>
+      <p>Three ways to make <code>replicate()</code> happen by itself. 10.5 uses Quartz twice raw
+      (<code>_i</code>, <code>_ii</code>) and twice through Spring's Quartz integration
+      (<code>_iii</code>, <code>_iv</code>); 10.6 and 10.10 use Spring's own scheduler with no third-party
+      library at all. The distinction the book cares about is where the trigger lives: Quartz keeps
+      <code>JobDetail</code> and <code>Trigger</code> objects (and can persist them), while
+      <code>ScheduledAnnotationBeanPostProcessor</code> keeps an in-memory list of
+      <code>ScheduledMethodRunnable</code>s that die with the context.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">A Quartz fire, from trigger to file copy</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant SC as Scheduler -- StdSchedulerFactory or SchedulerFactoryBean
+    participant TF as documentReplicationTrigger
+    participant WQ as Quartz worker thread
+    participant JB as FileReplicationJob
+    participant DR as documentReplicator
+    participant FC as NioFileCopier
+    SC->>TF: compute the next fire time
+    TF-->>SC: startDelay 5000 ms then every 60000 ms
+    SC->>WQ: hand off the fired trigger and job detail
+    WQ->>JB: execute with a JobExecutionContext
+    JB->>JB: pull fileReplicator from the JobDataMap
+    JB->>DR: replicate
+    DR->>FC: copyFile for every regular file in srcDir
+    FC-->>DR: file created in destDir
+    DR-->>JB: void, or IOException
+    JB-->>WQ: JobExecutionException wrapping the failure
+    WQ-->>SC: report and reschedule
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the hand-off.</strong> The hop from <code>WQ</code> to <code>JOB</code> is the
+      interesting one, because a Quartz job is <em>not</em> a Spring bean: Quartz instantiates
+      <code>FileReplicationJob.class</code> reflectively per fire. In <code>recipe_10_5_i</code>/<code>_ii</code> the
+      collaborator therefore has to travel through the <code>JobDataMap</code>:
+      <code>jobDataMap.put("fileReplicator", documentReplicator)</code> in <code>Main</code>, then
+      <code>(FileReplicator) dataMap.get("fileReplicator")</code> inside
+      <code>execute(JobExecutionContext)</code>. From <code>recipe_10_5_iii</code> the job instead extends
+      <code>QuartzJobBean</code> and declares a <code>setFileReplicator</code> setter; the job instance is created by
+      Quartz but the property is populated by Spring from the scheduler context, so
+      <code>executeInternal(JobExecutionContext)</code> can use the field directly — and the wiring moves out of Java
+      and into <code>QuartzConfiguration</code>, where <code>JobDetailFactoryBean.setJobDataAsMap(singletonMap(...))</code>
+      supplies the value. The two trigger flavours are the whole difference between <code>_iii</code> and
+      <code>_iv</code>: <code>SimpleTriggerFactoryBean</code> with
+      <code>setStartDelay(5000)</code> and <code>setRepeatInterval(60000)</code>, versus
+      <code>CronTriggerFactoryBean</code> with <code>setCronExpression("0/60 * * * * ?")</code> — which is the
+      Spring-side mirror of <code>SimpleScheduleBuilder.simpleSchedule().withIntervalInSeconds(60).repeatForever()</code>
+      versus <code>CronScheduleBuilder.cronSchedule(...)</code> in <code>_i</code>/<code>_ii</code>.
+      <code>SchedulerFactoryBean.scheduler(Trigger[] triggers)</code> collects every trigger bean in the context by
+      type, so adding a second trigger bean needs no change to the scheduler definition.</p>
+      <h3>Without Quartz</h3>
+      <p><code>recipe_10_6_i/.../config/SchedulingConfiguration.java</code> is 20 lines:
+      <code>@EnableScheduling</code> plus a <code>ThreadPoolTaskScheduler</code> bean with
+      <code>setThreadNamePrefix("s6r-scheduler-")</code> and <code>setPoolSize(10)</code>. The annotation switch
+      registers <code>ScheduledAnnotationBeanPostProcessor</code>, which finds
+      <code>@Scheduled(fixedDelay = 60_000)</code> on <code>SimpleFileReplicator.replicate()</code> and submits it to
+      any bean of type <code>TaskScheduler</code> — matched here by name, <code>taskScheduler</code>. Because
+      <code>@Bean</code> returns the concrete <code>SimpleFileReplicator</code>, the post-processor sees the annotated
+      class rather than the <code>FileReplicator</code> interface. <code>recipe_10_6_ii</code> additionally implements
+      <code>SchedulingConfigurer</code> and calls
+      <code>taskRegistrar.addFixedDelayTask(() -&gt; fileReplicator.replicate(), Duration.ofSeconds(60))</code>; the
+      annotation is still on the bean, so <em>the folder is replicated on two independent 60-second schedules</em>.
+      <code>recipe_10_10_i</code> starts from the 10.6_ii shape and changes only observability: <code>Main</code>
+      calls <code>ctx.setApplicationStartup(new FlightRecorderApplicationStartup())</code> before
+      <code>ctx.scan(cfg); ctx.refresh()</code>, so every built-in startup step lands in JFR. <code>_ii</code> wraps
+      the registration itself in a custom step by implementing <code>ApplicationStartupAware</code> and bracketing
+      <code>configureTasks</code> with <code>applicationStartup.start("s6r.register-task")</code> /
+      <code>step.end()</code>; <code>_iii</code> adds <code>step.tag("task", "file-replicator")</code> so the step is
+      attributable in the recording.</p>
+      <div class="callout danger">
+        <h4>All four 10.5 <code>Main</code> classes exit before the first fire</h4>
+        <p>Unlike 10.1/10.2/10.3/10.6/10.10, none of <code>recipe_10_5_i</code> … <code>_iv</code> call
+        <code>System.in.read()</code>. Their try-with-resources closes the context the instant
+        <code>scheduler.scheduleJob(job, trigger)</code> returns, which shuts the scheduler down before the 5-second
+        <code>startDelay</code> elapses. Add a blocking read (or a <code>CountDownLatch</code>) to actually observe a
+        replication run.</p>
+      </div>
+    </section>
+
+    <section id="ws">
+      <span class="kicker">Recipes 10.7, 10.8, 10.9</span>
+      <h2>Document-driven web services</h2>
+      <p>10.7 produces the contract: the <code>README.txt</code> runs the sample <code>request.xml</code> and
+      <code>response.xml</code> through XMLBeans <code>inst2xsd -design rd -enumerations never</code> and hand-tightens
+      the result into <code>temperature.xsd</code>. 10.8 and 10.9 implement that schema twice — once with DOM, once
+      with JAXB — and each recipe is a matched pair of <code>_Server</code> (a WAR) and <code>_Client</code> (a console
+      app).</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart LR</span>
+          <span class="dtitle">Deployment topology of the Spring WS pair</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph cJvm["Client JVM -- SpringWSInvokerClient.main"]
+        wc["weatherServiceClient -- WeatherServiceClient"]
+        wp["weatherServiceProxy -- WeatherServiceProxy"]
+        wt["webServiceTemplate -- WebServiceTemplate"]
+        jm["marshaller -- Jaxb2Marshaller, 10_9 only"]
+    end
+    subgraph war["Tomcat -- springws.war at context springws"]
+        mds["MessageDispatcherServlet"]
+        wd["temperature -- DefaultWsdl11Definition"]
+        xs["temperatureSchema -- SimpleXsdSchema"]
+        ep["TemperatureEndpoint"]
+        wsi["WeatherServiceImpl"]
+    end
+    wc -- getTodayTemperature --> wp
+    wp --> wt
+    wt -- marshalSendAndReceive --> jm
+    wt -- sendSourceAndReceiveToResult --> mds
+    jm -- HTTP POST SOAP --> mds
+    mds -- PayloadRoot mapping --> ep
+    ep -- getTemperatures --> wsi
+    wd -- renders --> xs
+    mds -- serve the WSDL --> wd
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the endpoints.</strong> Three beans define the server surface.
+      <code>@EnableWs</code> on <code>SpringWsConfiguration</code> installs the Spring WS infrastructure
+      (<code>MessageDispatcherServlet</code> plus its <code>MessageMapping</code> post-processors);
+      <code>Initializer extends AbstractAnnotationConfigMessageDispatcherServletInitializer</code> registers that
+      servlet with the container and hands it <code>getServletConfigClasses() = SpringWsConfiguration.class</code>
+      (with <code>getRootConfigClasses()</code> returning <code>null</code>, so there is exactly one context); and the
+      bean <em>name</em> <code>temperature</code> on <code>DefaultWsdl11Definition</code> is what publishes the WSDL —
+      Spring WS resolves a WSDL request to the bean of that name, and the bean pulls its schema from
+      <code>SimpleXsdSchema</code> over <code>/META-INF/xsd/temperature.xsd</code>. On the client the gateway is
+      <code>WebServiceTemplate</code> with
+      <code>setDefaultUri("http://localhost:8080/springws/services")</code>; the WAR is renamed to
+      <code>springws.war</code> by <code>ch10/build.gradle</code>, so <code>/springws</code> is the context and
+      <code>/services</code> is the dispatcher path the template is expected to reach — confirm the exact mapping from
+      the container's deployment log, since <code>Initializer</code> does not override
+      <code>getServletMapping()</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">GetTemperatures round trip, DOM in 10.8 versus JAXB in 10.9</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant CL as WeatherServiceClient
+    participant PR as WeatherServiceProxy
+    participant WT as WebServiceTemplate
+    participant DS as MessageDispatcherServlet
+    participant EP as TemperatureEndpoint
+    participant SV as WeatherServiceImpl
+    CL->>PR: getTemperatures with city and date list
+    alt 10_8 the proxy builds a dom4j document
+        PR->>WT: sendSourceAndReceiveToResult with DocumentSource and DocumentResult
+    else 10_9 the proxy builds a GetTemperaturesRequest
+        PR->>WT: marshalSendAndReceive with the JAXB object
+        WT->>WT: Jaxb2Marshaller writes the request element
+    end
+    WT->>DS: HTTP POST SOAP envelope to the defaultUri
+    DS->>EP: match PayloadRoot GetTemperaturesRequest then call getTemperature
+    alt 10_8 payload bound to an Element
+        EP->>EP: DefaultXPath valueOf for city and selectNodes for dates
+    else 10_9 payload unmarshalled by MarshallingPayloadMethodProcessor
+        EP->>EP: getCity and getDate on the request object
+    end
+    EP->>SV: getTemperatures with city and LocalDate list
+    SV-->>EP: list of TemperatureInfo records from ThreadLocalRandom
+    EP-->>DS: response Element or a GetTemperaturesResponse
+    DS-->>WT: SOAP response
+    WT-->>PR: response payload, unmarshalled in 10_9
+    PR-->>CL: the first TemperatureInfo
+        </pre>
+      </figure>
+      <p class="reading"><strong>Walking it.</strong> <code>WeatherServiceClient.getTodayTemperature("Houston")</code>
+      builds <code>Collections.singletonList(LocalDate.now())</code> and calls the <code>WeatherService</code>
+      interface — the client never knows it is talking to a web service, because
+      <code>weatherServiceProxy</code> is injected in its place. The proxy's job is payload assembly and one
+      <code>WebServiceTemplate</code> call. On the server, the <code>@PayloadRoot(localPart = "GetTemperaturesRequest",
+      namespace = namespaceUri)</code> annotation is the routing key that <code>MessageDispatcherServlet</code>
+      matches, and the parameter binding is where the two recipes fork: 10.8 binds
+      <code>@RequestPayload Element</code> and runs two pre-configured <code>DefaultXPath</code> objects
+      (<code>cityPath</code>, <code>datePath</code>, both with <code>setNamespaceURIs(Map.of("weather", namespaceUri))</code>)
+      and builds the reply with <code>DocumentHelper.createDocument()</code>; 10.9 binds
+      <code>@RequestPayload GetTemperaturesRequest</code>, and that is only possible because
+      <code>SpringWsConfiguration extends WsConfigurerAdapter</code> and registers
+      <code>new MarshallingPayloadMethodProcessor(marshaller())</code> in <em>both</em>
+      <code>addArgumentResolvers</code> and <code>addReturnValueHandlers</code> — the same processor class plays the
+      request-unmarshaller and response-marshaller role. <code>WeatherServiceImpl</code> is
+      <code>@Component("weatherService")</code> and returns random values, so nothing here needs a weather backend.
+      One detail to watch in 10.9: the JAXB classes carry the <code>http://spring6recipes.apress.com/...</code>
+      namespace matching the code, while <code>ch10/recipe_10_7/temperature.xsd</code> still declares
+      <code>http://springrecipes.apress.com/weather/schemas</code>; the copies of the schema under
+      <code>src/main/resources/META-INF/xsd/</code> in both server modules use the <code>spring6recipes</code> form, as
+      the modules' own <code>TemperatureEndpoint</code> requires.</p>
+    </section>
+
+    <section id="metrics">
+      <span class="kicker">Recipe 10.11</span>
+      <h2>Publishing metrics over JMX</h2>
+      <p>The chapter closes by looping back to JMX, but through Micrometer instead of <code>MBeanExporter</code>:
+      every HTTP request observed on either side of the wire becomes an MBean you can watch in a console. The REST app
+      is the Chapter 3 court service (<code>implementation(project(":ch03:recipe_3_shared"))</code>), packaged as
+      <code>court.war</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart LR</span>
+          <span class="dtitle">Observations from both sides of one HTTP call, into one MBeanServer</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph cli["MemberClient JVM"]
+        sch["taskExecutor -- ThreadPoolTaskScheduler"]
+        rt["restTemplate -- RestTemplate with an ObservationRegistry"]
+        o1["observationRegistry -- ObservationRegistry"]
+        m1["meterRegistry -- JmxMeterRegistry"]
+        mbr["MeterBinderRegistrar, 10_11_ii"]
+        bnd["UptimeMetrics and JvmThreadMetrics and JvmMemoryMetrics"]
+    end
+    subgraph srv["court.war on Tomcat"]
+        dfp["DelegatingFilterProxy named metricsFilter"]
+        flt["metricsFilter -- ServerHttpObservationFilter"]
+        ds["DispatcherServlet"]
+        ctl["RestMemberController"]
+        o2["observationRegistry -- ObservationRegistry"]
+        m2["meterRegistry -- JmxMeterRegistry"]
+    end
+    pms["Platform MBeanServer"]
+    con["JConsole"]
+    sch -- scheduleAtFixedRate --> rt
+    rt -- poll members every 100 ms --> dfp
+    dfp -- resolves the bean --> flt
+    flt --> ds
+    ds -- handler mapping --> ctl
+    rt -- client observation --> o1
+    flt -- server observation --> o2
+    o1 -- DefaultMeterObservationHandler --> m1
+    o2 -- DefaultMeterObservationHandler --> m2
+    bnd -- bindTo --> m1
+    mbr -- forEach bindTo --> bnd
+    m1 -- publish meters --> pms
+    m2 -- publish meters --> pms
+    pms -- read attributes --> con
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading both halves.</strong> Client side: <code>MemberClient.main</code> gets a
+      <code>TaskScheduler</code> and a <code>RestTemplate</code> from its own context, then
+      <code>scheduler.scheduleAtFixedRate(() -&gt; listMembers(restTemplate), Duration.ofMillis(100))</code> polls
+      <code>http://127.0.0.1:8080/court/members</code>. The template records a request only because
+      <code>restTemplate.setObservationRegistry(observationRegistry)</code> is called in
+      <code>MemberClientConfiguration</code>. Server side the observation is installed at the servlet-container
+      boundary: <code>CourtRestApplicationInitializer.getServletFilters()</code> returns
+      <code>new DelegatingFilterProxy("metricsFilter")</code>, and <code>CourtRestConfiguration</code> declares the
+      bean <code>metricsFilter(ObservationRegistry or)</code> as a <code>ServerHttpObservationFilter</code>. That two-step
+      matters — the filter instance Tomcat holds is a <code>DelegatingFilterProxy</code> shell that looks the real
+      filter up <em>by name</em> in the <code>DispatcherServlet</code> context produced by
+      <code>getServletConfigClasses() = CourtRestConfiguration.class</code>. From either observation, the single
+      registered <code>DefaultMeterObservationHandler(meterRegistry)</code> turns the timer into Micrometer meters, and
+      <code>JmxMeterRegistry(JmxConfig.DEFAULT, Clock.SYSTEM)</code> publishes them as MBeans. 10.11_ii's only delta is
+      <code>MeterBinderRegistrar</code>: a <code>@Component</code> injecting <code>MeterRegistry</code> and
+      <code>ObjectProvider&lt;MeterBinder&gt;</code>, whose <code>@PostConstruct register()</code> calls
+      <code>binders.forEach(b -&gt; b.bindTo(registry))</code>. It is picked up by
+      <code>@ComponentScan("com.apress.spring6recipes.court")</code> in the WAR and by
+      <code>@Import({MeterBinderRegistrar.class, MeterBindersConfiguration.class})</code> in the client, and the client
+      is the only place that declares actual binders — <code>UptimeMetrics</code>, <code>JvmThreadMetrics</code>,
+      <code>JvmMemoryMetrics</code> — so the server registers the machinery and binds nothing.</p>
+    </section>
+
+    <section id="matrix">
+      <span class="kicker">Reference</span>
+      <h2>Technology and abstraction matrix</h2>
+      <p>Direction is from the application's point of view: <em>out</em> means Spring pushes to the external system,
+      <em>in</em> means the external system causes your code to run.</p>
+      <table>
+        <thead>
+          <tr><th>Recipe</th><th>Enterprise technology</th><th>Spring abstraction actually referenced</th><th>Endpoint class</th><th>Dir.</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="num">10.1 i</td><td>JMX, ModelMBean layer</td><td>none — raw <code>ManagementFactory.getPlatformMBeanServer()</code></td><td><code>Main</code></td><td>out</td></tr>
+          <tr><td class="num">10.1 ii–v</td><td>JMX</td><td><code>MBeanExporter</code> + one of three <code>MBeanInfoAssembler</code> implementations</td><td><code>JmxConfig</code></td><td>out</td></tr>
+          <tr><td class="num">10.1 vi–vii</td><td>JMX, annotation driven</td><td><code>AnnotationMBeanExporter</code>, <code>@ManagedResource</code>/<code>@ManagedAttribute</code>/<code>@ManagedOperation</code></td><td><code>JmxConfig</code></td><td>out</td></tr>
+          <tr><td class="num">10.1 viii</td><td>JMX over RMI</td><td><code>ConnectorServerFactoryBean</code> (<code>FactoryBean</code>)</td><td><code>JmxServerConfig</code></td><td>in</td></tr>
+          <tr><td class="num">10.2 i</td><td>JMX notifications</td><td><code>@EnableMBeanExport</code> + <code>NotificationPublisherAware</code></td><td><code>FileReplicatorConfig</code></td><td>out</td></tr>
+          <tr><td class="num">10.2 ii</td><td>JMX notifications</td><td><code>AnnotationMBeanExporter.setNotificationListenerMappings</code></td><td><code>JmxConfig</code></td><td>in</td></tr>
+          <tr><td class="num">10.3 i</td><td>JMX RMI connector</td><td><code>MBeanServerConnectionFactoryBean</code> → <code>MBeanServerConnection</code></td><td><code>JmxClientConfiguration</code></td><td>in</td></tr>
+          <tr><td class="num">10.3 ii</td><td>JMX RMI connector</td><td><code>MBeanProxyFactoryBean</code> with <code>setProxyInterface</code></td><td><code>JmxClientConfiguration</code></td><td>in</td></tr>
+          <tr><td class="num">10.4 i</td><td>SMTP</td><td>none — Jakarta Mail <code>Session</code>/<code>Transport</code></td><td><code>EmailErrorNotifier</code></td><td>out</td></tr>
+          <tr><td class="num">10.4 ii–iii</td><td>SMTP</td><td><code>MailSender</code>, <code>JavaMailSenderImpl</code>, <code>SimpleMailMessage</code></td><td><code>MailConfiguration</code></td><td>out</td></tr>
+          <tr><td class="num">10.4 iv–v</td><td>SMTP, MIME multipart</td><td><code>JavaMailSender</code>, <code>MimeMessageHelper</code>, <code>MimeMessagePreparator</code></td><td><code>MailConfiguration</code></td><td>out</td></tr>
+          <tr><td class="num">10.5 i–ii</td><td>Quartz (RAMJobStore)</td><td>none — <code>StdSchedulerFactory</code> with Quartz builders</td><td><code>Main</code></td><td>in</td></tr>
+          <tr><td class="num">10.5 iii–iv</td><td>Quartz</td><td><code>SchedulerFactoryBean</code>, <code>JobDetailFactoryBean</code>, <code>SimpleTriggerFactoryBean</code> / <code>CronTriggerFactoryBean</code>, <code>QuartzJobBean</code></td><td><code>QuartzConfiguration</code></td><td>in</td></tr>
+          <tr><td class="num">10.6 i</td><td>Spring scheduling</td><td><code>@EnableScheduling</code>, <code>@Scheduled</code>, <code>ThreadPoolTaskScheduler</code></td><td><code>SchedulingConfiguration</code></td><td>in</td></tr>
+          <tr><td class="num">10.6 ii</td><td>Spring scheduling</td><td><code>SchedulingConfigurer</code> + <code>ScheduledTaskRegistrar.addFixedDelayTask</code></td><td><code>SchedulingConfiguration</code></td><td>in</td></tr>
+          <tr><td class="num">10.7</td><td>XSD design derivation</td><td>none — XMLBeans <code>inst2xsd</code></td><td>n/a</td><td>—</td></tr>
+          <tr><td class="num">10.8</td><td>SOAP / Spring WS</td><td><code>DefaultWsdl11Definition</code>, <code>SimpleXsdSchema</code>, <code>@Endpoint</code>/<code>@PayloadRoot</code>, <code>WebServiceTemplate</code></td><td><code>TemperatureEndpoint</code> (in), <code>WeatherServiceProxy</code> (out)</td><td>both</td></tr>
+          <tr><td class="num">10.9</td><td>SOAP / Spring WS + JAXB</td><td><code>Jaxb2Marshaller</code>, <code>MarshallingPayloadMethodProcessor</code>, <code>WsConfigurerAdapter</code></td><td><code>TemperatureEndpoint</code> (in), <code>WeatherServiceProxy</code> (out)</td><td>both</td></tr>
+          <tr><td class="num">10.10 i–iii</td><td>Java Flight Recorder</td><td><code>FlightRecorderApplicationStartup</code>, <code>ApplicationStartupAware</code>, <code>StartupStep</code></td><td><code>Main</code>, <code>SchedulingConfiguration</code></td><td>out</td></tr>
+          <tr><td class="num">10.11 i–ii</td><td>Micrometer over JMX</td><td><code>JmxMeterRegistry</code>, <code>ObservationRegistry</code>, <code>ServerHttpObservationFilter</code>, <code>RestTemplate.setObservationRegistry</code></td><td><code>CourtRestConfiguration</code> (in), <code>MemberClient</code> (out)</td><td>both</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Running</span>
+      <h2>Building and running for real</h2>
+      <p>Every ch10 module is a Gradle project — <code>settings.gradle</code> walks directories matching
+      <code>^(?i)(ch|recipe|appendix).*$</code> and includes anything named <code>recipe*</code>, so the paths are
+      <code>:ch10:recipe_10_1_i</code> … <code>:ch10:recipe_10_11_ii</code>. The chapter applies the shadow plugin to
+      every subproject and finalises <code>build</code> with <code>shadowJar</code>, giving you a runnable fat jar at
+      <code>ch10/&lt;module&gt;/build/libs/&lt;module&gt;-6.0.0-SNAPSHOT-all.jar</code> (<code>version</code> comes from
+      <code>gradle.properties</code>).</p>
+      <pre><code># console recipes: build, then run the fat jar
+./gradlew :ch10:recipe_10_1_vii:build
+java --enable-preview -cp ch10/recipe_10_1_vii/build/libs/recipe_10_1_vii-6.0.0-SNAPSHOT-all.jar \
+     com.apress.spring6recipes.replicator.Main
+
+# the 10.3 pair, in two shells
+./gradlew :ch10:recipe_10_3_i:build
+java --enable-preview -cp ch10/recipe_10_3_i/build/libs/recipe_10_3_i-6.0.0-SNAPSHOT-all.jar \
+     com.apress.spring6recipes.replicator.Server
+java --enable-preview -cp ch10/recipe_10_3_i/build/libs/recipe_10_3_i-6.0.0-SNAPSHOT-all.jar \
+     com.apress.spring6recipes.replicator.Client</code></pre>
+      <p>Toolchain facts from the root build worth knowing before you start: <code>java.toolchain.languageVersion</code>
+      is <code>19</code>, <code>gradle.properties</code> pins <code>org.gradle.java.home</code> to a JDK 17 install, and
+      <code>--enable-preview</code> is added to every <code>JavaCompile</code>, <code>Test</code> and
+      <code>JavaExec</code>. Preview-flagged class files are only accepted by the exact JVM version they were compiled
+      for, so run the jars on a Java 19 with <code>--enable-preview</code>, and let Gradle provision a 19 toolchain if
+      you do not have one.</p>
+
+      <h3>What has to be listening</h3>
+      <table>
+        <thead><tr><th>Recipes</th><th>Prerequisite</th><th>Where it comes from in the source</th></tr></thead>
+        <tbody>
+          <tr><td>10.1 i–vii, 10.2 i–ii</td>
+            <td>Nothing to install. The platform MBeanServer is in-process; attach JConsole or <code>jcmd</code> from
+            the same JDK. A console is required, because <code>Main</code> blocks on
+            <code>System.in.read()</code> and closes the context when it returns.</td>
+            <td>No ports bound by these modules</td></tr>
+          <tr><td>10.6 i–ii</td>
+            <td>Nothing external, and no scheduler backing store — <code>@EnableScheduling</code> plus a
+            <code>ThreadPoolTaskScheduler</code> bean keep the tasks in memory only.</td>
+            <td><code>SchedulingConfiguration.taskScheduler()</code>; <code>Main</code> blocks on
+            <code>System.in.read()</code></td></tr>
+          <tr><td>10.1 viii, 10.3 i–ii</td>
+            <td>An RMI registry on <strong>localhost:1099</strong> started before the server (the JDK
+            <code>rmiregistry</code> tool). Then any JMX client can use the published connector.</td>
+            <td><code>ConnectorServerFactoryBean.setServiceUrl("service:jmx:rmi://localhost/jndi/rmi://localhost:1099/replicator")</code></td></tr>
+          <tr><td>10.4 i–v</td>
+            <td>An SMTP sink on <strong>localhost:3025</strong>. The repo ships none; any local catcher works, because
+            <code>JavaMailSenderImpl</code> is given username <code>system</code> and password <code>12345</code> but
+            the recipes never enable TLS or auth properties.</td>
+            <td><code>mailSender.setPort(3025)</code> in <code>MailConfiguration</code>; <code>props.put("mail.smtp.port", "3025")</code> in <code>recipe_10_4_i</code>. The legacy <code>beans.xml</code> in 10.4 iii–v says port <code>25</code> but is not loaded.</td></tr>
+          <tr><td>10.5 i–iv</td>
+            <td>No database. There is no <code>quartz.properties</code> in any module, so the default
+            <code>RAMJobStore</code>, non-clustered scheduler is used. <code>spring-tx</code> is on the classpath for
+            <code>_iii</code>/<code>_iv</code> but no transaction manager is wired.</td>
+            <td><code>ch10/build.gradle</code> lines for <code>recipe_10_5_iii</code>/<code>_iv</code>; no properties file anywhere under <code>ch10/*/src/main/resources</code></td></tr>
+          <tr><td>10.7</td>
+            <td>The XMLBeans binary distribution — a manual download, not a Gradle dependency.</td>
+            <td><code>ch10/recipe_10_7/README.txt</code> step 1 and the <code>inst2xsd</code> invocation</td></tr>
+          <tr><td>10.8, 10.9</td>
+            <td>A servlet container on <strong>8080</strong>. Both server modules apply the <code>war</code>,
+            <code>com.palantir.docker</code> and <code>com.palantir.docker-run</code> plugins and produce
+            <code>springws.war</code>.</td>
+            <td><code>ch10/build.gradle</code>: <code>war { archiveFileName = 'springws.war' }</code>, <code>dockerRun { ports '8080:8080' }</code>. Note <code>dockerfile file('../Dockerfile')</code> resolves to <code>ch10/Dockerfile</code>, <strong>which is not in the repo</strong> — <code>:ch10:recipe_10_8_SpringWS_Server:docker</code> will fail. Each module does carry its own <code>Dockerfile</code> (Temurin 19 + Tomcat 10.1.4, <code>EXPOSE 8080 5005</code>), so build the image manually or drop the WAR into a local Tomcat.</td></tr>
+          <tr><td>10.10 i–iii</td>
+            <td>JFR must be enabled and dumped to see anything: run with
+            <code>-XX:StartFlightRecording=filename=ch10.jfr</code> or attach <code>jcmd &lt;pid&gt; JFR.dump</code>.
+            The recipe only installs <code>FlightRecorderApplicationStartup</code>.</td>
+            <td><code>ctx.setApplicationStartup(new FlightRecorderApplicationStartup())</code> in each <code>Main</code></td></tr>
+          <tr><td>10.11 i–ii</td>
+            <td>Tomcat on <strong>8080</strong> with <code>court.war</code> deployed at context <code>/court</code>,
+            then run <code>MemberClient</code>. These two modules do have their own <code>Dockerfile</code> and the
+            <code>docker</code> task points at <code>file('./Dockerfile')</code>, so
+            <code>./gradlew :ch10:recipe_10_11_i:dockerRun</code> is consistent (that image exposes 8080, 5005 and an
+            unused 9000). A JMX console reads the published meters.</td>
+            <td><code>war { archiveFileName = 'court.war' }</code>; <code>MemberClient.listMembers</code> targets <code>http://127.0.0.1:8080/court/members</code></td></tr>
+          <tr><td>all replicator recipes</td>
+            <td>Two writable directories: <code>${user.home}/docs</code> (source) and
+            <code>${user.home}/docs_backup</code> (destination). Drop a file into the first to see a replication.</td>
+            <td><code>@Value("#{systemProperties['user.home']}/docs")</code> plus
+            <code>@PostConstruct verifyDirectoriesExist()</code>, which calls <code>Files.createDirectories</code>;
+            override with <code>-Duser.home=...</code></td></tr>
+        </tbody>
+      </table>
+
+      <h3>Source defects that stop a recipe cold</h3>
+      <p>These are worth knowing before you spend time debugging wiring that the book never ran.</p>
+      <ul>
+        <li><code>recipe_10_2_ii/.../Main.java</code> starts
+          <code>new AnnotationConfigApplicationContext(FileReplicator.class, JmxConfig.class)</code>. It registers an
+          interface as a component class and never loads <code>FileReplicatorConfig</code>, so there is no
+          <code>documentReplicator</code> bean for the listener mapping to attach to. Add
+          <code>FileReplicatorConfig.class</code> to run it.</li>
+        <li><code>recipe_10_3_ii/.../Client.java</code> passes
+          <code>"bean:name=documentReplicator,type=JMXFileReplicator"</code> as the scan package instead of
+          <code>JmxClientConfiguration.class</code>, so <code>fileReplicatorProxy</code> is never defined.</li>
+        <li><code>recipe_10_4_ii</code> and <code>recipe_10_4_v</code> <code>Main</code> classes scan
+          <code>com.apress.springrecipes.replicator.config</code> (typo, missing the <code>6</code>).</li>
+        <li><code>recipe_10_9_SpringWS_Client/.../SpringWSInvokerClient.java</code> assigns
+          <code>SpringWsClientConfiguration.class</code> to a local <code>cfg</code> and then builds an
+          <em>empty</em> <code>new AnnotationConfigApplicationContext()</code>, so the very next
+          <code>getBean(WeatherServiceClient.class)</code> fails. The 10.8 client does pass <code>cfg</code>.</li>
+        <li><code>recipe_10_1_i</code>–<code>viii</code>, <code>10_2_ii</code>, <code>10_4_iii</code>–<code>v</code>,
+          <code>10_5_ii</code>–<code>iv</code> and <code>10_6_i</code>–<code>ii</code> still ship
+          <code>beans.xml</code>/<code>beans-jmx.xml</code> with Spring 3.2 schema locations and the misspelled scan
+          package. They are reference material; nothing in a <code>Main</code> loads them.</li>
+        <li>No ch10 module has <code>src/test</code> — <code>build</code> compiles and packages only, so a green build
+          is not evidence that a recipe behaved.</li>
+      </ul>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch10/</code> &mdash; <a href="../index.html">Spring 6 Recipes contents</a>
+</footer>
+</body>
+</html>

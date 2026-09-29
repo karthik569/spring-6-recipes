@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 8 — Spring Batch — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 8</div>
+  <h1>Chapter 8 — Spring Batch</h1>
+  <p class="lede">Sixteen modules, one job. Every recipe in this chapter builds the same
+  single-step, chunk-oriented import — <code>insertIntoDbFromCsvJob</code> / <code>step1</code>, chunk
+  size 5, CSV in, <code>USER_REGISTRATION</code> rows out — and varies exactly one thing around it:
+  how the batch infrastructure is declared, how the reader and writer are assembled, what happens to a
+  bad row, how a deadlock is retried, how the launch is made asynchronous, and who triggers it. Read the
+  deltas, not the boilerplate.</p>
+  <div class="chip-row">
+    <span class="chip">16 recipe modules, 64 Java files</span>
+    <span class="chip">spring-batch-core 5.0.0</span>
+    <span class="chip">spring-context + spring-jdbc 6.0.3</span>
+    <span class="chip">H2 2.1.214 file DB at ~/batch</span>
+    <span class="chip">chunk(5) in all 12 step definitions</span>
+    <span class="chip">./gradlew :ch08:recipe_8_2_i:build</span>
+    <span class="chip">Java 19 toolchain, --enable-preview</span>
+    <span class="chip">no Tasklet, no listener, no skip rule in the chapter</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch07/index.html">&larr; Chapter 7 — Spring Transaction Management</a>
+    <a href="../ch09/index.html">Chapter 9 — Spring Data Access with NoSQL &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc"><h2>On this page</h2><ol>
+    <li><a href="#overview">Overview and module map</a></li>
+    <li><a href="#infrastructure">Declaring the batch infrastructure (8-1)</a></li>
+    <li><a href="#pipeline">Reader, processor, writer (8-2, 8-3, 8-4)</a></li>
+    <li><a href="#execution">Launching a job and writing metadata (8-2 onward)</a></li>
+    <li><a href="#fault">Fault tolerance: retry without skip (8-5, 8-6)</a></li>
+    <li><a href="#flow">Flow control and execution status (8-7)</a></li>
+    <li><a href="#scheduling">Async launching and scheduled launching (8-8, 8-9)</a></li>
+    <li><a href="#running">Building and running the recipes</a></li>
+  </ol></aside>
+  <article>
+
+    <section id="overview">
+      <h2>Overview and module map</h2>
+      <p>The domain example is a US state-licensing CSV dump. Each line is eleven comma-separated
+      columns that map onto the <code>UserRegistration</code> record shipped in almost every module, and
+      the job turns those lines into <code>INSERT</code> statements against
+      <code>USER_REGISTRATION</code> in an H2 file database at <code>jdbc:h2:~/batch</code>. The same
+      database holds Spring Batch's own metadata (<code>BATCH_JOB_INSTANCE</code>,
+      <code>BATCH_JOB_EXECUTION</code>, <code>BATCH_JOB_PARAMS</code>,
+      <code>BATCH_STEP_EXECUTION</code> and the two context tables), which is why a chapter about
+      "reading a file" spends most of its code on <code>JobRepository</code> plumbing.</p>
+      <p>Recipes group by what they change:</p>
+      <ul>
+        <li><strong>8-1</strong> — get the infrastructure into the container, by hand
+          (<code>recipe_8_1_i</code>) or with <code>@EnableBatchProcessing</code>
+          (<code>recipe_8_1_ii</code>). No job yet; <code>Main</code> just prints the three beans.</li>
+        <li><strong>8-2</strong> — the first working job: read a flat file, write JDBC. Setter
+          assembly (<code>recipe_8_2_i</code>) versus the fluent item builders
+          (<code>recipe_8_2_ii</code>).</li>
+        <li><strong>8-3</strong> — hand-written <code>ItemReader</code> and <code>ItemWriter</code>
+          against a service interface instead of a file and a table.</li>
+        <li><strong>8-4</strong> — the <code>ItemProcessor</code> slot: validate, normalise, or drop a row.</li>
+        <li><strong>8-5, 8-6</strong> — fault tolerance. 8-5 opens the
+          <code>faultTolerant()</code> block and leaves the policies commented out; 8-6 shows three
+          places to put retry (step level, writer level with <code>RetryTemplate</code>, declarative
+          <code>@Retryable</code>).</li>
+        <li><strong>8-7</strong> — flow control. One class, <code>HoroscopeDecider</code>.</li>
+        <li><strong>8-8</strong> — four ways to get the job off the calling thread
+          (<code>SimpleAsyncTaskExecutor</code>, <code>taskExecutorRef</code>,
+          <code>@EnableAsync</code> plus <code>@Scheduled</code>).</li>
+        <li><strong>8-9</strong> — the scheduled launcher as the normal way to run the job.</li>
+      </ul>
+
+      <h3>Module map</h3>
+      <table>
+        <thead><tr><th>Recipe</th><th>Module</th><th>What it demonstrates</th><th>Key classes</th></tr></thead>
+        <tbody>
+          <tr><td>8-1</td><td><code>recipe_8_1_i</code></td>
+            <td>Fully hand-wired batch infrastructure: <code>JobRepositoryFactoryBean</code>,
+              <code>TaskExecutorJobLauncher</code>, <code>MapJobRegistry</code>,
+              <code>JobRegistryBeanPostProcessor</code>, <code>DataSourceTransactionManager</code>,
+              schema bootstrapping via <code>DataSourceInitializer</code>.</td>
+            <td><code>config/BatchConfiguration</code>, <code>Main</code></td></tr>
+          <tr><td>8-1</td><td><code>recipe_8_1_ii</code></td>
+            <td>The same four infrastructure beans replaced by <code>@EnableBatchProcessing</code>; the
+              module keeps only <code>dataSource</code>, <code>transactionManager</code> and the schema
+              populator. <code>Main</code> now resolves the infrastructure by bean name.</td>
+            <td><code>config/BatchConfiguration</code>, <code>Main</code></td></tr>
+          <tr><td>8-2</td><td><code>recipe_8_2_i</code></td>
+            <td>First job and step. <code>JobBuilder</code> and <code>StepBuilder</code>,
+              <code>chunk(5, txManager)</code>, reader assembled from
+              <code>DefaultLineMapper</code> + <code>DelimitedLineTokenizer</code> +
+              <code>BeanWrapperFieldSetMapper</code>, writer assembled from
+              <code>JdbcBatchItemWriter</code> + <code>BeanPropertyItemSqlParameterSourceProvider</code>.</td>
+            <td><code>config/UserJob</code>, <code>Main</code>, <code>UserRegistration</code></td></tr>
+          <tr><td>8-2</td><td><code>recipe_8_2_ii</code></td>
+            <td>Identical job expressed with <code>FlatFileItemReaderBuilder</code> and
+              <code>JdbcBatchItemWriterBuilder.beanMapped()</code>. The input <code>Resource</code> moves
+              from a <code>@Value</code> field to a constructor parameter, and the INSERT string gains a
+              trailing semicolon.</td>
+            <td><code>config/UserJob</code>, <code>Main</code>, <code>UserRegistration</code></td></tr>
+          <tr><td>8-3</td><td><code>recipe_8_3</code></td>
+            <td>Custom item reader and writer against a service interface. Library-style recipe: no
+              <code>Main</code>, no <code>@Configuration</code>, no job or step in the module — the four
+              classes exist to be wired by a later job definition.</td>
+            <td><code>UserRegistrationItemReader</code>, <code>UserRegistrationServiceItemWriter</code>,
+              <code>UserRegistrationService</code>, <code>UserRegistration</code></td></tr>
+          <tr><td>8-4</td><td><code>recipe_8_4</code></td>
+            <td>The processor slot: normalises ZIP and phone to digits, drops rows whose state code is
+              not in a fixed list by returning <code>null</code>. <code>step1</code> gains
+              <code>.processor(processor)</code>. This module also renames the record component
+              <code>stat</code>, spelled that way in 8-2 and 8-3, to <code>state</code>.</td>
+            <td><code>UserRegistrationValidationItemProcessor</code>, <code>config/UserJob</code></td></tr>
+          <tr><td>8-5</td><td><code>recipe_8_5</code></td>
+            <td>Fault tolerance scaffolding only: <code>.faultTolerant()</code> is called and the
+              <code>noRollback</code> / <code>retry</code> lines are left as comments. No <code>skip</code>,
+              no retry list. Its <code>batch.properties</code> is the first to point at Derby.</td>
+            <td><code>config/UserJob</code>, <code>config/BatchConfiguration</code>, <code>Main</code></td></tr>
+          <tr><td>8-6</td><td><code>recipe_8_6_i</code></td>
+            <td>Chunk-level retry declared on the step: <code>.retryLimit(3).retry(DeadlockLoserDataAccessException.class)</code>.</td>
+            <td><code>config/UserJob</code>, <code>config/BatchConfiguration</code></td></tr>
+          <tr><td>8-6</td><td><code>recipe_8_6_ii</code></td>
+            <td>Programmatic retry inside the writer: a per-item <code>RetryTemplate.execute</code> fed by
+              an <code>ExponentialBackOffPolicy</code> (1 s initial, 10 s max, multiplier 2) declared as
+              beans in <code>BatchConfiguration</code>.</td>
+            <td><code>RetryableUserRegistrationServiceItemWriter</code>, <code>config/BatchConfiguration</code></td></tr>
+          <tr><td>8-6</td><td><code>recipe_8_6_iii</code></td>
+            <td>Declarative retry: <code>@EnableRetry</code> plus <code>@Retryable(backoff = @Backoff(delay
+              = 1000, maxDelay = 10000, multiplier = 2))</code> on the service interface method.</td>
+            <td><code>UserRegistrationService</code>, <code>config/BatchConfiguration</code></td></tr>
+          <tr><td>8-7</td><td><code>recipe_8_7</code></td>
+            <td>A <code>JobExecutionDecider</code> that returns <code>FlowExecutionStatus.FAILED</code> or
+              <code>COMPLETED</code>. The module contains only this class — no job, no step, no
+              <code>Main</code>, and no <code>decision()</code> or <code>split()</code> call exists
+              anywhere in the chapter.</td>
+            <td><code>HoroscopeDecider</code></td></tr>
+          <tr><td>8-8</td><td><code>recipe_8_8_i</code></td>
+            <td>Baseline for the async series: <code>@EnableBatchProcessing</code>, no task executor bean,
+              <code>.faultTolerant()</code> with no policy attached.</td>
+            <td><code>config/BatchConfiguration</code>, <code>config/UserJob</code>, <code>Main</code></td></tr>
+          <tr><td>8-8</td><td><code>recipe_8_8_iI</code> (capital <code>I</code> in the directory name)</td>
+            <td>Adds a <code>SimpleAsyncTaskExecutor taskExecutor()</code> bean for the launcher to use.
+              Its <code>Main</code> is the odd one out: it builds a <code>ClassPathXmlApplicationContext</code>
+              from <code>batch.xml</code> and <code>user-job.xml</code>, and neither file exists in the module.</td>
+            <td><code>config/BatchConfiguration</code>, <code>Main</code></td></tr>
+          <tr><td>8-8</td><td><code>recipe_8_8_iii</code></td>
+            <td>Ties the executor to the batch namespace by name:
+              <code>@EnableBatchProcessing(taskExecutorRef = "customTaskExecutor")</code>. Still carries the
+              XML <code>Main</code> from 8-8_iI.</td>
+            <td><code>config/BatchConfiguration</code>, <code>config/UserJob</code>, <code>Main</code></td></tr>
+          <tr><td>8-8</td><td><code>recipe_8_8_iv</code></td>
+            <td><code>@EnableScheduling</code> and <code>@EnableAsync</code> plus
+              <code>ThreadPoolTaskExecutor</code> (group <code>batch-executor</code>, max 10) and
+              <code>ThreadPoolTaskScheduler</code> (group <code>batch-scheduler</code>, pool 10); a
+              <code>@Component</code> scheduler relaunches the job on a fixed delay. Also the only module
+              still on the Spring Batch 4 <code>JobBuilderFactory</code> / <code>StepBuilderFactory</code> API.</td>
+            <td><code>scheduler/JobScheduler</code>, <code>config/BatchConfiguration</code>, <code>config/UserJob</code></td></tr>
+          <tr><td>8-9</td><td><code>recipe_8_9</code></td>
+            <td>Scheduler-driven job as the standard shape: same executors, same
+              <code>@Scheduled(fixedDelay = 1000 * 10)</code>, job parameters built with
+              <code>addLocalDateTime</code> and <code>addString</code>.</td>
+            <td><code>scheduler/JobScheduler</code>, <code>config/UserJob</code>, <code>Main</code></td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The chunk-oriented step every recipe shares</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    csv["registrations.csv in the user home"] --> rd["csvFileReader, a FlatFileItemReader"]
+    rd --> tok["DelimitedLineTokenizer with 11 names"]
+    tok --> lmap["DefaultLineMapper plus BeanWrapperFieldSetMapper"]
+    lmap --> rec["one UserRegistration per line"]
+    subgraph job["insertIntoDbFromCsvJob, built by JobBuilder"]
+        subgraph step["step1, chunk of 5 with PlatformTransactionManager"]
+            direction LR
+            proc["validatingItemProcessor, added in 8-4"] --> wr["jdbcItemWriter, a JdbcBatchItemWriter"]
+        end
+    end
+    rec --> proc
+    wr --> tbl["USER_REGISTRATION table"]
+    job --> jr["JobRepository"]
+    step --> jr
+    jr --> meta["BATCH_JOB_INSTANCE, BATCH_JOB_EXECUTION, BATCH_JOB_PARAMS, BATCH_STEP_EXECUTION"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Left to right is the data path
+      <em>inside one chunk</em>: <code>FlatFileItemReader.read()</code> pulls a line, the tokenizer splits
+      it on commas, <code>DefaultLineMapper</code> hands the <code>FieldSet</code> to
+      <code>BeanWrapperFieldSetMapper</code>, which produces the <code>UserRegistration</code> that is fed
+      to the processor. In <code>recipe_8_2_i</code> and <code>_ii</code> the processor edge is absent from
+      the builder chain, so items go straight to the writer; from <code>recipe_8_4</code> onward
+      <code>.processor(processor)</code> is present and a <code>null</code> return removes the item from
+      the chunk. The writer receives the whole accumulated chunk, not one item at a time — that is the
+      definition of chunk-oriented processing and it is why <code>chunk(5, txManager)</code> is the single
+      most load-bearing call in the chapter. Both edges into <code>JobRepository</code> are the metadata
+      writes: the job and step lifecycle events plus the per-commit counters, landing in the
+      <code>BATCH_*</code> tables that live in the same H2 file as the business table.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Recipe lineage: what each module changes over its neighbour</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    a1["8-1_i hand-wired infrastructure"] --> a2["8-1_ii EnableBatchProcessing"]
+    a2 --> b1["8-2_i first job, setter assembly"]
+    b1 --> b2["8-2_ii item builders"]
+    b1 --> c["8-3 custom reader and writer classes, no Main"]
+    b2 --> d["8-4 chunk gains an ItemProcessor"]
+    d --> e["8-5 faultTolerant, policies commented out"]
+    e --> f1["8-6_i step retryLimit 3"]
+    f1 --> f2["8-6_ii RetryTemplate in a writer"]
+    f2 --> f3["8-6_iii EnableRetry and Retryable on the service"]
+    f3 --> g["8-7 HoroscopeDecider, a lone class"]
+    g --> h1["8-8_i baseline, no task executor"]
+    h1 --> h2["8-8_iI SimpleAsyncTaskExecutor bean, XML Main"]
+    h2 --> h3["8-8_iii taskExecutorRef customTaskExecutor"]
+    h3 --> h4["8-8_iv EnableScheduling, EnableAsync, JobScheduler"]
+    h4 --> i["8-9 JobScheduler owns the launch"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> This is the reading order, not a dependency
+      graph — no module depends on another; each is a standalone Gradle project under
+      <code>ch08/</code> that copies its predecessor and edits one thing. The evidence for the ordering is
+      that the bean names (<code>csvFileReader</code>, <code>jdbcItemWriter</code>, <code>step1</code>,
+      <code>insertIntoDbFromCsvJob</code>) and the job and step display names are byte-identical across
+      twelve modules, while the deltas are single lines: <code>8-2_i</code> to <code>8-2_ii</code> swaps
+      setters for <code>FlatFileItemReaderBuilder</code>; <code>8-4</code> adds the processor;
+      <code>8-5</code> to <code>8-6_i</code> fills in the retry call that <code>8-5</code> left commented;
+      the <code>8-8</code> chain replaces the launcher's threading model. Two side branches
+      (<code>8-3</code>, <code>8-7</code>) contribute classes without a runnable entry point, so they are
+      dead ends in the build sense.</p>
+    </section>
+
+    <section id="infrastructure">
+      <h2>Declaring the batch infrastructure (8-1)</h2>
+      <p><code>ch08/recipe_8_1_i</code> is the chapter's Rosetta stone because it names every bean Spring
+      Batch needs and shows who consumes it. <code>jobRepository()</code> is a
+      <code>JobRepositoryFactoryBean</code> given the <code>DataSource</code> and the
+      <code>PlatformTransactionManager</code>; <code>jobLauncher()</code> is a
+      <code>TaskExecutorJobLauncher</code> given that repository; <code>jobRegistry()</code> is a plain
+      <code>MapJobRegistry</code>; and <code>jobRegistryBeanPostProcessor()</code> is what gets each
+      <code>Job</code> bean into that registry at context refresh, which is why the recipe can later do
+      <code>context.getBean(Job.class)</code>. Schema comes from <code>DataSourceInitializer</code> with a
+      <code>ResourceDatabasePopulator</code> that runs
+      <code>org/springframework/batch/core/schema-h2.sql</code> (inside the spring-batch-core jar) followed
+      by <code>sql/reset_user_registration.sql</code>, with <code>setContinueOnError(true)</code> so a
+      second run does not die on the existing <code>USER_REGISTRATION</code> table.</p>
+      <p><code>ch08/recipe_8_1_ii</code> deletes those four bean methods and puts
+      <code>@EnableBatchProcessing</code> on the class instead. The change is observable in
+      <code>Main</code>: the hand-wired module asks for beans by type, the annotated one asks
+      <code>getBean("jobRegistry", …)</code>, <code>getBean("jobLauncher", …)</code>,
+      <code>getBean("jobRepository", …)</code> — the fixed names Spring Batch's own registrar publishes.
+      From <code>recipe_8_2_ii</code> onward a handful of modules drop the explicit
+      <code>transactionManager</code> bean and let the annotation supply it: <code>recipe_8_5</code>
+      declares no transaction manager at all yet injects a <code>PlatformTransactionManager</code> into
+      <code>UserJob</code>'s constructor, which only resolves if <code>@EnableBatchProcessing</code>
+      exposes one over the single <code>DataSource</code> bean.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Property source to container to resolved beans, as wired in recipe_8_1_i</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    props["batch.properties, PropertySource"] --> env["Environment"]
+    env --> ds["dataSource, DriverManagerDataSource"]
+    ds --> tx["transactionManager, DataSourceTransactionManager"]
+    schema["spring-batch-core jar, schema-h2.sql"] --> pop["ResourceDatabasePopulator, continueOnError"]
+    reset["sql/reset_user_registration.sql"] --> pop
+    ds --> init["dataSourceInitializer"]
+    pop --> init
+    init --> h2["H2 file database, ~/batch"]
+    ds --> jrf["jobRepository, JobRepositoryFactoryBean"]
+    tx --> jrf
+    jrf --> jr["JobRepository"]
+    jr --> jl["jobLauncher, TaskExecutorJobLauncher"]
+    jr --> reg["jobRegistry, MapJobRegistry"]
+    reg --> bpp["jobRegistryBeanPostProcessor"]
+    bpp --> jobs["each Job bean registered at refresh"]
+    main["Main, AnnotationConfigApplicationContext"] --> reg
+    main --> jl
+    main --> jr
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Start at <code>batch.properties</code>:
+      <code>@PropertySource("classpath:batch.properties")</code> loads it into the
+      <code>Environment</code>, and the <code>dataSource(Environment)</code> bean method pulls
+      <code>datasource.url</code>, <code>datasource.username</code>, <code>datasource.password</code> with
+      <code>getRequiredProperty</code> on the URL only — so a wrong key name fails at refresh, not at
+      first connection. <code>DriverManagerDataSource</code> opens a fresh connection per request (no pool;
+      that matters for the Derby variants in 8-5 and later). <code>DataSourceInitializer</code> is a
+      <code>InitializingBean</code>, so the two scripts run the moment the container is refreshed, before
+      any job executes. <code>JobRepositoryFactoryBean</code> is a <code>FactoryBean</code>: the container
+      exposes the <code>JobRepository</code> it builds, and that object is the only path to the metadata
+      tables. <code>TaskExecutorJobLauncher</code> holds the repository and is what <code>Main</code> calls
+      <code>run</code> on. Finally, <code>JobRegistryBeanPostProcessor</code> is the reason a
+      <code>Job</code> declared as a plain <code>@Bean</code> in <code>UserJob</code> is discoverable by
+      name — without it, <code>getBean(Job.class)</code> still works but the registry stays empty.</p>
+      <div class="callout info"><h4>Two naming quirks worth knowing before you copy either module</h4>
+        <p>In <code>recipe_8_1_ii</code>, <code>recipe_8_2_i</code> and most later modules the bean method
+        called <code>databasePopulator()</code> actually returns a <code>DataSourceInitializer</code>, so
+        the bean named <code>databasePopulator</code> is the initializer, not the populator. And in
+        <code>recipe_8_1_i</code> the same role is played by a method honestly named
+        <code>dataSourceInitializer</code>. Otherwise the two files are interchangeable.</p></div>
+    </section>
+
+    <section id="pipeline">
+      <h2>Reader, processor, writer (8-2, 8-3, 8-4)</h2>
+      <p><code>ch08/recipe_8_2_i/src/main/java/com/apress/spring6recipes/springbatch/config/UserJob.java</code>
+      is the fullest statement of the item pipeline in the chapter. The reader is assembled in four beans:
+      <code>FlatFileItemReader.csvFileReader(…)</code> gets a <code>Resource</code> injected from
+      <code>@Value("file:${user.home}/batches/registrations.csv")</code> and a
+      <code>DefaultLineMapper</code>, which itself is built from a <code>DelimitedLineTokenizer</code>
+      (delimiter <code>,</code>, eleven names) and a <code>BeanWrapperFieldSetMapper</code> whose
+      <code>targetType</code> is <code>UserRegistration.class</code>. The writer is a
+      <code>JdbcBatchItemWriter</code> with a single multi-row INSERT and a
+      <code>BeanPropertyItemSqlParameterSourceProvider</code>, so <code>:firstName</code>-style
+      named parameters are filled from the item's bean properties — the same mapping
+      <code>recipe_8_2_ii</code> requests with <code>.beanMapped()</code>, collapsing both ends into builders:
+      <code>FlatFileItemReaderBuilder … .delimited().names(…)</code> and
+      <code>JdbcBatchItemWriterBuilder … .beanMapped()</code> — and the four intermediate beans disappear.</p>
+      <p><code>ch08/recipe_8_3</code> answers "what if my items come from a service, not a file". Its
+      <code>UserRegistrationItemReader</code> implements <code>ItemReader</code> directly and its
+      <code>UserRegistrationServiceItemWriter</code> implements <code>ItemWriter</code> and loops over the
+      <code>Chunk</code>, calling <code>registerUser</code> per item and logging the result. Note the
+      asymmetry the book's own code keeps: the reader asks the service for
+      <code>getOutstandingUserRegistrationBatchForDate(1, LocalDate.now())</code> <em>inside</em>
+      <code>read()</code> and builds a fresh iterator each call, so it returns the head of the outstanding
+      set every time rather than walking it — a stateful reader would hold the iterator between calls, or be
+      an <code>ItemStream</code> so its position is checkpointed. Since the module ships no job, that code
+      never runs here.</p>
+      <p><code>ch08/recipe_8_4</code> is the only module that puts a business rule inside the pipeline.
+      <code>UserRegistrationValidationItemProcessor.process(…)</code> strips non-digits from ZIP and phone,
+      checks phone length 10, ZIP length 5 or 9, and that the state code is in a hard-coded list, then
+      returns a <em>new</em> record with the normalised values — or returns <code>null</code>, which is how
+      Spring Batch expresses "filter this item out, it is not an error". Filtered items are counted in
+      <code>FILTER_COUNT</code>, a column already visible in the chapter's own
+      <code>sql/create_schema.sql</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The item contracts and the classes that implement them in ch08</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class UserRegistration {
+        String firstName
+        String lastName
+        String company
+        String address
+        String city
+        String state
+        String zip
+        String county
+        String url
+        String phoneNumber
+        String fax
+    }
+    class ItemReader {
+        read()
+    }
+    class ItemProcessor {
+        process()
+    }
+    class ItemWriter {
+        write(Chunk)
+    }
+    class UserRegistrationService {
+        getOutstandingUserRegistrationBatchForDate(int, LocalDate)
+        registerUser(UserRegistration)
+    }
+    class FlatFileItemReader
+    class JdbcBatchItemWriter
+    class UserRegistrationItemReader
+    class UserRegistrationServiceItemWriter
+    class RetryableUserRegistrationServiceItemWriter
+    class UserRegistrationValidationItemProcessor
+    class Chunk
+    FlatFileItemReader --|> ItemReader
+    UserRegistrationItemReader --|> ItemReader
+    UserRegistrationValidationItemProcessor --|> ItemProcessor
+    JdbcBatchItemWriter --|> ItemWriter
+    UserRegistrationServiceItemWriter --|> ItemWriter
+    RetryableUserRegistrationServiceItemWriter --|> ItemWriter
+    UserRegistrationItemReader --> UserRegistrationService : queries the outstanding set
+    UserRegistrationServiceItemWriter --> UserRegistrationService : registers each item
+    RetryableUserRegistrationServiceItemWriter --> UserRegistrationService : registers inside RetryTemplate execute
+    ItemWriter o-- Chunk : receives the whole buffer
+    Chunk o-- UserRegistration : carries
+    ItemReader ..> UserRegistration : produces
+    UserRegistrationValidationItemProcessor ..> UserRegistration : returns null to filter
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The three interfaces at the top are the only
+      thing the step builder cares about — <code>SimpleStepBuilder.reader(…)
+      .processor(…).writer(…)</code> accepts them by type, which is why <code>recipe_8_2_i</code> can
+      inject <code>ItemReader of UserRegistration</code> and receive the
+      <code>FlatFileItemReader</code> bean. The solid arrows on the right show the two interchangeable
+      implementations of each slot: file plus JDBC in recipes 8-2, 8-4 to 8-9, and the service-backed pair
+      from <code>recipe_8_3</code> (with <code>recipe_8_6_ii</code>'s retrying writer as its
+      hardening). The <code>ItemWriter to Chunk</code> edge is the one people get wrong: the writer is
+      invoked once per chunk with everything buffered, whereas
+      <code>UserRegistrationServiceItemWriter</code> and <code>RetryableUserRegistrationServiceItemWriter</code>
+      both loop over it, restoring per-item semantics by hand.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Inside step1: one chunk of five, from read to commit</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant SS as SimpleStep
+    participant RD as FlatFileItemReader
+    participant PR as UserRegistrationValidationItemProcessor
+    participant WR as JdbcBatchItemWriter
+    participant TX as PlatformTransactionManager
+    SS->>TX: open the chunk transaction through TransactionTemplate
+    loop up to 5 items
+        SS->>RD: read()
+        RD-->>SS: a UserRegistration, or null when the file ends
+        SS->>PR: process(item)
+        PR-->>SS: the normalised record, or null which filters the item away
+        SS->>SS: append every non null result to the Chunk
+    end
+    SS->>WR: write(Chunk of at most 5 items)
+    WR-->>SS: one batched INSERT into USER_REGISTRATION
+    SS->>TX: commit the chunk
+    SS->>SS: record read, filter, write and commit counts
+    Note over SS,RD: null from read() closes the loop early and the partial chunk is still written
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> <code>SimpleStep</code> — what
+      <code>StepBuilder.chunk(5, txManager).build()</code> produces — is the driver. It opens a
+      transaction, then calls <code>FlatFileItemReader.read()</code> repeatedly; the reader pulls one line
+      per call and returns <code>null</code> at end of file, and that <code>null</code> is the loop's
+      terminator, not an error. Each item crosses to the processor; in <code>recipe_8_4</code> a row whose
+      state is not in the list or whose digits come back the wrong length yields <code>null</code> and is
+      dropped, which is exactly the <code>FILTER_COUNT</code> you can then read out of
+      <code>BATCH_STEP_EXECUTION</code>. Only after five survivors does the writer see anything, and it
+      sees a <code>Chunk</code>. The commit is <em>per chunk</em>, so a failure in the third chunk
+      reprocesses items 11 to 15, not the whole file — that is the property every fault-tolerance recipe
+      in 8-5 and 8-6 is exploiting.</p>
+    </section>
+
+    <section id="execution">
+      <h2>Launching a job and writing metadata</h2>
+      <p>Each <code>Main</code> in the chapter is the same five moves: build an
+      <code>AnnotationConfigApplicationContext</code> over <code>BatchConfiguration</code>, fetch
+      <code>JobLauncher</code> and <code>Job</code>, build a <code>JobParameters</code> containing a
+      <code>date</code>, call <code>jobLauncher.run(job, jobParameters)</code>, then spin
+      <code>while (batchStatus.isRunning())</code> (500 ms in <code>recipe_8_2_i</code> and
+      <code>recipe_8_6_i</code> via <code>Utils.sleep</code> from <code>shared-resources</code>,
+      1000 ms elsewhere) before printing <code>getExitStatus().getExitCode()</code> and
+      <code>getJobInstance().getId()</code>.</p>
+      <p>The <code>date</code> parameter is not decoration. Spring Batch identifies a
+      <code>JobInstance</code> by job name plus the <em>identifying</em> parameters, and the constraint is
+      right there in the chapter's own DDL: <code>constraint JOB_INST_UN unique (JOB_NAME, JOB_KEY)</code>
+      in <code>ch08/recipe_8_2_i/src/main/resources/sql/create_schema.sql</code>. Changing the date on
+      every run is what lets the recipe be launched twice in a row and get a new instance id printed. Drop
+      it and the second launch collides with the completed one instead of doing work.</p>
+      <p>Metadata bookkeeping is entirely behind <code>JobRepository</code>. The reference DDL shipped in
+      each module documents the tables and the counters you can query afterwards —
+      <code>COMMIT_COUNT</code>, <code>READ_COUNT</code>, <code>FILTER_COUNT</code>,
+      <code>WRITE_COUNT</code>, <code>READ_SKIP_COUNT</code>, <code>WRITE_SKIP_COUNT</code>,
+      <code>PROCESS_SKIP_COUNT</code>, <code>ROLLBACK_COUNT</code> on
+      <code>BATCH_STEP_EXECUTION</code>. Worth being precise about two things: that
+      <code>sql/create_schema.sql</code> is <em>not</em> executed (the header admits it was copied from a
+      Spring Batch 2.1.1 release and its <code>BATCH_JOB_PARAMS</code> table name predates 5.0); the
+      scripts the populator actually runs are the jar's <code>schema-h2.sql</code> and the module's
+      <code>reset_user_registration.sql</code>, which only creates <code>USER_REGISTRATION</code>.
+      <code>drop_all.sql</code> and <code>truncate_all.sql</code> are shipped but unreferenced.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">One launch, end to end, including the retry and failure paths</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main
+    participant JL as TaskExecutorJobLauncher
+    participant JR as JobRepository
+    participant H2 as BATCH tables in the H2 file
+    participant ST as step1, chunk of 5
+    M->>JL: run(job, jobParameters) where date is the identifying parameter
+    JL->>JR: createJobExecution for the job name and parameters
+    JR->>H2: insert BATCH_JOB_INSTANCE, BATCH_JOB_EXECUTION and the step execution row
+    JR-->>JL: JobExecution carrying a fresh JobInstance id
+    JL->>ST: execute the step
+    loop each chunk until the reader returns null
+        ST->>ST: read, process, write
+        ST->>JR: update the step execution counts and context
+        JR->>H2: COMMIT_COUNT, READ_COUNT, FILTER_COUNT, WRITE_COUNT
+        alt a write throws DeadlockLoserDataAccessException, recipes 8-6 only
+            ST->>JR: transaction rolled back, ROLLBACK_COUNT
+            ST->>ST: retry the whole chunk while attempts remain under retryLimit 3
+        else any other exception
+            ST->>ST: no skip rule exists in ch08, so the item cannot be skipped
+            ST-->>JL: step FAILED, job FAILED
+        end
+    end
+    ST-->>JL: StepExecution with its terminal BatchStatus
+    JL->>JR: update the job execution with end time and exit code
+    M->>M: poll getStatus().isRunning() then print the exit code and instance id
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Because the launcher is a
+      <code>TaskExecutorJobLauncher</code> (<code>recipe_8_1_i:75</code>), <code>run(...)</code> hands the
+      job to another thread and returns immediately — that single fact explains why every <code>Main</code>
+      in this chapter has a busy-wait loop on <code>BatchStatus.isRunning()</code> rather than a blocking
+      call. <code>JobRepository.createJobExecution</code> is the gatekeeper: it creates or refuses the
+      instance under <code>JOB_INST_UN</code>. From there the step's own transaction manages data
+      consistency while <code>JobRepository</code> updates metadata in its transaction, which is why a
+      crashed run still shows accurate counters in <code>BATCH_STEP_EXECUTION</code>. The retry branch is
+      chunk level, not item level: the transaction rolls back, the reader rewinds to the checkpoint stored
+      in <code>BATCH_STEP_EXECUTION_CONTEXT</code> (a <code>FlatFileItemReader</code> is an
+      <code>ItemStream</code>, so it can), and up to five items are read, processed and written again —
+      three times at most under <code>retryLimit(3)</code>. The skip branch is drawn but unreachable: no
+      module in ch08 calls <code>.skip(...)</code> or <code>.skipLimit(...)</code>, so
+      <code>READ_SKIP_COUNT</code>, <code>PROCESS_SKIP_COUNT</code> and <code>WRITE_SKIP_COUNT</code>
+      stay at zero and any non-retried exception ends the step.</p>
+    </section>
+
+    <section id="fault">
+      <h2>Fault tolerance: retry without skip (8-5, 8-6)</h2>
+      <p><code>ch08/recipe_8_5</code> is the honest starting point. Its step calls
+      <code>.faultTolerant()</code> and nothing else — the two lines that would name a policy are
+      comments, one of them literally <code>.noRollback(com.yourdomain.exceptions.YourBusinessException.class)</code>
+      and one bare <code>.retry()</code>. Calling <code>faultTolerant()</code> on its own changes nothing
+      observable: it just creates the <code>SimpleStepBuilder</code> fault-tolerant branch with the default
+      policies, so every exception still rolls the chunk back and fails the step.</p>
+      <p>The three <code>8-6</code> modules are the same job with retry bolted on in three different
+      places, and the chapter keeps the step-level policy in all three:
+      <code>.retryLimit(3).retry(DeadlockLoserDataAccessException.class)</code> appears in
+      <code>recipe_8_6_i:62</code>, <code>recipe_8_6_ii:61</code> and <code>recipe_8_6_iii:61</code>. That
+      is the interesting part — the variants do not replace it, they add a <em>second</em>, narrower retry
+      underneath it:</p>
+      <ul>
+        <li><code>recipe_8_6_i</code> — step level only. One policy, five items retried as a unit.</li>
+        <li><code>recipe_8_6_ii</code> — declares <code>RetryTemplate</code> and
+          <code>ExponentialBackOffPolicy</code> beans and a
+          <code>RetryableUserRegistrationServiceItemWriter</code> that wraps each
+          <code>registerUser</code> call in <code>retryTemplate.execute(...)</code>, so retry happens per
+          item before the chunk ever fails. Caveat from the source: that writer is never registered as a
+          <code>@Bean</code> — <code>UserJob.jdbcItemWriter</code> is still the injected
+          <code>ItemWriter</code>, so the retry template is inert unless you swap the writer.</li>
+        <li><code>recipe_8_6_iii</code> — moves the policy onto the business contract:
+          <code>@Retryable(backoff = @Backoff(delay = 1000, maxDelay = 10000, multiplier = 2))</code> on
+          <code>UserRegistrationService.registerUser(...)</code>, activated by <code>@EnableRetry</code> on
+          <code>BatchConfiguration</code>. Now any caller of the service retries, batch or not.</li>
+      </ul>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Where an exception lands, and which of the three 8-6 policies catches it</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    boom["an exception escapes read, process or write"] --> insvc{"did it come from the service call, 8-6_iii"}
+    insvc -- "yes, proxy intercepts registerUser" --> r1["Retryable with Backoff 1000 to 10000, multiplier 2"]
+    r1 --> ok1{"succeeded within the retry policy"}
+    ok1 -- "yes" --> cont["chunk continues normally"]
+    ok1 -- "no" --> step
+    insvc -- "no, or the writer was swapped, 8-6_ii" --> step{"step faultTolerant retry list contains it"}
+    step -- "yes, DeadlockLoserDataAccessException" --> rb["roll the chunk back, ROLLBACK_COUNT plus 1"]
+    rb --> lim{"fewer than 3 attempts used"}
+    lim -- "yes" --> rew["reader rewinds to the checkpoint and the chunk is reprocessed"]
+    rew --> cont
+    lim -- "no" --> fail["step FAILED, job FAILED"]
+    step -- "no" --> skip{"any skip rule declared"}
+    skip -- "none exist anywhere in ch08" --> fail
+    skip -- "would have to be added" --> drop["READ, PROCESS or WRITE_SKIP_COUNT plus 1, item dropped"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Take the middle path first, because it is the
+      one all three modules actually configure: the step builder's retry list holds exactly
+      <code>DeadlockLoserDataAccessException</code>, so the chunk transaction is rolled back, the
+      <code>ItemStream</code> readers are reset to the position recorded in the step execution context, and
+      the entire chunk — up to five reads, five processes and one write — is attempted again, three times
+      in total. Anything the retry list does not name goes straight down the right-hand branch and, with no
+      <code>skip</code> call in the chapter, terminates the step. The left-hand branch is the 8-6_iii
+      addition: <code>@EnableRetry</code> puts an AOP proxy in front of the service, so retry happens
+      before the exception can even reach the step, per item, with the exponential backoff. 8-6_ii sits
+      between the two by calling <code>RetryTemplate.execute</code> explicitly inside the writer — same
+      effect, no proxy, and you can see the <code>RetryContext</code> if you want it.</p>
+      <div class="callout"><h4>Retry granularity is the real lesson</h4>
+        <p>A step-level retry re-runs up to five <code>INSERT</code>s, so the writer must be idempotent or
+        the table must reject duplicates. A per-item retry inside the writer re-runs one
+        <code>registerUser</code> call only. Nothing in the ch08 <code>USER_REGISTRATION</code> DDL enforces
+        uniqueness, so the difference is observable as duplicate rows — that is why 8-6_ii and 8-6_iii exist
+        at all.</p></div>
+    </section>
+
+    <section id="flow">
+      <h2>Flow control and execution status (8-7)</h2>
+      <p><code>ch08/recipe_8_7</code> contains exactly one class and no configuration, no job and no
+      <code>Main</code>. <code>HoroscopeDecider implements JobExecutionDecider</code> and its
+      <code>decide(JobExecution, StepExecution)</code> rolls <code>ThreadLocalRandom.current().nextDouble()</code>
+      and returns <code>FlowExecutionStatus.FAILED</code> when it exceeds 0.9, otherwise
+      <code>FlowExecutionStatus.COMPLETED</code>. That is the whole recipe: a decider is a callback that
+      turns an execution into a routing key. Be aware of what the module does <em>not</em> show — the
+      consuming side. There is no <code>decision(…)</code>, <code>split(…)</code>, <code>flow(…)</code> or
+      <code>next(…)</code> call anywhere in the chapter's twelve job definitions, so the routing table that
+      would interpret COMPLETED versus FAILED is left to the reader.</p>
+      <p>What the chapter <em>does</em> exercise is status reading. Every <code>Main</code> and both
+      <code>JobScheduler</code> classes consume <code>BatchStatus</code> and
+      <code>ExitStatus</code>, and only ever compare against running or print a code — no module assigns
+      <code>STOPPED</code>, <code>ABANDONED</code> or <code>UNKNOWN</code>, and there is no
+      <code>JobExplorer</code> or <code>JobOperator</code> bean in any of the sixteen modules, which is the
+      machinery a stop would need.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The decider's two outcomes and the routing that is missing from the module</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    call["decide(jobExecution, stepExecution) invoked between steps"] --> roll["ThreadLocalRandom draw compared against 0.9"]
+    roll --> onein["about one call in ten"]
+    roll --> nine["about nine calls in ten"]
+    onein --> f["FlowExecutionStatus.FAILED"]
+    nine --> c["FlowExecutionStatus.COMPLETED"]
+    f --> route["a decision node would map this status to a next step"]
+    c --> route
+    route --> absent["no job in recipe_8_7 defines that mapping, the module ships only the class"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The signature is the contract: the decider
+      receives the live <code>JobExecution</code> and the <code>StepExecution</code> that just finished (the
+      latter is <code>null</code> when the decision sits before the first step), and its return value is a
+      <em>status string</em>, not a step reference. The job definition is what binds
+      <code>FlowExecutionStatus</code> names to targets, and since <code>recipe_8_7</code> has no job, the
+      only honest reading of the diagram is that the last edge is unimplemented in the source. Use the
+      <code>recipe_8_2_ii</code> builder chain and add a decision node to see the routing.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">State</span>
+          <span class="dtitle">BatchStatus transitions that ch08 code actually observes</span></figcaption>
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> CREATED
+    CREATED --> RUNNING : JobRepository.createJobExecution inserted the instance and execution rows
+    RUNNING --> COMPLETED : every chunk committed and the reader hit end of file
+    RUNNING --> FAILED : an exception survived retryLimit 3, and nothing is skippable
+    COMPLETED --> [*] : Main prints the exit code and the JobInstance id
+    FAILED --> [*] : Main prints the exit code and the JobInstance id
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The transitions are the ones the source can
+      produce: <code>JobLauncher.run</code> moves the execution out of <code>CREATED</code> once
+      <code>JobRepository</code> has written its rows, and the terminal state is decided by the chunk loop.
+      The loop <code>while (batchStatus.isRunning()) { … sleep … }</code> is a hand-rolled wait on this
+      machine, and it is more fragile than it looks — <code>batchStatus</code> is captured once from
+      <code>jobExecution.getStatus()</code> into a local before the loop and never refreshed, so it is a
+      snapshot rather than a poll. Either the execution is already terminal at the first test and the body
+      never runs, or the flag stays <code>RUNNING</code> forever and <code>Main</code> spins. The states the
+      metadata schema permits
+      but these recipes never reach are <code>STOPPING</code>, <code>STOPPED</code>,
+      <code>ABANDONED</code>, <code>UNKNOWN</code> and <code>NO_START</code>: they require an operator call
+      that is not in this chapter.</p>
+    </section>
+
+    <section id="scheduling">
+      <h2>Async launching and scheduled launching (8-8, 8-9)</h2>
+      <p>The <code>8-8</code> series is one question — who owns the thread — answered four times.</p>
+      <table>
+        <thead><tr><th>Module</th><th>Executor declared</th><th>How the launcher finds it</th></tr></thead>
+        <tbody>
+          <tr><td><code>recipe_8_8_i</code></td><td>none</td><td>nothing but <code>@EnableBatchProcessing</code></td></tr>
+          <tr><td><code>recipe_8_8_iI</code></td><td><code>SimpleAsyncTaskExecutor taskExecutor()</code></td>
+            <td>by the conventional bean name <code>taskExecutor</code></td></tr>
+          <tr><td><code>recipe_8_8_iii</code></td><td><code>SimpleAsyncTaskExecutor customTaskExecutor()</code></td>
+            <td>by explicit reference: <code>@EnableBatchProcessing(taskExecutorRef = "customTaskExecutor")</code></td></tr>
+          <tr><td><code>recipe_8_8_iv</code>, <code>recipe_8_9</code></td>
+            <td><code>ThreadPoolTaskExecutor taskExecutor()</code> group <code>batch-executor</code> max 10,
+              and <code>ThreadPoolTaskScheduler taskScheduler()</code> group <code>batch-scheduler</code> pool 10</td>
+            <td><code>@EnableAsync</code> and <code>@EnableScheduling</code> pick the beans up by type</td></tr>
+        </tbody>
+      </table>
+      <p><code>recipe_8_8_iv</code> is where the job gets a timer. <code>JobScheduler</code> is a
+      <code>@Component</code> constructor-injected with <code>JobLauncher</code> and <code>Job</code>;
+      <code>runRegistrationsJobOnASchedule()</code> carries
+      <code>@Scheduled(fixedDelay = 10_0000)</code> — note that literal is one hundred seconds, an
+      extra zero over the ten seconds the comment-free <code>recipe_8_9</code> version writes as
+      <code>fixedDelay = 1000 * 10</code>. Each tick builds parameters with
+      <code>addLocalDateTime("date", date)</code> plus <code>addString("input.file", "registrations")</code>
+      and calls <code>jobLauncher.run(job, jobParameters)</code>, then prints the exit code. Because the
+      date is the identifying parameter, every tick legitimately creates a new <code>JobInstance</code> —
+      which is exactly what you want here, and exactly what would blow up on <code>JOB_INST_UN</code> if you
+      dropped it from a scheduled job.</p>
+      <p>Two of these modules carry dead ends you should know about before running anything:
+      <code>recipe_8_8_iI/Main.java</code> and <code>recipe_8_8_iii/Main.java</code> both construct a
+      <code>ClassPathXmlApplicationContext("batch.xml", "user-job.xml")</code>, and no XML exists anywhere in
+      <code>ch08</code>; <code>recipe_8_8_iI</code> also reads its DB username from the key
+      <code>datsSource.username</code>, which is not in <code>batch.properties</code>. And
+      <code>recipe_8_9/Main.java</code> asks for a job bean named <code>dailySalesFigures</code> that this
+      module does not define (its only <code>Job</code> bean is <code>insertIntoDbFromCsvJob</code>), while
+      its <code>JobScheduler</code> passes a <code>java.util.Date</code> to
+      <code>runRegistrationsJob(LocalDateTime)</code> — that does not compile.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">A scheduled tick relaunches the job (recipe_8_8_iv and recipe_8_9)</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant TS as ThreadPoolTaskScheduler, group batch-scheduler
+    participant SP as ScheduledAnnotationBeanPostProcessor
+    participant JS as JobScheduler component
+    participant JL as JobLauncher
+    participant JR as JobRepository
+    participant ST as step1
+    TS->>SP: the fixedDelay interval elapses
+    SP->>JS: runRegistrationsJobOnASchedule()
+    JS->>JS: runRegistrationsJob(LocalDateTime.now())
+    JS->>JS: JobParametersBuilder addLocalDateTime date, addString input.file
+    JS->>JL: run(job, jobParameters)
+    JL->>JR: createJobExecution, a new instance because the date changed
+    JR-->>JL: JobExecution
+    JL->>ST: execute the chunk loop again
+    ST-->>JL: StepExecution COMPLETED
+    JL-->>JS: JobExecution
+    JS->>JS: print the exit code, then wait for the next tick
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> <code>@EnableScheduling</code> registers
+      <code>ScheduledAnnotationBeanPostProcessor</code>, which discovers the <code>@Scheduled</code> method on
+      the <code>JobScheduler</code> bean and schedules it on the <code>ThreadPoolTaskScheduler</code> the
+      module declares — the thread group name <code>batch-scheduler</code> is what you will see in a thread
+      dump. The scheduler component holds <code>JobLauncher</code> and <code>Job</code> by constructor
+      injection, so no <code>ApplicationContext</code> lookup is needed any more; that is the structural
+      difference between 8-8 and the earlier recipes, where <code>Main</code> played container.
+      <code>run</code> is still non-blocking, and here nobody waits for it — the tick just prints the exit
+      code of whatever the launcher handed back, which in a synchronous test is the finished execution. The
+      <code>ThreadPoolTaskExecutor</code> named <code>taskExecutor</code> is what lets several job runs
+      overlap; with a fixed delay of ten seconds and a CSV big enough to take longer, you get concurrent
+      instances of the same job, which is the point of 8-8's <code>maxPoolSize(10)</code>.</p>
+    </section>
+
+    <section id="running">
+      <h2>Building and running the recipes</h2>
+      <p>Each module is its own Gradle project; <code>ch08/build.gradle</code> applies the shadow plugin to
+      all of them, attaches <code>spring-context</code>, <code>spring-jdbc</code>,
+      <code>spring-expression</code>, <code>spring-batch-core</code> and <code>h2</code>, and sets
+      <code>Main-Class</code> to <code>com.apress.spring6recipes.springbatch.Main</code>. The build is
+      finalised by <code>shadowJar</code>, so one command gives you a runnable fat jar:</p>
+      <pre><code>cd C:\Users\sahuk\IdeaProjects\spring-6-recipes
+./gradlew :ch08:recipe_8_2_ii:build
+java -jar ch08/recipe_8_2_ii/build/libs/recipe_8_2_ii-6.0.0-SNAPSHOT-all.jar</code></pre>
+      <p>Replace <code>recipe_8_2_ii</code> with any module directory name <em>exactly as spelled</em> —
+      <code>:ch08:recipe_8_8_iI:build</code> has a capital <code>I</code>, unlike its siblings.
+      <code>recipe_8_3</code> and <code>recipe_8_7</code> have no <code>Main</code>, so the manifest points
+      at a class that is not in the jar and <code>java -jar</code> cannot start them; build them to read
+      them. The toolchain is Java 19 with <code>--enable-preview</code> on compile, test and exec, so run the
+      jars on a matching JDK.</p>
+
+      <h3>Prerequisites the source actually imposes</h3>
+      <ul>
+        <li><strong>An input file.</strong> Every job reads
+          <code>@Value("file:${user.home}/batches/registrations.csv")</code>. No CSV is checked into the
+          chapter, so create <code>~/batches/registrations.csv</code> with eleven comma-separated columns
+          per row in the order <code>firstName, lastName, company, address, city, state, zip, county, url,
+          phoneNumber, fax</code> (the order the tokenizer names in all twelve job definitions).</li>
+        <li><strong>The database.</strong> <code>recipe_8_1_i</code>, <code>8_1_ii</code>,
+          <code>8_2_i</code>, <code>8_2_ii</code>, <code>8_3</code> and <code>8_4</code> point at
+          <code>jdbc:h2:~/batch</code>, which H2 creates on first run — no server, no port. (The
+          <code>8_3</code> copy is inert: that module has no configuration class.) Batch metadata
+          and <code>USER_REGISTRATION</code> land in the same file, so imported rows accumulate across runs:
+          the populator only ever runs <code>CREATE TABLE USER_REGISTRATION</code>, whose failure the
+          <code>continueOnError</code> flag swallows. Use the shipped-but-unreferenced
+          <code>sql/truncate_all.sql</code> by hand if you want a clean slate.</li>
+        <li><strong>Derby, if you trust the properties file.</strong> Every module from
+          <code>recipe_8_5</code> to <code>recipe_8_9</code> (ten of them) instead declares
+          <code>datasource.url=jdbc:derby://localhost:1527/batch;create=true</code> and
+          <code>datasource.driverClassName=org.apache.derby.jdbc.ClientDriver</code>, with
+          <code>app</code>/<code>app</code> credentials except in <code>recipe_8_8_iv</code>, which uses
+          <code>sa</code>/<code>sa</code>. Two things follow: no bean method ever reads
+          <code>datasource.driverClassName</code> — <code>DriverManagerDataSource</code> is configured with
+          URL, username and password only, so the driver has to be discoverable by <code>DriverManager</code>
+          — and the chapter's dependency list contains H2 only, so a Derby-backed run needs
+          <code>derbyclient</code> added to <code>ch08/build.gradle</code> (plus a Derby server on port 1527)
+          or the URL changed back to <code>jdbc:h2:~/batch</code>.</li>
+      </ul>
+
+      <div class="callout danger"><h4>Modules that need an edit before they start</h4>
+        <p>Verified in source, not inferred:</p>
+        <ul>
+          <li><code>recipe_8_5</code>, <code>8_8_i</code>, <code>8_8_iii</code> and <code>8_9</code> read
+            <code>env.getRequiredProperty("dataSource.url")</code> while their
+            <code>batch.properties</code> defines <code>datasource.url</code> — capital S. That throws at
+            context refresh, before any job runs.</li>
+          <li><code>recipe_8_5</code>'s <code>step1</code> takes an
+            <code>ItemProcessor&lt;UserRegistration, UserRegistration&gt;</code> parameter, but the module
+            contains no processor class and no processor bean (that is
+            <code>recipe_8_4</code>'s <code>UserRegistrationValidationItemProcessor</code>). The context
+            cannot satisfy the step.</li>
+          <li><code>recipe_8_8_iI</code> and <code>recipe_8_8_iii</code> <code>Main</code>s load
+            <code>batch.xml</code> and <code>user-job.xml</code>, which do not exist in the chapter; the Java
+            <code>@Configuration</code> classes in the same module are ignored by those entry points.
+            <code>recipe_8_8_iI</code> additionally reads <code>datsSource.username</code>.</li>
+          <li><code>recipe_8_8_iv</code>'s <code>UserJob</code> is the only one on the deprecated
+            <code>JobBuilderFactory</code> / <code>StepBuilderFactory</code> API and sets
+            <code>.transactionManager(new DataSourceTransactionManager())</code> — a transaction manager with
+            no <code>DataSource</code>, so it cannot govern the chunk.</li>
+          <li><code>recipe_8_9</code> does not compile: <code>JobScheduler</code> passes
+            <code>new Date()</code> to <code>runRegistrationsJob(LocalDateTime)</code>, and
+            <code>Main</code> resolves a <code>dailySalesFigures</code> job the module never defines.</li>
+          <li><code>recipe_8_2_i</code>, <code>recipe_8_2_ii</code> and <code>recipe_8_3</code> declare the
+            record component as <code>stat</code>, while the tokenizer names and the INSERT placeholder
+            <code>:state</code> both say <code>state</code> — so in those three modules the column can never
+            be bound. <code>recipe_8_4</code> renames it. Separately, the INSERT string in
+            <code>recipe_8_2_ii</code> (and <code>recipe_8_4</code>) ends with a trailing semicolon that the
+            other ten definitions do not carry.</li>
+        </ul>
+        <p>With the CSV in place and the H2 URL, <code>recipe_8_1_i</code>, <code>8_1_ii</code>,
+        <code>8_2_i</code>, <code>8_2_ii</code> and <code>8_4</code> are the modules whose properties,
+        property keys and bean graph are all self-consistent, so their context refreshes and their
+        <code>Main</code> reaches <code>jobLauncher.run</code>. The three <code>8_6</code> modules use
+        matching <code>datasource.*</code> keys in Java and only need the Derby URL swapped for
+        <code>jdbc:h2:~/batch</code>; the <code>8_8</code> modules additionally need their entry point
+        repaired. Where a writer binds a named parameter to a property the record does not expose under that
+        name, expect the failure at the first <code>write</code>, not at startup.</p></div>
+
+      <h3>Things to watch while a job runs</h3>
+      <ul>
+        <li>The console prints <code>Still running...</code> from the <code>isRunning()</code> loop in
+          <code>Main</code>, not from the batch itself — and per the caveat in
+          <a href="#flow">Flow control and execution status</a>, that flag is a snapshot, so you will see
+          either none of those lines or an endless stream of them.</li>
+        <li>After a run, query the metadata: <code>SELECT STEP_NAME, STATUS, COMMIT_COUNT, READ_COUNT,
+          FILTER_COUNT, WRITE_COUNT, ROLLBACK_COUNT FROM BATCH_STEP_EXECUTION ORDER BY STEP_EXECUTION_ID
+          DESC</code>. On <code>recipe_8_4</code> with a dirty CSV you should see
+          <code>READ_COUNT</code> greater than <code>WRITE_COUNT</code>, the gap being
+          <code>FILTER_COUNT</code>. On every module in the chapter the three skip counters read 0, because
+          no skip rule is declared.</li>
+        <li><code>recipe_8_1_i</code> and <code>recipe_8_1_ii</code> print the <code>JobRegistry</code>,
+          <code>JobLauncher</code> and <code>JobRepository</code> <code>toString</code>s and stop — that is
+          the entire intended output of recipe 8-1, an infrastructure smoke test.</li>
+      </ul>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">Generated from source in <code>ch08/</code> &mdash; 16 recipe modules of the Apress
+<em>Spring 6 Recipes</em> book. <a href="../index.html">Back to all chapters</a></footer>
+</body>
+</html>

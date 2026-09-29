@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 4 — Spring WebFlux — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 4</div>
+  <h1>Chapter 4 — Spring WebFlux</h1>
+  <p class="lede">The servlet stack of chapters 2 and 3 is gone: every recipe here builds an <code>HttpHandler</code>
+  from a Spring <code>ApplicationContext</code> and lets Reactor Netty (or a Servlet 6 container) serve it, with
+  endpoints that hand back <code>Mono</code> and <code>Flux</code> instead of values. Six recipe families cover one
+  concern each — bootstrapping, JSON endpoints, error handling, Thymeleaf views, <code>WebClient</code> consumption
+  and functional router endpoints — all on a single in-memory domain: a court-club <code>Member</code> registry.
+  Read the async claims with a sceptic's eye: the service layer in this chapter is synchronous, so the diagrams show
+  where the asynchrony <em>is</em> (I/O, encoding, subscription) and where it only <em>looks</em> like it.</p>
+  <div class="chip-row">
+    <span class="chip">16 recipe modules + recipe_4_shared</span>
+    <span class="chip">76 Java files</span>
+    <span class="chip">spring-webflux 6.0.3</span>
+    <span class="chip">reactor-bom 2022.0.0 + reactor-netty-http</span>
+    <span class="chip">thymeleaf-spring6 3.1.1</span>
+    <span class="chip">Java 19 toolchain, --enable-preview</span>
+    <span class="chip">port 8080 (4.6 on 8090)</span>
+    <span class="chip">./gradlew :ch04:recipe_4_1_i:build</span>
+    <span class="chip">4_1_ii / 4_1_iii need a Tomcat 10 WAR or Docker</span>
+    <span class="chip">no DB, no broker</span>
+    <span class="chip">no SSE, no WebSocket handler, no R2DBC in ch04 sources</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch03/index.html">&larr; Chapter 3 — Spring REST</a>
+    <a href="../ch05/index.html">Chapter 5 — Spring Security &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc"><h2>On this page</h2><ol>
+    <li><a href="#overview">Mental model and module map</a></li>
+    <li><a href="#bootstrap">Bootstrap: one HttpHandler, three launchers</a></li>
+    <li><a href="#endpoints">Annotated endpoints vs functional endpoints</a></li>
+    <li><a href="#streams">Where the asynchrony actually lands</a></li>
+    <li><a href="#model">Object graph: service, records, advice</a></li>
+    <li><a href="#errors">Error handling with ControllerAdvice</a></li>
+    <li><a href="#views">Reactive Thymeleaf views</a></li>
+    <li><a href="#client">WebClient as a reactive consumer</a></li>
+    <li><a href="#running">Building and running the recipes</a></li>
+  </ol></aside>
+  <article>
+
+    <section id="overview">
+      <span class="kicker">Chapter map</span>
+      <h2>Mental model and module map</h2>
+      <p>Every WebFlux app in this chapter is assembled the same way. A <code>WebFluxConfiguration</code> class
+      (<code>@Configuration</code> + <code>@EnableWebFlux</code> + <code>@ComponentScan</code>, implementing the
+      no-op marker <code>WebFluxConfigurer</code>) seeds an <code>AnnotationConfigApplicationContext</code>, and
+      <code>WebHttpHandlerBuilder.applicationContext(context).build()</code> turns that context into a single
+      <code>HttpHandler</code>. That handler is then adapted to whichever transport the recipe chooses. There is no
+      <code>DispatcherServlet</code>, no <code>web.xml</code>, no thread-per-request pool — the equivalent of the
+      front controller is <code>DispatcherHandler</code>, an internal collaborator of the built handler.</p>
+      <p>The domain example shrinks from the court reservations of chapters 2–3 to a club member registry: a
+      <code>Member</code> record (<code>name</code>, <code>email</code>, <code>phone</code>, later a
+      <code>SportType preferredType</code>) held in <code>InMemoryMemberService</code> inside
+      <code>ch04/recipe_4_shared</code>. The old reservation model survives only in the package name
+      <code>com.apress.spring6recipes.reactive.court</code>.</p>
+      <div class="callout info"><h4>Ignore the compiled leftovers</h4>
+        <p><code>ch04/recipe_4_1_i/out/production/classes/</code> and the <code>bin/</code> directories contain stale
+        IDE output under the older package <code>com.apress.springrecipes.reactive.court</code> —
+        <code>InMemoryReservationService</code>, <code>Reservation</code>, <code>Player</code>,
+        <code>ReservationQueryController</code>. None of those have sources anywhere in <code>ch04/</code>; nothing in
+        this page is derived from them.</p></div>
+
+      <table>
+        <thead><tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr></thead>
+        <tbody>
+          <tr><td class="num">4.1</td><td><code>recipe_4_1_i</code>, <code>recipe_4_1_ii</code>, <code>recipe_4_1_iii</code></td>
+            <td>Three ways to launch the same application: standalone Reactor Netty, a WAR registered through
+              <code>WebApplicationInitializer</code>, a WAR through <code>AbstractReactiveWebInitializer</code>.</td>
+            <td><code>ReactorNettyBootstrap</code>, <code>WebFluxConfiguration</code>, <code>WebFluxInitializer</code>, <code>WelcomeController</code></td></tr>
+          <tr><td class="num">4.2</td><td><code>recipe_4_2_i</code>, <code>recipe_4_2_ii</code></td>
+            <td>Reactive CRUD endpoints returning <code>Flux</code>/<code>Mono</code>, a customised Jackson codec;
+              <em>ii</em> adds Bean Validation to the request body.</td>
+            <td><code>MemberController</code>, <code>Member</code>, <code>WebFluxConfiguration.configureHttpMessageCodecs</code>, <code>Jackson2JsonEncoder</code></td></tr>
+          <tr><td class="num">4.3</td><td><code>recipe_4_3_i</code>, <code>recipe_4_3_ii</code>, <code>recipe_4_3_iii</code></td>
+            <td>Three escalation levels of global error handling for <code>WebExchangeBindException</code>: hand-written
+              handler, framework base class, framework base class plus a locale-aware override.</td>
+            <td><code>GlobalErrorHandler</code>, <code>ErrorMessage</code>, <code>ResponseEntityExceptionHandler</code>, <code>Member</code></td></tr>
+          <tr><td class="num">4.4</td><td><code>recipe_4_4_i</code> … <code>recipe_4_4_v</code></td>
+            <td>Thymeleaf rendered reactively: view-name <code>Mono</code>s, publishers as model attributes, an
+              <code>id</code> lookup, a dropdown fed by <code>Flux</code>, a <code>Converter</code> registration, then
+              form validation.</td>
+            <td><code>ThymeleafReactiveViewResolver</code>, <code>SpringWebFluxTemplateEngine</code>, <code>SpringResourceTemplateResolver</code>, <code>MemberController</code>, <code>SportTypeRepository</code>, <code>SportTypeConverter</code>, <code>Member</code>, <code>SportType</code></td></tr>
+          <tr><td class="num">4.5</td><td><code>recipe_4_5_i</code></td>
+            <td>Consuming a WebFlux endpoint with <code>WebClient</code> — raw <code>String</code> decoding versus
+              decoding straight into the <code>Member</code> record.</td>
+            <td><code>Main</code>, <code>ClientWithMapping</code>, <code>Member</code></td></tr>
+          <tr><td class="num">4.6</td><td><code>recipe_4_6_i</code></td>
+            <td>The same <code>/members</code> contract expressed with the functional API: <code>RouterFunction</code>
+              beans and <code>HandlerFunction</code> methods on a plain component, served on port 8090.</td>
+            <td><code>WebFluxConfiguration.membersRouter</code>, <code>RouterFunctions</code>, <code>ServerRequest</code>, <code>ServerResponse</code>, <code>MemberController</code></td></tr>
+          <tr><td class="num">shared</td><td><code>recipe_4_shared</code></td>
+            <td><code>java-library</code> dependency of every 4.2–4.6 module: the reactive service contract and its
+              in-memory implementation.</td>
+            <td><code>MemberService</code>, <code>InMemoryMemberService</code>, <code>Member</code></td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Recipe families and what each one stacks on the previous</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+  sh["recipe_4_shared -- Member record, MemberService, InMemoryMemberService"]
+  b1["4.1 -- i standalone Reactor Netty, ii WAR plus WebApplicationInitializer, iii WAR plus AbstractReactiveWebInitializer"]
+  b2["4.2 -- Flux and Mono endpoints with a Jackson codec override, ii adds Valid on the body"]
+  b3["4.3 -- ControllerAdvice strategies i hand written, ii framework base class, iii framework plus override"]
+  b4["4.4 -- i to v Thymeleaf views, id lookup, dropdown, converter registration, form validation"]
+  b6["4.6 -- functional RouterFunction and HandlerFunction, served on 8090"]
+  b5["4.5 -- WebClient consumer, no server of its own"]
+  b1 -- next module copies WebFluxConfiguration --> b2
+  sh -- compiled into every module from 4.2 on --> b2
+  b2 -- same controller and service, plus advice --> b3
+  b3 -- RestController becomes a Controller --> b4
+  b4 -- same handler methods, wrapped in ServerResponse --> b6
+  b2 -- serves GET /members to --> b5
+  sh -- seeds the data printed by --> b5
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Follow the left spine first: 4.1 produces a running server
+      and nothing else — its only endpoint is <code>WelcomeController.welcome</code>, which returns
+      <code>Mono.just("Hello …")</code>. From 4.2 onward each module re-declares the identical
+      <code>WebFluxConfiguration</code> (sometimes with one extra override) and adds exactly one concern:
+      <code>configureHttpMessageCodecs</code> in 4.2, a <code>@ControllerAdvice</code> bean in 4.3, three view beans and
+      a <code>configureViewResolvers</code> override in 4.4. The bottom edge is the one real runtime coupling: 4.5_i
+      has no server, it dials <code>http://localhost:8080/</code> and prints whatever a 4.2-style
+      <code>MemberController.list</code> sends back, so the data it shows comes from
+      <code>InMemoryMemberService.init</code> in <code>recipe_4_shared</code>. 4.6_i is the endpoint model swapped out
+      underneath the same service, which is why it hangs off 4.4 rather than continuing the chain.</p>
+    </section>
+
+    <section id="bootstrap">
+      <span class="kicker">Recipe 4.1</span>
+      <h2>Bootstrap: one HttpHandler, three launchers</h2>
+      <p><code>ch04/recipe_4_1_i/src/main/java/com/apress/spring6recipes/reactive/court/ReactorNettyBootstrap.java</code>
+      is the whole server: context, <code>WebHttpHandlerBuilder</code>,
+      <code>new ReactorHttpHandlerAdapter(handler)</code>, then
+      <code>HttpServer.create().host("0.0.0.0").port(8080).handle(adapter).bind().block()</code> and a
+      <code>System.in.read()</code> to hold <code>main</code>. Recipe 4.1_ii drops the bootstrap class and instead
+      implements <code>WebApplicationInitializer</code>: the same builder call, but the adapter is a
+      <code>ServletHttpHandlerAdapter</code> registered as servlet <code>dispatcher-handler</code> on mapping
+      <code>"/"</code> with <code>setAsyncSupported(true)</code> — without that flag the servlet container would
+      time out the non-blocking dispatch. Recipe 4.1_iii deletes even that: <code>WebFluxInitializer</code> extends
+      <code>AbstractReactiveWebInitializer</code> and contributes only
+      <code>getConfigClasses()</code> returning <code>WebFluxConfiguration.class</code>, because the base class already
+      performs the context creation, the <code>WebHttpHandlerBuilder</code> call, the adapter creation and the servlet
+      registration. The controller is byte-for-byte the same in all three (module <em>i</em> declares
+      <code>@RequestMapping("/welcome")</code> on the class and <code>@RequestParam(defaultValue = "World")</code>;
+      <em>ii</em> and <em>iii</em> put the path on <code>@GetMapping("/welcome")</code> and keep the default value).</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The three 4.1 launch paths converging on one HttpHandler</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+  cfg["WebFluxConfiguration -- Configuration, EnableWebFlux, ComponentScan, implements WebFluxConfigurer"]
+  subgraph P1["4_1_i -- plain main, Reactor Netty"]
+    c1["AnnotationConfigApplicationContext"] --> h1["WebHttpHandlerBuilder.applicationContext().build"]
+    h1 --> ad1["ReactorHttpHandlerAdapter"]
+    ad1 --> srv1["HttpServer.create host 0.0.0.0 port 8080, handle, bind, block"]
+  end
+  subgraph P2["4_1_ii -- WAR on Tomcat 10"]
+    w2["WebFluxInitializer implements WebApplicationInitializer"] --> h2["same builder call inside onStartup"]
+    h2 --> ad2["ServletHttpHandlerAdapter"]
+    ad2 --> reg2["addServlet dispatcher-handler, mapping slash, loadOnStartup 1, asyncSupported"]
+  end
+  subgraph P3["4_1_iii -- WAR on Tomcat 10"]
+    w3["WebFluxInitializer extends AbstractReactiveWebInitializer"] --> gc3["getConfigClasses returns WebFluxConfiguration"]
+    gc3 --> ad3["context, builder call and adapter all done by the base class"]
+  end
+  cfg --> c1
+  cfg --> w2
+  cfg --> w3
+  srv1 -- welcome page on 8080 --> resp["GET /welcome, Mono of String written as text/plain"]
+  reg2 -- same controller --> resp
+  ad3 -- same controller --> resp
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Three lanes, one shared left-hand node. In each lane the
+      context is refreshed first, so <code>@ComponentScan</code> from the base package
+      <code>com.apress.spring6recipes.reactive.court</code> registers <code>WelcomeController</code> and the
+      <code>WebFluxConfigurer</code> before any request can arrive; then <code>WebHttpHandlerBuilder</code> walks the
+      context for its infrastructure beans (<code>WebFluxConfigurationSupport</code> defaults plus any
+      <code>WebFluxConfigurer</code> it finds) and produces the <code>HttpHandler</code>. The adapters differ only in
+      transport: <code>ReactorHttpHandlerAdapter</code> plugs into <code>HttpServer.handle(...)</code>,
+      <code>ServletHttpHandlerAdapter</code> plugs into a servlet registration. Note what <em>does not</em> appear in
+      the WAR lanes: <code>bind().block()</code> and <code>System.in.read()</code> are exclusive to <em>i</em>, since
+      the container owns the process lifecycle there. Both WAR modules are built with the <code>war</code> plugin plus
+      <code>providedCompile jakarta.servlet-api</code>, which is why <code>jakarta.servlet.ServletContext</code>
+      compiles but is absent from the fat classpath.</p>
+    </section>
+
+    <section id="endpoints">
+      <span class="kicker">Recipes 4.2–4.4 vs 4.6</span>
+      <h2>Annotated endpoints vs functional endpoints</h2>
+      <p>This is the chapter's central fork, and the source makes it unusually clean because the two models wrap the
+      identical service call. The annotated form
+      (<code>ch04/recipe_4_2_i/src/main/java/.../web/MemberController.java</code>) is a
+      <code>@RestController @RequestMapping("/members")</code> with <code>@GetMapping Flux&lt;Member&gt; list()</code>
+      and <code>@PostMapping Mono&lt;Member&gt; create(@RequestBody Member member)</code> — the path, the method and
+      the status are all implicit, and the response body is whatever the returned publisher emits. The functional form
+      (<code>ch04/recipe_4_6_i/src/main/java/.../WebFluxConfiguration.java</code>) declares
+      <code>@Bean RouterFunction&lt;ServerResponse&gt; membersRouter(MemberController handler)</code> built by
+      <code>RouterFunctions.route().GET("/members", handler::list).POST("/members", handler::create).build()</code>,
+      where the handler is a bare <code>@Component</code> whose methods are
+      <code>Mono&lt;ServerResponse&gt; list(ServerRequest request)</code> and
+      <code>create(ServerRequest request)</code>. Here the status is explicit (<code>ServerResponse.ok()</code>), the
+      request body is pulled by hand with <code>request.bodyToMono(Member.class)</code>, and the element type has to be
+      named a second time in <code>.body(member, Member.class)</code> so the writer knows what the wrapped publisher
+      carries.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Two endpoint models, side by side, over the same MemberService</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+  req["request, GET or POST /members"]
+  subgraph ANN["Annotation model -- recipe_4_2_i, RestController"]
+    rhm["RequestMappingHandlerMapping matches RequestMapping members"] --> rha["RequestMappingHandlerAdapter resolves arguments"]
+    rha --> body["RequestBody decoder for Member, Valid applied first"]
+    body --> mc["MemberController.list or create"]
+    mc --> ret["Flux of Member, Mono of Member returned bare"]
+    ret --> rbh["ResponseBodyResultHandler picks the encoder"]
+  end
+  subgraph FUN["Functional model -- recipe_4_6_i, RouterFunction"]
+    rfm["RouterFunctionMapping matches membersRouter bean"] --> hfa["HandlerFunctionAdapter invokes the HandlerFunction"]
+    hfa --> rf["RouterFunctions.route with GET members and POST members"]
+    rf --> ref["method references handler::list and handler::create"]
+    ref --> fh["MemberController component, list and create take ServerRequest"]
+    fh --> read["request.bodyToMono Member then flatMap save"]
+    read --> sr["ServerResponse.ok().body with the declared element class"]
+  end
+  req --> rhm
+  req --> rfm
+  rbh --> enc["Jackson2JsonEncoder from configureHttpMessageCodecs"]
+  sr --> enc
+  enc --> out["application/json response"]
+  svc["InMemoryMemberService, findAll and save"]
+  ret -. same service call .- svc
+  read -. same service call .- svc
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> A request enters <code>DispatcherHandler</code>, which
+      consults its registered <code>HandlerMapping</code>s in order and stops at the first match — that is why both
+      lanes are drawn from the same <code>req</code> node and why the two models can coexist: <code>RouterFunctionMapping</code>
+      finds the bean, <code>RequestMappingHandlerMapping</code> finds the annotated controller, and neither knows about
+      the other. In the left lane the argument resolver for <code>@RequestBody</code> defers the actual
+      <code>create(...)</code> invocation until Jackson has produced a <code>Member</code>; in the right lane
+      <code>create(ServerRequest)</code> runs immediately, but only to <em>build</em> the pipeline —
+      <code>request.bodyToMono(Member.class).flatMap(memberService::save)</code> is inert until
+      <code>ServerResponse.ok().body(member, Member.class)</code> is itself subscribed by the handler. That is the
+      single most important asymmetry between the models in this chapter, and it is easy to miss: in 4.6_i the
+      <code>memberService.save</code> reference is bound eagerly, while in 4.2_i <code>save</code> is not even called
+      until the body arrives. 4.6_i proves the coexistence point in one file: its
+      <code>WebFluxConfiguration</code> has the router bean, and <code>@ComponentScan</code> still drags in the
+      annotated <code>WelcomeController</code> on <code>/welcome</code> — though that module registers no view resolver
+      and declares no Thymeleaf dependency, so only <code>/members</code> is genuinely usable there.</p>
+    </section>
+
+    <section id="streams">
+      <span class="kicker">Recipes 4.2, 4.3, 4.6</span>
+      <h2>Where the asynchrony actually lands</h2>
+      <p>Say it plainly before drawing anything: nothing in <code>ch04/recipe_4_shared</code> is asynchronous.
+      <code>InMemoryMemberService.save</code> writes into a <code>ConcurrentHashMap</code> and returns
+      <code>Mono.just(member)</code>; <code>findAll</code> is <code>Flux.fromIterable(members.values())</code>, a
+      snapshot of an already-materialised collection; <code>@PostConstruct init()</code> seeds three members through
+      <code>Flux.just(...).flatMap(this::save).subscribe()</code>. The reactive types are the endpoint <em>contract</em>,
+      not proof of non-blocking I/O. What <em>is</em> genuinely non-blocking is everything the recipes do not write:
+      Reactor Netty accepting connections, the response body being encoded into <code>DataBuffer</code>s and flushed as
+      signals arrive, and the request body being decoded lazily.</p>
+      <p>The blocking calls that do exist are <code>bind().block()</code>, in all twelve
+      <code>ReactorNettyBootstrap</code> classes of the chapter, and <code>System.in.read()</code> in eleven of them
+      (4.6_i omits it and stays up anyway, because Netty's event-loop threads are non-daemon). Both park the
+      <code>main</code> thread only; no <code>block()</code>, <code>toFuture()</code> or <code>Thread.sleep</code>
+      appears anywhere on the request path.</p>
+      <div class="note"><h4>What the chapter deliberately leaves out</h4>
+        <p>Grep <code>ch04/</code> for <code>ServerSentEvent</code>, <code>TEXT_EVENT_STREAM</code>,
+        <code>WebSocketHandler</code>, <code>Flux.interval</code>, <code>delayElements</code>, <code>R2dbc</code> or
+        <code>WebTestClient</code>: zero hits in sources. So a <code>Flux&lt;Member&gt;</code> served with
+        <code>Accept: application/json</code> is aggregated into <em>one</em> JSON array by the encoder rather than
+        streamed record by record — per-element streaming would need <code>application/x-ndjson</code> or
+        <code>text/event-stream</code>, and neither appears. The <code>webapp/</code> folder inside
+        <code>recipe_4_4_i</code> (<code>index.html</code>, <code>app.js</code>, <code>webstomp.js</code>) is a
+        STOMP-over-WebSocket browser client pointed at <code>ws://localhost:8080/echo-ws/echo-endpoint</code> with
+        <code>/topic/echo</code> and <code>/app/echo</code>; ch04 has no server side for it and no
+        <code>addResourceHandlers</code> registration, so it is never served.</p></div>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">GET and POST against /members, with subscription doing the real work</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant CL as Client
+    participant NE as Reactor Netty HttpServer
+    participant DH as DispatcherHandler
+    participant MC as MemberController of 4_2_i
+    participant SV as InMemoryMemberService
+    participant EN as Jackson2JsonEncoder
+    participant DC as Jackson2JsonDecoder
+    par Read side, GET /members
+        CL->>NE: GET /members, Accept application/json
+        NE->>DH: new ServerWebExchange
+        DH->>MC: RequestMappingHandlerAdapter invokes list
+        MC->>SV: findAll
+        SV-->>MC: Flux of Member, snapshot of map values, no element produced yet
+        MC-->>DH: the same Flux, method has already returned
+        Note over DH,EN: ResponseBodyResultHandler subscribes -- this is where execution starts
+        DH->>EN: encode each onNext signal
+        EN-->>NE: DataBuffers appended to one JSON array
+        NE-->>CL: 200 OK, headers first, body flushed as buffers fill
+    and Write side, POST /members
+        CL->>NE: POST /members with a JSON body
+        NE->>DH: new ServerWebExchange
+        DH->>DC: decode the body into a Member
+        DC-->>DH: Member instance, Valid checked before any call
+        DH->>MC: create with the decoded Member
+        MC->>SV: save member
+        SV-->>MC: Mono of Member, the map put ran synchronously
+        MC-->>DH: Mono returned
+        DH->>EN: encode the emitted Member
+        DH-->>CL: 200 OK with the encoded body
+    end
+    Note over NE,DH: bind().block() in ReactorNettyBootstrap parked main once at startup, nothing parks an event loop here
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The <code>par</code> lanes are two independent subscriptions
+      that can interleave on the same event loop — that is the point of drawing them in parallel. Read the left lane's
+      hand-off carefully: <code>list()</code> returns before a single <code>Member</code> exists, so the arrow from
+      <code>MC</code> back to <code>DH</code> carries an unstarted <code>Flux</code>; only
+      <code>ResponseBodyResultHandler</code> subscribing to it (the <code>Note over</code>) causes
+      <code>findAll</code>'s iterator to be pulled. In the right lane the order matters the other way round: the body
+      must be decoded <em>before</em> <code>create(@RequestBody Member member)</code> can be called at all, so
+      <code>save</code> — and its synchronous <code>ConcurrentHashMap.put</code> — happens on whatever thread the
+      decoder completed on. Because <code>save</code> and <code>findAll</code> never touch the network or disk, that
+      thread is never held longer than the map operation; put a real JDBC or HTTP call in there and the same diagram
+      becomes an event-loop stall. The codec node is not decorative: <code>WebFluxConfiguration</code> in 4.2_i, 4.2_ii
+      and all three 4.3 modules overrides <code>configureHttpMessageCodecs(ServerCodecConfigurer configurer)</code> and
+      installs <code>configurer.defaultCodecs().jackson2JsonEncoder(new Jackson2JsonEncoder(mapper))</code> with
+      <code>SerializationFeature.WRITE_DATES_AS_TIMESTAMPS</code> disabled — 4.4 and 4.6 do not override it and fall
+      back to the detected default.</p>
+    </section>
+
+    <section id="model">
+      <span class="kicker">Recipes 4.2–4.4</span>
+      <h2>Object graph: service, records, collaborators</h2>
+      <p>The dependency shape is deliberately tiny, which makes it worth pinning down exactly. <code>MemberService</code>
+      is a public interface exposing <code>Flux&lt;Member&gt; findAll()</code>,
+      <code>Mono&lt;Member&gt; findById(long)</code> and <code>Mono&lt;Member&gt; save(Member)</code>; its only
+      implementation, <code>InMemoryMemberService</code>, is <code>@Service</code> and deliberately
+      <em>package-private</em>, so controllers depend on the abstraction even though the scan finds the bean from the
+      same root package. Note the shadowing trick in the module layout: 4.2_ii, all three 4.3 modules, and 4.4_iii–v
+      declare their own <code>com.apress.spring6recipes.reactive.court.domain.Member</code> under
+      <code>src/main/java</code>, and that compiled class wins over the identically named record in
+      <code>recipe_4_shared</code> because module output precedes dependencies on the classpath. Same simple name,
+      three different shapes.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Shared service contract, the three Member record shapes, and view-layer collaborators</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class MemberService {
+        findAll
+        findById
+        save
+    }
+    class InMemoryMemberService {
+        sequence
+        members
+        init
+    }
+    class MemberShared["Member -- recipe_4_shared"] {
+        name
+        email
+        phone
+    }
+    class MemberValidated["Member -- 4_2_ii and 4_3"] {
+        name
+        email
+        phone
+    }
+    class MemberForm["Member -- 4_4_iii onwards"] {
+        name
+        email
+        phone
+        preferredType
+    }
+    class SportType {
+        id
+        name
+    }
+    class SportTypeRepository {
+        findAll
+        findById
+    }
+    class SportTypeConverter {
+        convert
+    }
+    class GlobalErrorHandler["GlobalErrorHandler -- 4_3_i"] {
+        handleValidationErrors
+        toErrorMessage
+    }
+    class ErrorMessage["ErrorMessage -- nested record"] {
+        field
+        message
+    }
+    InMemoryMemberService ..|> MemberService : annotated Service, package private
+    InMemoryMemberService --> MemberShared : PostConstruct seeds three records
+    MemberValidated ..> MemberShared : local record shadows the shared one
+    MemberForm ..> MemberShared : four components instead of three
+    MemberForm --> SportType : preferredType
+    SportTypeRepository --> SportType : fixed list of three
+    SportTypeConverter --> SportTypeRepository : findById via Optional
+    SportTypeConverter ..> MemberForm : binds preferredType from the select value
+    GlobalErrorHandler --> ErrorMessage : maps every FieldError
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the graph.</strong> The realization edge from
+      <code>InMemoryMemberService</code> up to <code>MemberService</code> is the only Spring-managed contract in the
+      chapter: every
+      <code>MemberController</code> variant, annotated or functional, receives that interface through a constructor
+      parameter, which is why no module declares a <code>@Bean</code> for it — <code>@ComponentScan</code> plus
+      <code>@Service</code> is enough. The three <code>Member</code> boxes are not a hierarchy; the dotted
+      <code>..&gt;</code> edges say "this module ships its own record and the shared one is invisible to it".
+      <code>MemberValidated</code> is the one annotated <code>@NotBlank String name, @NotBlank @Email String email,
+      String phone</code>; <code>MemberForm</code> is the four-component one, <code>name, email, phone,
+      SportType preferredType</code>, and the extra constructor <code>this(name, email, phone, null)</code> in it is
+      load-bearing in a way that is easy to miss: <code>InMemoryMemberService</code> is compiled against the
+      <em>three</em>-argument record in <code>recipe_4_shared</code>, so once a module shadows that record the inherited
+      <code>@PostConstruct init()</code> only links if the local record still offers a three-argument constructor. The
+      <code>SportTypeRepository</code> pair is the chapter's honest note about reactive purity:
+      <code>findAll</code> returns a <code>Flux</code> but <code>findById</code> returns a blocking
+      <code>Optional</code>, and that second method is the one <code>SportTypeConverter</code> calls.</p>
+    </section>
+
+    <section id="errors">
+      <span class="kicker">Recipe 4.3</span>
+      <h2>Error handling with @ControllerAdvice</h2>
+      <p>All three modules change the same two lines of input — <code>@Valid @RequestBody Member member</code> and
+      <code>@RequestParam String name</code> without a default — and differ only in what catches the resulting
+      exception. 4.3_i is hand-written: an empty-by-content <code>@ControllerAdvice</code> class whose
+      <code>@ExceptionHandler(WebExchangeBindException.class)</code> method is <code>@ResponseBody</code> and returns
+      <code>Flux&lt;ErrorMessage&gt;</code>, built with <code>Flux.fromIterable(ex.getFieldErrors()).map(this::toErrorMessage)</code>
+      where <code>toErrorMessage</code> reads <code>fe.getField()</code> and <code>fe.getDefaultMessage()</code> into
+      the nested <code>record ErrorMessage(String field, String message)</code>. 4.3_ii is two lines:
+      <code>@ControllerAdvice public class GlobalErrorHandler extends ResponseEntityExceptionHandler { }</code> — no
+      handler methods, because the base class already carries one per framework exception. 4.3_iii keeps the base class
+      and overrides a single protected hook,
+      <code>handleWebExchangeBindException(WebExchangeBindException ex, HttpHeaders headers, HttpStatusCode status,
+      ServerWebExchange exchange)</code> returning <code>Mono&lt;ResponseEntity&lt;Object&gt;&gt;</code>, to translate
+      the violation messages through <code>getMessageSource()</code> for the request's locale and stash them on the
+      exchange before delegating to <code>super.handleExceptionInternal(ex, null, headers, status, exchange)</code>.
+      Two details that matter when you run them: <code>HttpStatusCode</code> (not the old <code>HttpStatus</code>) is
+      the Spring 6 signature, and 4.3_iii imports <code>Map</code>, <code>MissingRequestValueException</code> and
+      <code>ServerWebInputException</code> without using any of them.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">A failed POST /members and where each 4.3 variant sends it</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+  post["POST /members, JSON body with a blank email"] --> dec["body decoded into Member"]
+  dec --> q{"is the parameter annotated Valid"}
+  q -- "no -- 4.2_i" --> plain["create runs anyway, save accepts it, 200 with the bad record"]
+  q -- "yes -- 4.2_ii and 4.3" --> raise["binding and validation collect FieldErrors, WebExchangeBindException before create runs"]
+  raise -- "4.3_i" --> hand["GlobalErrorHandler.handleValidationErrors"]
+  hand --> fmap["Flux.fromIterable of getFieldErrors then map toErrorMessage"]
+  fmap --> bodyi["ResponseBody, JSON list of field and message"]
+  raise -- "4.3_ii" --> empty["GlobalErrorHandler extends ResponseEntityExceptionHandler, no methods"]
+  empty --> inh["inherited handler for the bind exception produces the 400 response entity"]
+  raise -- "4.3_iii" --> ovr["override handleWebExchangeBindException with HttpStatusCode parameter"]
+  ovr --> loc["exchange.getLocaleContext().getLocale"]
+  loc --> msgs["ex.resolveErrorMessages with getMessageSource and that locale"]
+  msgs --> attr["exchange.getBody().setProperty errors with the resolved values"]
+  attr --> sup["super.handleExceptionInternal, status kept as passed in"]
+  wex["GET /welcome without a name query parameter"] -. "MissingRequestValueException" .-> onlyi["4.3_i has no handler for it, only 4.3_ii and 4.3_iii inherit one"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The decision node is the fork the recipes exist to show:
+      validation is triggered while the annotated argument resolver is producing <code>Member</code>, so the exception
+      surfaces <em>before</em> <code>MemberController.create</code> is ever entered and must be caught by advice, not
+      by the controller. The advice itself is invoked by the annotated-<code>@ExceptionHandler</code> resolution
+      strategy that <code>@EnableWebFlux</code> registers, and it is looked up <em>after</em> the handler method fails —
+      which is why 4.3_ii needs no <code>@ResponseBody</code> (its inherited methods already return
+      <code>ResponseEntity</code>) while 4.3_i must declare it explicitly to write a <code>Flux</code> as JSON. The
+      dashed bottom edge is the practical difference between the variants: from 4.3 onward
+      <code>WelcomeController.welcome</code> declares <code>@RequestParam String name</code> with no default value, so a
+      missing <code>name</code> raises a different exception that only the two base-class variants know how to map.</p>
+    </section>
+
+    <section id="views">
+      <span class="kicker">Recipe 4.4</span>
+      <h2>Reactive Thymeleaf views</h2>
+      <p>Five modules, one controller rewritten each time. 4.4_i swaps <code>@RestController</code> for
+      <code>@Controller</code> and adds the three Thymeleaf beans to <code>WebFluxConfiguration</code>:
+      <code>SpringResourceTemplateResolver</code> (prefix <code>classpath:/templates/</code>, suffix
+      <code>.html</code>, <code>TemplateMode.HTML</code>), <code>SpringWebFluxTemplateEngine</code>, and
+      <code>ThymeleafReactiveViewResolver</code>, registered through
+      <code>configureViewResolvers(registry.viewResolver(thymeleafReactiveViewResolver()))</code>. Its handler methods
+      return view names, sometimes inside a publisher: <code>Mono&lt;String&gt; add(Model model)</code> returns
+      <code>Mono.just("member")</code> after putting an empty <code>Member</code> in the model, and
+      <code>create</code> composes <code>Mono.just(member).map(memberService::save).then(Mono.just("redirect:member-success"))</code>
+      — the <code>.then</code> discards the saved member so the outcome is a redirect. <code>welcome.html</code> is the
+      clearest reactive-view idiom in the book: the controller does
+      <code>model.addAttribute("today", Mono.just(LocalDate.now()))</code> and the template consumes
+      <code>${#temporals.format(today, 'dd-MM-yyyy')}</code>, i.e. a publisher is a legitimate model attribute because
+      the reactive resolver subscribes to it before rendering. 4.4_ii adds
+      <code>@GetMapping("/{id}")</code> with <code>findById(id).defaultIfEmpty(...).doOnNext(m -&gt;
+      model.addAttribute("member", m)).then(Mono.just("member"))</code>. 4.4_iii adds
+      <code>@ModelAttribute("sportTypes") Flux&lt;SportType&gt;</code> so the select in <code>member.html</code> can
+      iterate <code>${sportTypes}</code>. 4.4_iv registers <code>SportTypeConverter</code> via
+      <code>addFormatters(FormatterRegistry)</code>. 4.4_v swaps that for validation — <code>@Valid</code>,
+      <code>@NotBlank</code>, <code>@Email</code>, <code>@NotNull SportType</code> and an explicit
+      <code>if (bindingResult.hasErrors()) return Mono.just("member")</code> — and, notably, drops the converter
+      registration: <code>SportTypeConverter</code> is still in the source but without <code>@Component</code>, and
+      <code>addFormatters</code> is gone, so <code>preferredType</code> binds with default conversion only.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Configuration to container to view: how a returned string becomes HTML</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+  cfg["WebFluxConfiguration of 4_4_i to v"]
+  cfg --> res["SpringResourceTemplateResolver -- prefix classpath templates, suffix html, TemplateMode HTML"]
+  res --> eng["SpringWebFluxTemplateEngine"]
+  eng --> vres["ThymeleafReactiveViewResolver"]
+  cfg --> ov["configureViewResolvers, ViewResolverRegistry"]
+  ov --> reg["registry.viewResolver"]
+  reg --> vres
+  fh["MemberController, Controller"] --> names["Mono of view name, or a plain String view name"]
+  names --> disp["DispatcherHandler result handling"]
+  disp --> vres
+  vres --> pub["model attributes that are Publishers, today and sportTypes, subscribed before rendering"]
+  pub --> html["member.html rendered as a stream of DataBuffers"]
+  conv["SportTypeConverter, 4_4_iv only"] -. addFormatters .-> cfg
+  repo["SportTypeRepository"] -. findAll returns Flux .-> conv
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Trace the top chain first: it is plain bean wiring executed
+      once at context refresh — <code>thymeleafTemplateResolver()</code> is fed to
+      <code>thymeleafTemplateEngine()</code>, which is fed to <code>thymeleafReactiveViewResolver()</code>, and the
+      <code>WebFluxConfigurer.configureViewResolvers</code> callback adds that last bean to the
+      <code>ViewResolverRegistry</code> that <code>@EnableWebFlux</code> uses to build its view-resolution result
+      handler. Then the request chain: <code>welcome()</code> returns the literal <code>"welcome"</code>, the result
+      handler treats it as a view name, the resolver writes the rendered template into the response body — and note that
+      a handler may return <code>String</code> or <code>Mono&lt;String&gt;</code> here with no other change, because
+      the view-name publisher is simply subscribed. <code>model.addAttribute("today", Mono.just(LocalDate.now()))</code>
+      is the interesting hop: nothing in the controller forces that <code>Mono</code>, so the value reaching
+      <code>${today}</code> is only produced during rendering, which is exactly what makes the Thymeleaf
+      <em>reactive</em> engine necessary (a plain <code>SpringTemplateEngine</code> would print the publisher). The
+      dashed lower edges are 4.4_iv's contribution: a <code>Converter&lt;String, SportType&gt;</code> handed to the
+      <code>FormatterRegistry</code>, consulted when the submitted <code>&lt;select&gt;</code> value has to become a
+      <code>SportType</code> record, and reading through the same <code>SportTypeRepository.findById</code> that
+      <code>@ModelAttribute("sportTypes")</code> streamed to the browser.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">State</span>
+          <span class="dtitle">The member form's round trip in 4.4_v</span></figcaption>
+        <pre class="mermaid">
+stateDiagram-v2
+    [*] --> BlankForm : GET /members, add puts an empty Member in the model
+    BlankForm --> DetailForm : GET /members with an id path variable, 4_4_ii onwards
+    DetailForm --> Posted : submit
+    BlankForm --> Posted : submit
+    Posted --> BlankForm : bindingResult.hasErrors, create returns the member view name again
+    Posted --> Saved : no errors, save runs then then redirects to member-success
+    Saved --> [*] : GET member-success
+    Posted --> Broken : 4_4_i to iv ignore hasErrors entirely
+    Broken --> [*] : the redirect is returned regardless
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the states.</strong> <code>BlankForm</code> and <code>DetailForm</code> are the
+      two <code>@GetMapping</code> methods of <code>MemberController</code>; both end in the same view name
+      <code>member</code>, and the detail one only fills the model once <code>findById</code> emits, via
+      <code>doOnNext</code> inside the returned chain. The transition that earns its place is
+      <code>Posted -&gt; BlankForm</code>: only in 4.4_v does <code>create</code> inspect
+      <code>BindingResult.hasErrors()</code> and short-circuit back to the form, which is what makes the
+      <code>th:if="${#fields.hasErrors('email')}"</code> and <code>th:errors="*{email}"</code> spans in
+      <code>member.html</code> produce red text instead of a silently redirected record. In 4.4_i through iv the
+      <code>BindingResult</code> parameter is declared and never read, so an invalid submission falls into the
+      <code>Broken</code> path and still redirects. One template is orphaned in all five modules:
+      <code>members.html</code>, which iterates <code>${members}</code>, is never resolved because no handler method in
+      ch04 returns the view name <code>members</code>.</p>
+    </section>
+
+    <section id="client">
+      <span class="kicker">Recipe 4.5</span>
+      <h2>WebClient as a reactive consumer</h2>
+      <p>4.5_i is the only module in the chapter that consumes rather than serves, and it ships two <code>main</code>
+      methods that differ in exactly one type argument. Both do
+      <code>WebClient.create("http://localhost:8080/").get().uri("/members").accept(MediaType.APPLICATION_JSON)
+      .exchangeToFlux(cr -&gt; cr.bodyToFlux(X.class)).subscribe(System.out::println)</code> and then
+      <code>System.in.read()</code>. In <code>Main</code>, <code>X</code> is <code>String</code>; in
+      <code>ClientWithMapping</code> it is <code>Member</code>, which is why this module — like 4.2 — declares
+      <code>jackson-databind</code> and <code>jackson-datatype-jsr310</code> in <code>ch04/build.gradle</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">exchangeToFlux, bodyToFlux and the two print loops</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main or ClientWithMapping
+    participant W as WebClient
+    participant S as WebFlux server on 8080
+    M->>W: WebClient.create with the base url
+    M->>W: get().uri slash members, accept APPLICATION_JSON
+    W->>S: GET /members
+    S-->>W: status and headers, body still unread
+    W->>W: exchangeToFlux hands the ClientResponse to the lambda
+    W->>S: bodyToFlux subscribed, bytes now consumed
+    S-->>W: DataBuffers of one JSON array
+    W-->>M: Flux of String, or Flux of Member after Jackson decoding
+    M->>M: subscribe with System.out::println
+    Note over M,S: nothing here blocks -- main then parks in System.in.read so the onNext prints can still land
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The exchange is deliberately two-phase. The arrow
+      <code>S--&gt;&gt;W: status and headers, body still unread</code> is what <code>exchangeToFlux</code> guarantees:
+      you get a <code>ClientResponse</code> before the body is touched, and the lambda's
+      <code>cr.bodyToFlux(Member.class)</code> is the only thing that requests the bytes — which is why the client must
+      consume the returned <code>Flux</code> fully, since <code>exchangeToFlux</code> leaves connection release in your
+      hands rather than doing it for you as <code>retrieve()</code> would. The element type on the return edge explains
+      the two classes: with <code>String.class</code> each decoded JSON array element arrives as a JSON text
+      <code>String</code> you print as-is, with <code>Member.class</code> the same array elements are bound to the
+      record's components, so the console output is <code>Member[name=…, email=…, phone=…]</code>. The final note is the
+      whole reason <code>System.in.read()</code> is in both files: <code>subscribe</code> returns immediately, so
+      without a parked <code>main</code> the JVM would race the prints. Point it at <code>recipe_4_6_i</code> on 8090
+      instead (edit the base URL) and the same client exercises the functional endpoint model unchanged.</p>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Practicalities</span>
+      <h2>Building and running the recipes</h2>
+      <p><code>ch04/build.gradle</code> applies <code>java</code> plus
+      <code>com.github.johnrengelman.shadow</code> to every subproject whose name does not contain
+      <code>shared</code>, and adds <code>implementation project(":ch04:recipe_4_shared")</code>,
+      <code>spring-context</code>, <code>spring-webflux</code> and <code>reactor-netty-http</code> to all of them;
+      <code>build</code> is finalized by <code>shadowJar</code>. Thirteen of the sixteen modules are self-contained
+      servers or clients with no external infrastructure.</p>
+      <ol>
+        <li><strong>Compile and package one recipe.</strong>
+          <pre><code>./gradlew :ch04:recipe_4_1_i:build</code></pre>
+          Output: <code>ch04/recipe_4_1_i/build/libs/recipe_4_1_i-6.0.0-SNAPSHOT-all.jar</code>.</li>
+        <li><strong>Run the Reactor Netty recipes.</strong> The <code>application</code> plugin is not applied anywhere
+          in <code>ch04</code>, so the fat jar has no <code>Main-Class</code> manifest entry — run it with
+          <code>-cp</code> and name the bootstrap class (this is the pattern the repo's own
+          <code>docs/walkthrough_run_recipe.md</code> uses):
+          <pre><code>java -cp ch04/recipe_4_1_i/build/libs/recipe_4_1_i-6.0.0-SNAPSHOT-all.jar \
+  com.apress.spring6recipes.reactive.court.ReactorNettyBootstrap</code></pre>
+          Same shape for <code>recipe_4_2_i</code>, <code>recipe_4_2_ii</code>, <code>recipe_4_3_i|ii|iii</code>,
+          <code>recipe_4_4_i…v</code> and <code>recipe_4_6_i</code>. Press ENTER to stop anything with
+          <code>System.in.read()</code>; 4.6_i has to be killed, since its <code>main</code> returns while the
+          non-daemon event loops keep the JVM up.</li>
+        <li><strong>Probe the endpoints.</strong> <code>GET http://localhost:8080/welcome?name=World</code>
+          (in 4.1 the <code>name</code> parameter is optional, from 4.3 it is required),
+          <code>GET http://localhost:8080/members</code>,
+          <code>POST http://localhost:8080/members</code> with <code>{"name":"...","email":"...","phone":"..."}</code>,
+          and the form pages <code>/welcome</code> and <code>/members</code> plus <code>/members/{id}</code> for 4.4.
+          4.6_i answers the same paths on <strong>8090</strong>.</li>
+        <li><strong>Run the client.</strong> Start a 4.2-style server on 8080 first, then
+          <pre><code>java -cp ch04/recipe_4_5_i/build/libs/recipe_4_5_i-6.0.0-SNAPSHOT-all.jar \
+  com.apress.spring6recipes.reactive.court.ClientWithMapping</code></pre>
+          or <code>...reactive.court.Main</code> for the untyped variant.</li>
+        <li><strong>Recipe 4.1_ii and 4.1_iii are WARs.</strong> Either deploy
+          <code>build/libs/recipe_4_1_ii.war</code> to a Servlet 6 container (Tomcat 10.1, Jetty 11 —
+          <code>jakarta.servlet-api</code> is <code>providedCompile</code>), or use the palantir tasks configured in
+          <code>ch04/build.gradle</code>: <code>./gradlew :ch04:recipe_4_1_ii:docker</code> then
+          <code>./gradlew :ch04:recipe_4_1_ii:dockerRun</code> builds <code>s6r/court-flux:recipe_4_1_ii</code>, starts
+          a container named <code>s6r-court-flux-recipe_4_1_ii</code> and maps <code>8080:8080</code>.</li>
+      </ol>
+      <div class="callout"><h4>Prerequisites and traps found in the source</h4>
+        <ul>
+          <li><strong>Java 19 toolchain.</strong> The root <code>build.gradle</code> pins
+            <code>JavaLanguageVersion.of(19)</code> and adds <code>--enable-preview</code> to compile, test and exec.
+            On this machine <code>gradle.properties</code> sets <code>org.gradle.java.home</code> to a JDK 17, so a JDK
+            19+ must be resolvable (toolchain auto-provisioning, or run Gradle itself on 19). The repo walkthrough uses
+            <code>C:\Users\sahuk\.jdks\openjdk-23\bin\java.exe</code> to execute the jars.</li>
+          <li><strong>Port collisions.</strong> Everything binds 8080 except 4.6_i (8090), and only one server can hold
+            a port at a time. 4.1_i binds <code>0.0.0.0</code> (all interfaces) while every other bootstrap binds
+            <code>localhost</code> — the only recipe reachable from outside the machine.</li>
+          <li><strong>The ch04 Dockerfile expects <code>court.war</code>.</strong>
+            <code>ch04/Dockerfile</code> builds <code>eclipse-temurin:19-jdk-alpine</code> with Tomcat 10.1.4, then
+            <code>COPY court.war $CATALINA_HOME/webapps/</code> — but no build script renames the WAR, and palantir
+            <code>files war.outputs</code> drops <code>recipe_4_1_ii.war</code> into the context. Rename the artifact or
+            set the WAR archive name before building the image. It also exposes <code>5005</code> for JDWP.</li>
+          <li><strong>Validation needs an EL implementation.</strong> 4.2_ii, 4.3_* and 4.4_v add
+            <code>hibernate-validator</code> <em>and</em> <code>org.glassfish:jakarta.el</code>; drop the latter and
+            message interpolation fails at runtime, not at compile time.</li>
+          <li><strong>No database, broker or cache.</strong> The only state is
+            <code>InMemoryMemberService</code>'s <code>ConcurrentHashMap</code> — restart the process and the seeded
+            three members plus anything POSTed are gone. 4.5_i also has no test or server, so it is useless unless
+            another module is running.</li>
+        </ul></div>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  <p>Generated from source in <code>ch04/</code> — 16 recipe modules plus <code>recipe_4_shared</code>, Spring Framework
+  6.0.3. <a href="../index.html">&larr; All chapters</a></p>
+</footer>
+</body>
+</html>

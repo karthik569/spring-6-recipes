@@ -1,0 +1,650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 2 — Spring MVC — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 2</div>
+  <h1>Chapter 2 — Spring MVC</h1>
+  <p class="lede">Chapter 2 builds one web application — the tennis-club <em>Court</em> reservation
+  system — and changes a single mechanism per module. Twenty-two WAR modules plus
+  <code>recipe_2_shared</code> walk from raw servlet bootstrapping through handler mappings,
+  interceptors, form binding with validation, content negotiation and PDF/Excel views. It is the only
+  chapter that ships a deployable <code>court.war</code>, and the build wraps it in both a Gretty
+  embedded Tomcat and a Palantir Docker image so you can actually serve it.</p>
+  <div class="chip-row">
+    <span class="chip">23 modules (22 recipes + recipe_2_shared)</span>
+    <span class="chip">spring-webmvc 6.0.3 (Java 19)</span>
+    <span class="chip">DispatcherServlet / @Controller / InternalResourceViewResolver</span>
+    <span class="chip">HandlerInterceptor, @Validated, @ControllerAdvice</span>
+    <span class="chip">JSTL, hibernate-validator 8.0.0.Final, openpdf + poi-ooxml</span>
+    <span class="chip">org.gretty 4.0.3 (tomcat10) + com.palantir.docker 0.34.0</span>
+    <span class="chip">ships court.war — the deployable chapter</span>
+    <span class="chip">./gradlew :ch02:recipe_2_11:dockerRun</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch01/index.html">&larr; Chapter 1 — Spring Core Tasks</a>
+    <a href="../ch03/index.html">Chapter 3 — Spring REST &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc">
+    <h2>On this page</h2>
+    <ol>
+      <li><a href="#overview">Chapter map and module index</a></li>
+      <li><a href="#spine">The request path (spine)</a></li>
+      <li><a href="#bootstrap">Bootstrapping the DispatcherServlet (2.1)</a></li>
+      <li><a href="#domain">The Court domain and its collaborators</a></li>
+      <li><a href="#interceptor">Handler interceptors (2.3)</a></li>
+      <li><a href="#form">Form binding and validation errors (2.8–2.9)</a></li>
+      <li><a href="#errors">Failures as views (2.8.iii, 2.10, 2.11)</a></li>
+      <li><a href="#negotiate">Content negotiation and document views (2.7, 2.11)</a></li>
+      <li><a href="#war">How the WAR is served: Gretty vs Docker</a></li>
+      <li><a href="#running">Building and running</a></li>
+    </ol>
+  </aside>
+  <article>
+
+    <section id="overview">
+      <span class="kicker">Mental model</span>
+      <h2>Chapter map and module index</h2>
+      <p>Read Chapter 2 as a diff. <code>recipe_2_shared</code> supplies the entire model layer once —
+      <code>Reservation</code>, <code>Player</code>, <code>SportType</code>,
+      <code>PeriodicReservation</code>, the <code>@Service InMemoryReservationService</code>, a
+      Spring <code>Validator</code> and a <code>Converter</code> — and every
+      <code>recipe_2_N_M</code> module adds only the controllers, JSPs and
+      <code>@Configuration</code> classes needed to demonstrate one Spring MVC feature. Two
+      <code>@Controller</code> beans recur almost everywhere: <code>WelcomeController</code> bound to
+      <code>/welcome</code>, and <code>ReservationQueryController</code> bound to
+      <code>/reservationQuery</code>. From 2.8 the form-handling trio
+      <code>ReservationFormController</code> / <code>ReservationValidator</code> /
+      <code>reservationForm.jsp</code> takes over as the subject of study.</p>
+      <p>Each module applies <code>war</code>, <code>org.gretty</code> and the Palantir plugins (see
+      <code>ch02/build.gradle</code>), and the non-shared modules all depend on
+      <code>project(":ch02:recipe_2_shared")</code>. The output of every one of them is a WAR renamed
+      to <code>court.war</code>.</p>
+
+      <h3>Module Map</h3>
+      <table>
+        <thead>
+          <tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="num">2.0</td>
+            <td><code>recipe_2_shared</code></td>
+            <td>Domain, service, converters and interceptors shared by every web module. No
+            controllers live here; it is a plain <code>java</code> library on
+            <code>spring-webmvc</code> and <code>hibernate-validator</code>.</td>
+            <td><code>Reservation</code>, <code>Player</code>, <code>SportType</code>,
+            <code>ReservationValidator</code>, <code>SportTypeConverter</code>,
+            <code>InMemoryReservationService</code>, <code>MeasurementInterceptor</code>,
+            <code>ExtensionInterceptor</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.1</td>
+            <td><code>recipe_2_1_i</code> … <code>recipe_2_1_iii</code></td>
+            <td>Registering the front controller three ways. i: a hand-written
+            <code>ServletContainerInitializer</code> builds an
+            <code>AnnotationConfigWebApplicationContext</code> and calls
+            <code>ctx.addServlet("court", …)</code> mapped to <code>/</code>. ii:
+            <code>AbstractAnnotationConfigDispatcherServletInitializer</code> mapped to <code>/</code>.
+            iii: same base class, mappings <code>{"/", "/welcome"}</code>.</td>
+            <td><code>CourtServletContainerInitializer</code>,
+            <code>CourtWebApplicationInitializer</code>, <code>CourtApplicationInitializer</code>,
+            <code>CourtConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.2</td>
+            <td><code>recipe_2_2_i</code>, <code>recipe_2_2_ii</code></td>
+            <td>Request mapping patterns and a redirect. i: <code>@Controller MemberController</code>
+            with absolute paths <code>/member/add</code>, <code>/member/remove</code>. ii: a class-level
+            <code>@RequestMapping("/member/*")</code>, a <code>@PathVariable("/display/{member}")</code>,
+            and <code>return "redirect:"</code>.</td>
+            <td><code>MemberController</code>, <code>Member</code>,
+            <code>InMemoryMemberService</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.3</td>
+            <td><code>recipe_2_3_i</code>, <code>recipe_2_3_ii</code></td>
+            <td>Pre/post handling around a controller. i: a local <code>MeasurementInterceptor</code>
+            registered through <code>WebMvcConfigurer.addInterceptors</code>. ii: adds the shared
+            <code>ExtensionInterceptor</code> with <code>addPathPatterns("/reservationSummary*")</code>.</td>
+            <td><code>InterceptorConfiguration</code>, <code>MeasurementInterceptor</code>,
+            <code>ExtensionInterceptor</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.4</td>
+            <td><code>recipe_2_4_i</code></td>
+            <td>Locale switching: <code>LocaleChangeInterceptor</code> on the <code>language</code>
+            request parameter plus a <code>CookieLocaleResolver</code> (1-hour cookie, default
+            <code>en</code>).</td>
+            <td><code>I18NConfiguration</code>, <code>WelcomeController</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.5</td>
+            <td><code>recipe_2_5_i</code></td>
+            <td>Adds a <code>ResourceBundleMessageSource</code> named <code>messages</code> so
+            <code>required.*</code> and <code>typeMismatch.*</code> validation codes resolve to text;
+            ships <code>messages.properties</code> and <code>messages_de.properties</code>.</td>
+            <td><code>I18NConfiguration</code>, <code>InterceptorConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.6</td>
+            <td><code>recipe_2_6_i</code>, <code>recipe_2_6_ii</code></td>
+            <td>View-resolution config split out of <code>CourtConfiguration</code> into a dedicated
+            <code>ViewResolverConfiguration</code> exposing an
+            <code>InternalResourceViewResolver</code> (prefix <code>/WEB-INF/jsp/</code>, suffix
+            <code>.jsp</code>).</td>
+            <td><code>ViewResolverConfiguration</code>, <code>CourtConfiguration</code>,
+            <code>CourtApplicationInitializer</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.7</td>
+            <td><code>recipe_2_7_i</code></td>
+            <td>Content negotiation groundwork: <code>configureContentNegotiation</code> registers
+            media types for html/pdf/xls/xml/json with <code>favorPathExtension(true)</code> and
+            <code>registry.enableContentNegotiation()</code>.</td>
+            <td><code>ViewResolverConfiguration</code>, <code>InterceptorConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.8</td>
+            <td><code>recipe_2_8_i</code> … <code>recipe_2_8_iii</code></td>
+            <td>The reservation form plus three ways to turn a thrown exception into a view. i: a
+            <code>SimpleMappingExceptionResolver</code> from <code>ErrorHandlingConfiguration</code>.
+            ii: local <code>@ExceptionHandler</code> methods inside the controller. iii: those methods
+            move to a <code>@ControllerAdvice ExceptionHandlingAdvice</code>.</td>
+            <td><code>ReservationFormController</code>, <code>ReservationValidator</code>,
+            <code>ErrorHandlingConfiguration</code>, <code>ExceptionHandlingAdvice</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.9</td>
+            <td><code>recipe_2_9_i</code> … <code>recipe_2_9_iv</code></td>
+            <td>Form binding progression. i: bare <code>@ModelAttribute</code>. ii: pre-fill the player
+            from <code>@RequestParam username</code>. iii: a <code>@ModelAttribute("sportTypes")</code>
+            method feeds the select. iv: <code>@Validated</code> plus <code>@InitBinder</code> installing
+            <code>ReservationValidator</code> and a <code>BindingResult</code> branch that re-renders on
+            errors; <code>BindingConfiguration</code> registers <code>SportTypeConverter</code>.</td>
+            <td><code>ReservationFormController</code>, <code>BindingConfiguration</code>,
+            <code>SportTypeConverter</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.10</td>
+            <td><code>recipe_2_10</code></td>
+            <td><code>@ControllerAdvice ExceptionHandlingAdvice</code> kept, and view resolution becomes
+            a stack: an ordered <code>ResourceBundleViewResolver</code> (basename
+            <code>court-views</code>) plus <code>InternalResourceViewResolver</code> behind a
+            <code>ContentNegotiatingViewResolver</code>.</td>
+            <td><code>ExceptionHandlingAdvice</code>, <code>ViewResolverConfiguration</code>,
+            <code>ReservationFormController</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.11</td>
+            <td><code>recipe_2_11</code></td>
+            <td>Document views. <code>ReservationSummaryController</code> mapped to
+            <code>/reservationSummary*</code> returns view <code>reservationSummary</code>; a
+            <code>BeanNameViewResolver</code> maps <code>reservationSummary.pdf</code> and
+            <code>reservationSummary.xls</code> onto <code>AbstractPdfView</code> and
+            <code>AbstractXlsxView</code> beans. An <code>@ExceptionHandler</code> turns a bad
+            <code>date</code> parameter into <code>ReservationWebException</code>.</td>
+            <td><code>ReservationSummaryController</code>, <code>PdfReservationSummary</code>,
+            <code>ExcelReservationSummary</code>, <code>ViewResolverConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">2.12</td>
+            <td><code>recipe_2_12</code></td>
+            <td>Asynchronous MVC support: <code>AsyncConfiguration.configureAsyncSupport</code> sets a
+            5-second default timeout and a <code>ThreadPoolTaskExecutor</code> named
+            <code>mvcTaskExecutor</code>; carries the 2.11 view set forward.</td>
+            <td><code>AsyncConfiguration</code>, <code>CourtConfiguration</code>,
+            <code>ViewResolverConfiguration</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="spine">
+      <span class="kicker">The spine</span>
+      <h2>The request path</h2>
+      <p>Everything in the chapter hangs off one pipeline. The <code>DispatcherServlet</code> (registered
+      as the servlet named <code>court</code> in <code>recipe_2_1_i</code>) receives the request, asks its
+      <code>RequestMappingHandlerMapping</code> for a handler, invokes the controller method, and passes
+      the returned view name to the configured <code>ViewResolver</code>. This trace uses the real
+      collaborators from <code>recipe_2_6_i</code> / <code>recipe_2_1_iii</code>.</p>
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">GET/POST through DispatcherServlet to a JSP</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant B as Browser
+    participant D as DispatcherServlet court
+    participant HM as RequestMappingHandlerMapping
+    participant C as ReservationQueryController
+    participant S as InMemoryReservationService
+    participant VR as InternalResourceViewResolver
+    participant J as reservationQuery.jsp
+    B->>D: POST /reservationQuery with courtName
+    D->>HM: getHandler(request)
+    HM-->>D: HandlerExecutionChain, mapped method sumbitForm
+    D->>C: sumbitForm(courtName, model)
+    C->>S: query(courtName)
+    S-->>C: list of Reservation
+    C-->>D: return view name reservationQuery, model filled
+    D->>VR: resolveViewName(reservationQuery, locale)
+    VR-->>D: InternalResourceView /WEB-INF/jsp/reservationQuery.jsp
+    D->>J: RequestDispatcher forward, expose reservations
+    J-->>B: rendered HTML table
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Hop by hop: the servlet container hands the
+      request to <code>DispatcherServlet.doDispatch</code> (the servlet is named <code>court</code> in
+      <code>recipe_2_1_i/src/main/java/com/apress/spring6recipes/court/web/CourtServletContainerInitializer.java</code>).
+      The <code>RequestMappingHandlerMapping</code> supplied by <code>@EnableWebMvc</code> matches the
+      class-level <code>@RequestMapping("/reservationQuery")</code> plus the <code>@PostMapping</code>
+      method <code>sumbitForm</code> and returns a <code>HandlerExecutionChain</code>. The controller
+      delegates to <code>InMemoryReservationService.query</code> and drops the result into the
+      <code>Model</code> under <code>reservations</code>, then returns the logical view name. Because no
+      body is written, <code>DispatcherServlet</code> resolves that name through
+      <code>InternalResourceViewResolver</code> (prefix <code>/WEB-INF/jsp/</code>, suffix <code>.jsp</code>,
+      from <code>ViewResolverConfiguration</code>) into an <code>InternalResourceView</code>, which
+      <em>forwards</em> to the JSP. The JSP runs a JSTL <code>c:forEach</code> over the
+      <code>reservations</code> attribute and renders the table back to the browser.</p>
+    </section>
+
+    <section id="bootstrap">
+      <span class="kicker">Recipe 2.1</span>
+      <h2>Bootstrapping the DispatcherServlet</h2>
+      <p>The three <code>recipe_2_1_*</code> modules are the same app wired three ways, showing the move
+      off Servlet 3.0 boilerplate onto Spring's own initializer base class. All three map the servlet and
+      register <code>CourtConfiguration</code> (<code>@Configuration @ComponentScan("com.apress.spring6recipes.court")
+      @EnableWebMvc</code>). The only real difference is <em>who creates the <code>DispatcherServlet</code></em>
+      and the set of URL patterns.</p>
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Three bootstrap styles, converging on one servlet</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    cfg["CourtConfiguration, EnableWebMvc + ComponentScan"] --> ds["DispatcherServlet registered"]
+    i["recipe_2_1_i CourtServletContainerInitializer"] --> i1["implements ServletContainerInitializer"]
+    i1 --> i2["new AnnotationConfigWebApplicationContext, register CourtConfiguration"]
+    i2 --> i3["ctx.addServlet court mapped to / and loadOnStartup 1"]
+    ii["recipe_2_1_ii CourtWebApplicationInitializer"] --> ii1["extends AbstractAnnotationConfigDispatcherServletInitializer"]
+    ii1 --> ii2["getServletConfigClasses CourtConfiguration, mappings /"]
+    iii["recipe_2_1_iii CourtApplicationInitializer"] --> iii1["extends the same base class"]
+    iii1 --> iii2["getServletMappings / and /welcome"]
+    i3 --> ds
+    ii2 --> ds
+    iii2 --> ds
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Path <code>i</code> is the raw route: you
+      implement <code>ServletContainerInitializer.onStartup</code>, build an
+      <code>AnnotationConfigWebApplicationContext</code>, wrap it in a <code>DispatcherServlet</code> and
+      register it yourself with <code>ctx.addServlet("court", …)</code>. Paths <code>ii</code> and
+      <code>iii</code> delete all of that by extending
+      <code>AbstractAnnotationConfigDispatcherServletInitializer</code>: Spring's built-in
+      <code>SpringServletContainerInitializer</code> discovers it, and you only override
+      <code>getServletConfigClasses</code> (returning <code>CourtConfiguration.class</code>) and
+      <code>getServletMappings</code>. The one behavioural delta between <code>ii</code> and
+      <code>iii</code> is the mapping array — <code>iii</code> adds <code>/welcome</code> alongside
+      <code>/</code>. <code>getRootConfigClasses()</code> returns <code>null</code> in all of them, so the
+      whole context is the single servlet context.</p>
+    </section>
+
+    <section id="domain">
+      <span class="kicker">Shared model</span>
+      <h2>The Court domain and its collaborators</h2>
+      <p>The whole chapter manipulates one aggregate. <code>Reservation</code> carries bean-validation
+      annotations (<code>@NotNull @Size(min = 4)</code> on <code>courtName</code>, <code>@Min(8)
+      @Max(22)</code> on <code>hour</code>, <code>@DateTimeFormat(iso = …DATE)</code> on <code>date</code>,
+      <code>@Valid</code> on the nested <code>player</code>) that recipes 2.9 onward rely on. A Spring
+      <code>Validator</code> and a <code>Converter</code> — both <code>@Component</code> beans in the shared
+      module — are what later modules inject.</p>
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Domain objects, the service, the validator and the converter</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Reservation {
+        String courtName
+        LocalDate date
+        int hour
+        Player player
+        SportType sportType
+    }
+    class Player {
+        String name
+        String phone
+    }
+    class SportType {
+        int id
+        String name
+    }
+    class ReservationService {
+        &lt;&lt;interface&gt;&gt;
+        query(courtName)
+        make(reservation)
+        findByDate(summaryDate)
+        getAllSportTypes()
+        getSportType(id)
+    }
+    class InMemoryReservationService
+    class ReservationValidator {
+        supports(clazz)
+        validate(target, errors)
+    }
+    class SportTypeConverter {
+        convert(source)
+    }
+    class ReservationNotAvailableException
+    Reservation o-- Player : nested
+    Reservation o-- SportType : chosen
+    InMemoryReservationService ..|> ReservationService : implements
+    ReservationValidator ..> Reservation : validates
+    SportTypeConverter ..> ReservationService : resolves id
+    ReservationService ..> ReservationNotAvailableException : throws on clash
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the model.</strong> <code>Reservation</code> is a composition of a
+      <code>Player</code> and a <code>SportType</code> — the <code>@Valid</code> on <code>player</code>
+      cascades bean validation into <code>Player.name</code>/<code>Player.phone</code>
+      (<code>@NotEmpty</code>). <code>InMemoryReservationService</code> is package-private and
+      <code>@Service</code>-annotated, seeds two <code>Tennis #1</code>/<code>Tennis #2</code> rows, and
+      <code>make()</code> counts matching court/date/hour rows to throw
+      <code>ReservationNotAvailableException</code> (a <code>RuntimeException</code>) — that exception is
+      what 2.8 and 2.10 catch. <code>SportTypeConverter</code> turns the form's numeric
+      <code>sportType</code> string back into a <code>SportType</code> by delegating to
+      <code>ReservationService.getSportType</code>, and <code>ReservationValidator</code> enforces the
+      weekday/holiday hour windows via <code>Errors.reject</code>.</p>
+    </section>
+
+    <section id="interceptor">
+      <span class="kicker">Recipes 2.3–2.5</span>
+      <h2>Handler interceptors</h2>
+      <p>Interceptors wrap the controller call without touching it. A <code>WebMvcConfigurer</code> adds
+      them, and path patterns scope them. Two concrete interceptors ship: <code>MeasurementInterceptor</code>
+      (a <code>StopWatch</code> that injects a <code>processingTime</code> model attribute in
+      <code>postHandle</code>) and <code>ExtensionInterceptor</code> (which sets a
+      <code>Content-Disposition</code> download header based on the <code>.pdf</code>/<code>.xlsx</code>
+      suffix). Recipe 2.4/2.5 layer a <code>LocaleChangeInterceptor</code> on top.</p>
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Interceptor chain around one controller invocation</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant D as DispatcherServlet
+    participant MI as MeasurementInterceptor
+    participant EI as ExtensionInterceptor
+    participant C as Controller
+    D->>MI: preHandle, start StopWatch, stash attribute
+    MI-->>D: true, continue chain
+    D->>EI: preHandle (only for /reservationSummary star)
+    D->>C: handler method runs, returns ModelAndView
+    D->>MI: postHandle(request, response, handler, mv)
+    MI->>MI: stop StopWatch, mv.addObject processingTime
+    D->>EI: postHandle, set Content-Disposition for pdf or xlsx
+    D-->>D: render view with processingTime available
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> <code>InterceptorConfiguration</code>
+      (<code>recipe_2_3_i/…/config/InterceptorConfiguration.java</code>) implements
+      <code>WebMvcConfigurer.addInterceptors(InterceptorRegistry)</code> and calls
+      <code>registry.addInterceptor(measurementInterceptor())</code> — no path pattern, so it applies to
+      every mapped request. The second registration in 2.3_ii chains
+      <code>.addPathPatterns("/reservationSummary*")</code> to scope <code>ExtensionInterceptor</code>.
+      <code>preHandle</code> returning <code>true</code> lets the chain proceed; if it returned
+      <code>false</code> the controller would be skipped. <code>postHandle</code> runs after the handler
+      but <em>before</em> rendering, which is why <code>MeasurementInterceptor.postHandle</code> can still
+      add <code>processingTime</code> to the <code>ModelAndView</code> and have it appear in the view.
+      <code>LocaleChangeInterceptor</code> (2.4/2.5) is registered through
+      <code>I18NConfiguration.addInterceptors</code> with <code>paramName</code> <code>language</code>,
+      working with the <code>CookieLocaleResolver</code> that <code>resolveViewName</code> consults.</p>
+    </section>
+
+    <section id="form">
+      <span class="kicker">Recipes 2.8–2.9</span>
+      <h2>Form binding and validation errors</h2>
+      <p>The <code>reservationForm.jsp</code> is a Spring <code>&lt;form:form&gt;</code> bound to the
+      <code>reservation</code> model attribute, with one <code>&lt;form:errors&gt;</code> tag per field.
+      <code>recipe_2_9_iv</code> is the canonical case: the POST argument carries <code>@Validated</code>,
+      <code>@InitBinder</code> installs <code>ReservationValidator</code> as the binder's validator, and a
+      <code>BindingResult</code> parameter receives any failures. If the result has errors the controller
+      returns the same view instead of saving.</p>
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">POST /reservationForm rejected with field errors</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant B as Browser
+    participant D as DispatcherServlet
+    participant C as ReservationFormController
+    participant BD as WebDataBinder
+    participant RV as ReservationValidator
+    participant J as reservationForm.jsp
+    B->>D: POST /reservationForm (courtName, hour, player.name)
+    D->>BD: bind request params onto Reservation
+    BD->>RV: validate(reservation, BindingResult)
+    RV-->>BD: BindingResult, courtName and hour errors
+    D->>C: submitForm(reservation, result, status)
+    C->>C: result.hasErrors is true
+    C-->>D: return view name reservationForm (no save)
+    D->>J: forward, form:errors render messages
+    J-->>B: same form redisplayed with error text
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> On <code>@SessionAttributes("reservation")</code>
+      the form-backing object is kept in the session across the GET and POST. The GET
+      <code>setupForm</code> creates a fresh <code>Reservation</code> (pre-filling <code>Player</code>
+      from <code>@RequestParam username</code> in 2.9_ii onward) and adds it to the model; the
+      <code>@ModelAttribute("sportTypes")</code> method (2.9_iii) feeds the select. On POST, the argument
+      is annotated <code>@ModelAttribute("reservation") @Validated</code>, so Spring's
+      <code>WebDataBinder</code> binds the request parameters onto the object — using the registered
+      <code>SportTypeConverter</code> to turn <code>sportType</code> into a real <code>SportType</code> —
+      then runs validation. <code>@InitBinder</code> in
+      <code>recipe_2_9_iv/…/ReservationFormController.java</code> calls
+      <code>binder.setValidator(reservationValidator)</code>, so the errors come from
+      <code>ReservationValidator.validate</code>, and a <code>BindingResult</code> immediately after the
+      model argument captures them without throwing. <code>result.hasErrors()</code> being true returns
+      <code>"reservationForm"</code>; only the clean branch calls <code>reservationService.make(...)</code>
+      and <code>status.setComplete()</code> to clear the session before redirecting to
+      <code>reservationSuccess</code>.</p>
+    </section>
+
+    <section id="errors">
+      <span class="kicker">Recipes 2.8.iii, 2.10, 2.11</span>
+      <h2>Failures as views</h2>
+      <p>Three competing mechanisms turn a thrown exception into a rendered page, and the chapter shows
+      their evolution: an <code>ExceptionHandlerExceptionResolver</code> backed by local
+      <code>@ExceptionHandler</code> methods (2.8.ii), the same methods lifted into a
+      <code>@ControllerAdvice ExceptionHandlingAdvice</code> (2.8.iii, 2.10), and — earlier — a
+      <code>SimpleMappingExceptionResolver</code> driven by properties (2.8.i).</p>
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">ReservationNotAvailableException resolved to a view</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    ex["reservationService.make throws ReservationNotAvailableException"] --> hs{"DispatcherServlet HandlerExceptionResolver chain"}
+    hs -->|2_8_i| sm["SimpleMappingExceptionResolver, ErrorHandlingConfiguration"]
+    hs -->|2_8_ii| le["local ExceptionHandler methods in controller"]
+    hs -->|2_8_iii and 2_10| ca["ControllerAdvice ExceptionHandlingAdvice"]
+    sm --> nv["mapped view reservationNotAvailable"]
+    le --> nv
+    ca --> nv
+    hs -->|no specific handler| def["defaultErrorView error"]
+    nv --> render["InternalResourceViewResolver renders JSP"]
+    def --> render
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> In <code>recipe_2_8_i</code> the resolver comes
+      from <code>ErrorHandlingConfiguration</code>: <code>configureHandlerExceptionResolvers</code> adds a
+      <code>SimpleMappingExceptionResolver</code> whose <code>Properties</code> map the fully-qualified
+      <code>ReservationNotAvailableException</code> name to view <code>reservationNotAvailable</code>, with
+      <code>defaultErrorView("error")</code> for anything else. In <code>recipe_2_8_ii</code> the
+      controller declares <code>@ExceptionHandler(ReservationNotAvailableException.class)</code> and a
+      catch-all <code>@ExceptionHandler</code> locally, dispatched by Spring's built-in
+      <code>ExceptionHandlerExceptionResolver</code>. From <code>recipe_2_8_iii</code> (and reused verbatim
+      in 2.10) those methods move into <code>@ControllerAdvice ExceptionHandlingAdvice</code>, making them
+      apply across every controller in the context. In <code>recipe_2_11</code> the advice pattern is
+      inverted for the summary page: a local <code>@ExceptionHandler</code> catches
+      <code>ServletRequestBindingException</code> from a malformed <code>date</code> parameter and rethrows
+      a <code>ReservationWebException</code>.</p>
+    </section>
+
+    <section id="negotiate">
+      <span class="kicker">Recipes 2.7, 2.11</span>
+      <h2>Content negotiation and document views</h2>
+      <p>Recipe 2.7 registers media types and switches on the path extension; 2.11 uses that to serve the
+      <em>same</em> model as HTML, PDF or Excel. The trick is a <code>BeanNameViewResolver</code>: the
+      negotiated view name plus extension (for example <code>reservationSummary.pdf</code>) matches the
+      <em>name</em> of a view bean, and that bean (<code>AbstractPdfView</code> /
+      <code>AbstractXlsxView</code>) renders the document itself instead of forwarding to a JSP.</p>
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">One view name, three renderers</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    req["GET /reservationSummary with date and path extension"] --> ds["DispatcherServlet"]
+    ds --> ctl["ReservationSummaryController.generateSummary"]
+    ctl --> model["model reservations from findByDate"]
+    model --> name["view name reservationSummary"]
+    name --> mgr["ContentNegotiationManager, favorPathExtension true"]
+    mgr --> ext{"negotiated media type"}
+    ext -->|html| jsp["InternalResourceViewResolver to JSP"]
+    ext -->|pdf| bn["BeanNameViewResolver"]
+    ext -->|xls| bn
+    bn --> pdfv["bean reservationSummary dot pdf, PdfReservationSummary"]
+    bn --> xlsv["bean reservationSummary dot xls, ExcelReservationSummary"]
+    pdfv --> out["AbstractPdfView writes document"]
+    xlsv --> out2["AbstractXlsxView writes workbook"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong>
+      <code>recipe_2_11/…/config/ViewResolverConfiguration.java</code> calls
+      <code>configureContentNegotiation</code> to register <code>html</code>, <code>pdf</code>
+      (<code>MediaType.APPLICATION_PDF</code>) and <code>xls</code>
+      (<code>application/vnd.ms-excel</code>) with <code>favorPathExtension(true)</code>, then
+      <code>configureViewResolvers</code> enables content negotiation, registers the JSP resolver, and adds
+      a <code>BeanNameViewResolver</code>. The controller returns the plain logical name
+      <code>reservationSummary</code>; the request's <code>.pdf</code>/<code>.xls</code> extension
+      determines the media type, and <code>BeanNameViewResolver</code> looks up a bean literally named
+      <code>reservationSummary.pdf</code> or <code>reservationSummary.xls</code> — the two
+      <code>@Bean(name = …)</code> methods returning <code>PdfReservationSummary</code>
+      (extends <code>AbstractPdfView</code>, builds a <code>com.lowagie.text.Table</code>) and
+      <code>ExcelReservationSummary</code> (extends <code>AbstractXlsxView</code>, uses Apache POI). The
+      <code>ExtensionInterceptor</code> from 2.3 then decorates the response with a
+      <code>Content-Disposition</code> filename.</p>
+    </section>
+
+    <section id="war">
+      <span class="kicker">Chapter-specific infrastructure</span>
+      <h2>How the WAR is served: Gretty vs Docker</h2>
+      <p>Unlike the rest of the book, Chapter 2 produces a real deployable. <code>ch02/build.gradle</code>
+      applies <code>war</code>, renames the artifact to <code>court.war</code>, and gives you two ways to
+      run it: an embedded Tomcat 10 through Gretty, or a container image through the Palantir plugins and
+      <code>ch02/Dockerfile</code> (Eclipse Temurin 19 on Alpine, Tomcat 10.1.4, debug port 5005).</p>
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">From sources to a served Court app, two routes</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    src["java + jsp + webapp resources"] --> wartask["war task renames to court.war"]
+    wartask --> route{"Serving route"}
+    route -->|Gretty| g["org.gretty 4.0.3, servletContainer tomcat10, contextPath /"]
+    g --> gt["gradlew :ch02:recipe_2_11:tomcatRun"]
+    gt --> gu["http localhost 8080 slash welcome"]
+    route -->|Docker| d["com.palantir.docker, files war.outputs, dockerfile ../Dockerfile"]
+    d --> img["image s6r/court-web colon recipe_2_11"]
+    img --> dr["dockerRun, ports 8080 to 8080, jdwp 5005"]
+    dr --> du["http localhost 8080 slash welcome"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The <code>subprojects</code> block in
+      <code>ch02/build.gradle</code> skips the <code>shared</code> module and applies
+      <code>war</code>, <code>com.palantir.docker</code>, <code>com.palantir.docker-run</code> and
+      <code>org.gretty</code> to every other module, with <code>defaultTasks 'build', 'docker'</code>. The
+      <code>war</code> block sets <code>archiveFileName = 'court.war'</code>. On the Gretty branch
+      <code>gretty { servletContainer = 'tomcat10'; contextPath = '/' }</code> means
+      <code>tomcatRun</code> boots an embedded Tomcat on the default port 8080 at the root context. On the
+      Docker branch the <code>docker</code> block names the image <code>s6r/court-web:$project.name</code>
+      (so <code>s6r/court-web:recipe_2_11</code>), copies the built <code>court.war</code> into the
+      Dockerfile's <code>$CATALINA_HOME/webapps/</code>, and <code>dockerRun</code> starts a container
+      <code>s6r-court-web-$project.name</code> mapping <code>8080:8080</code>; the Dockerfile also opens
+      JDWP on <code>5005</code> for remote debugging.</p>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Build and run</span>
+      <h2>Building and running</h2>
+      <p>All commands run from the repository root against the fully-qualified Gradle project path
+      (<code>:ch02:&lt;module&gt;</code>). Nothing needs a database or external broker — the service is the
+      in-memory <code>InMemoryReservationService</code> — but serving a page needs either Gretty or Docker,
+      because these are WARs deployed into a servlet container.</p>
+      <table>
+        <thead>
+          <tr><th>Goal</th><th>Command</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Compile + build the WAR only</td>
+            <td><code>./gradlew :ch02:recipe_2_11:war</code></td>
+            <td>Produces <code>build/libs/court.war</code> (name forced by <code>war { archiveFileName }</code>).</td>
+          </tr>
+          <tr>
+            <td>Serve with embedded Tomcat (Gretty)</td>
+            <td><code>./gradlew :ch02:recipe_2_11:tomcatRun</code></td>
+            <td><code>servletContainer = 'tomcat10'</code>, <code>contextPath = '/'</code>; app at
+            <code>http://localhost:8080/welcome</code> and <code>/reservationQuery</code>.</td>
+          </tr>
+          <tr>
+            <td>Build the container image</td>
+            <td><code>./gradlew :ch02:recipe_2_11:docker</code></td>
+            <td>Uses <code>ch02/Dockerfile</code> (Temurin 19 Alpine, Tomcat 10.1.4); image
+            <code>s6r/court-web:recipe_2_11</code>.</td>
+          </tr>
+          <tr>
+            <td>Run the image</td>
+            <td><code>./gradlew :ch02:recipe_2_11:dockerRun</code></td>
+            <td>Container <code>s6r-court-web-recipe_2_11</code>, ports <code>8080:8080</code>
+            (plus 5005 for JDWP).</td>
+          </tr>
+          <tr>
+            <td>Build everything (default tasks)</td>
+            <td><code>./gradlew :ch02:build</code></td>
+            <td>Non-shared modules default to <code>build</code> then <code>docker</code>, so a JDK and a
+            reachable Docker daemon are required for the full chapter build.</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="reading"><strong>Prerequisites found in source.</strong> Docker is genuinely required if you
+      run the default tasks or the <code>docker</code>/<code>dockerRun</code> goals — <code>defaultTasks
+      'build', 'docker'</code> is set in <code>ch02/build.gradle</code> and the <code>Dockerfile</code>
+      downloads Tomcat at build time. If you only want a page on screen without Docker, use the Gretty
+      <code>tomcatRun</code> task. <code>recipe_2_11</code> and <code>recipe_2_12</code> additionally pull
+      <code>openpdf</code> and <code>poi-ooxml</code> for the document views, and validation messages come
+      from <code>messages.properties</code>/<code>messages_de.properties</code> resolved by the
+      <code>ResourceBundleMessageSource</code> in 2.5 onward.</p>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch02/</code>. <a href="../index.html">&larr; Spring 6 Recipes index</a>
+</footer>
+</body>
+</html>

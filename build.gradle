@@ -4,6 +4,7 @@ plugins {
     id 'com.palantir.docker-run' version '0.34.0' apply false
     id 'com.intershop.gradle.jaxb' version '5.2.1' apply false
     id 'com.github.johnrengelman.shadow' version '7.1.2' apply false
+    id 'org.gretty' version '4.0.3' apply false
 }
 
 allprojects {

@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spring 6 Recipes — Illustrated Chapter Map</title>
+<link rel="stylesheet" href="assets/style.css">
+<script src="assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb">Apress source code &rsaquo; Spring 6 Recipes</div>
+  <h1>Spring 6 Recipes — Illustrated Chapter Map</h1>
+  <p class="lede">Fourteen chapter pages of Mermaid diagrams and mechanism-level notes, generated from the
+  recipe modules in this repository. Each chapter page maps every recipe it covers, then draws the
+  interactions the code actually performs.</p>
+  <div class="chip-row">
+    <span class="chip">14 chapters</span>
+    <span class="chip">370 Gradle modules</span>
+    <span class="chip">1,885 Java files</span>
+    <span class="chip">Spring Framework 6.0.3</span>
+    <span class="chip">group com.apress.spring6recipes</span>
+    <span class="chip">version 6.0.0-SNAPSHOT</span>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="toc">
+    <h2>On this page</h2>
+    <ol>
+      <li><a href="#overview">How to use these pages</a></li>
+      <li><a href="#chapters">Chapter index</a></li>
+      <li><a href="#layers">What each chapter covers</a></li>
+      <li><a href="#build">Build topology</a></li>
+      <li><a href="#platform">Dependency platform</a></li>
+      <li><a href="#running">Prerequisites and running</a></li>
+    </ol>
+  </aside>
+
+  <article>
+    <section id="overview">
+      <span class="kicker">Reading guide</span>
+      <h2>How to use these pages</h2>
+      <p>Every chapter page follows the same shape, so you can drop into any chapter cold:</p>
+      <ul>
+        <li>A <strong>Module Map</strong> table listing every recipe number in the chapter, the Gradle
+          modules implementing it, and the key classes to open first.</li>
+        <li><strong>Diagrams</strong> — class, sequence, flowchart and state diagrams chosen to suit the
+          subject, each with a <em>Reading the flow</em> note that walks the arrows in order and names the
+          Spring mechanism responsible.</li>
+        <li>A <strong>Running</strong> section with real Gradle paths and any Docker, database or broker
+          prerequisite the source actually requires.</li>
+      </ul>
+      <p>Diagrams render from a vendored, self-contained copy of Mermaid 12 in
+        <span class="path">docs/assets/mermaid.min.js</span>, so these pages work offline straight from the
+        filesystem — open <span class="path">docs/index.html</span> in a browser, or serve the folder:</p>
+      <pre><code>cd docs
+python -m http.server 8080      # then browse http://localhost:8080/</code></pre>
+      <div class="callout info">
+        <h4>Trust the code, not the picture</h4>
+        <p>Each page cites the module paths its classes came from. Where a page and the source disagree,
+        the source wins — the recipes are small and quick to open. Cross-references between chapters are
+        deliberate: chapters 10, 11 and 12 all touch messaging and each page states where its own boundary
+        lies.</p>
+      </div>
+    </section>
+
+    <section id="chapters">
+      <span class="kicker">Index</span>
+      <h2>Chapter index</h2>
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The book as a dependency ladder</span>
+          <span>Later chapters assume the container knowledge from chapter 1; the shaded groups are where
+          you can start cold.</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    subgraph core["Container foundation"]
+        c1["Ch 1 - Spring Core Tasks<br/>IoC, bean definitions, wiring"]
+    end
+    subgraph web["Web and API tier"]
+        c2["Ch 2 - Spring MVC"]
+        c3["Ch 3 - Spring REST"]
+        c4["Ch 4 - Spring WebFlux"]
+    end
+    subgraph cross["Cross-cutting concern"]
+        c5["Ch 5 - Spring Security"]
+    end
+    subgraph data["Persistence and consistency"]
+        c6["Ch 6 - Data Access"]
+        c7["Ch 7 - Transaction Management"]
+        c9["Ch 9 - NoSQL Data Access"]
+    end
+    subgraph eip["Enterprise integration"]
+        c8["Ch 8 - Spring Batch"]
+        c10["Ch 10 - Enterprise Integration"]
+        c11["Ch 11 - Spring Messaging"]
+        c12["Ch 12 - Spring Integration"]
+    end
+    subgraph qual["Quality and performance"]
+        c13["Ch 13 - Spring Testing"]
+        c14["Ch 14 - Caching"]
+    end
+    c1 --&gt; c2
+    c1 --&gt; c6
+    c2 --&gt; c3
+    c3 --&gt; c4
+    c1 --&gt; c5
+    c6 --&gt; c7
+    c6 --&gt; c9
+    c7 --&gt; c8
+    c1 --&gt; c10
+    c10 --&gt; c11
+    c11 --&gt; c12
+    c1 --&gt; c13
+    c6 --&gt; c14
+    c5 --- web
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the ladder.</strong> The arrows are teaching order, not build
+      order — every recipe module is independent at build time. Chapter 1 sits at the root because
+      everything else in the book is an application of the container: chapter 2 and 3 layer an HTTP
+      dispatcher over it, chapter 5 intercepts those requests with a filter chain, chapters 6 and 7 add a
+      persistence and transactional-proxy layer beneath them, and chapters 8 to 12 move the same
+      bean-and-proxy model out to brokers, jobs and external systems. Chapter 13 then tests all of it and
+      chapter 14 wraps the service beans of chapters 6 and 7 in a caching proxy.</p>
+
+      <div class="cards">
+        <a class="card" href="ch01/index.html"><span class="ck">Chapter 1</span>
+          <h3>Spring Core Tasks</h3>
+          <p>The IoC container itself: bean definitions, injection styles, scopes, SpEL and configuration
+          metadata.</p><span class="meta">59 modules · 408 files</span></a>
+        <a class="card" href="ch02/index.html"><span class="ck">Chapter 2</span>
+          <h3>Spring MVC</h3>
+          <p>Servlet request handling, controllers, views and form binding. Served through Gretty or a
+          Docker image.</p><span class="meta">23 modules · 167 files</span></a>
+        <a class="card" href="ch03/index.html"><span class="ck">Chapter 3</span>
+          <h3>Spring REST</h3>
+          <p>HTTP resource APIs, message converters, content negotiation and XML payloads via JAXB.</p>
+          <span class="meta">24 modules · 86 files</span></a>
+        <a class="card" href="ch04/index.html"><span class="ck">Chapter 4</span>
+          <h3>Spring WebFlux</h3>
+          <p>Reactive endpoints on Reactor — annotation-based and functional routing side by side.</p>
+          <span class="meta">16 modules · 76 files</span></a>
+        <a class="card" href="ch05/index.html"><span class="ck">Chapter 5</span>
+          <h3>Spring Security</h3>
+          <p>Authentication, authorisation and the filter chain that enforces them.</p>
+          <span class="meta">26 modules · 111 files</span></a>
+        <a class="card" href="ch06/index.html"><span class="ck">Chapter 6</span>
+          <h3>Spring Data Access</h3>
+          <p>JDBC and JPA: entity mapping, repositories, query derivation and datasource configuration.</p>
+          <span class="meta">43 modules · 132 files</span></a>
+        <a class="card" href="ch07/index.html"><span class="ck">Chapter 7</span>
+          <h3>Spring Transaction Management</h3>
+          <p>Transactional proxies, propagation, isolation and the real commit-versus-rollback rules.</p>
+          <span class="meta">17 modules · 114 files</span></a>
+        <a class="card" href="ch08/index.html"><span class="ck">Chapter 8</span>
+          <h3>Spring Batch</h3>
+          <p>Jobs, steps and chunk-oriented processing against the batch metadata repository.</p>
+          <span class="meta">16 modules · 64 files</span></a>
+        <a class="card" href="ch09/index.html"><span class="ck">Chapter 9</span>
+          <h3>Spring Data Access with NoSQL</h3>
+          <p>Non-relational mappings and repositories; several stores need a running server.</p>
+          <span class="meta">28 modules · 129 files</span></a>
+        <a class="card" href="ch10/index.html"><span class="ck">Chapter 10</span>
+          <h3>Spring Enterprise Integration</h3>
+          <p>Endpoints and gateways bridging Spring to external enterprise systems. Docker-backed.</p>
+          <span class="meta">33 modules · 215 files</span></a>
+        <a class="card" href="ch11/index.html"><span class="ck">Chapter 11</span>
+          <h3>Spring Messaging</h3>
+          <p>The messaging abstraction layer, with its boundary against chapters 10 and 12 made explicit.</p>
+          <span class="meta">32 modules · 163 files</span></a>
+        <a class="card" href="ch12/index.html"><span class="ck">Chapter 12</span>
+          <h3>Spring Integration</h3>
+          <p>Enterprise integration patterns: channels, gateways, adapters and routers.</p>
+          <span class="meta">17 modules · 77 files</span></a>
+        <a class="card" href="ch13/index.html"><span class="ck">Chapter 13</span>
+          <h3>Spring Testing</h3>
+          <p>TestContext lifecycle, context caching, mocks and slices. Uses Testcontainers.</p>
+          <span class="meta">21 modules · 77 files</span></a>
+        <a class="card" href="ch14/index.html"><span class="ck">Chapter 14</span>
+          <h3>Caching</h3>
+          <p>The cache abstraction as a proxy over service beans, across several providers.</p>
+          <span class="meta">15 modules · 66 files</span></a>
+      </div>
+    </section>
+
+    <section id="layers">
+      <span class="kicker">Coverage</span>
+      <h2>What each chapter covers</h2>
+      <table>
+        <thead><tr><th>Ch</th><th>Title</th><th>Modules</th><th>Java files</th>
+          <th>Build-time infrastructure found in <span class="path">chNN/build.gradle</span></th></tr></thead>
+        <tbody>
+          <tr><td class="num">1</td><td>Spring Core Tasks</td><td>59</td><td>408</td><td><code>shadow</code> fat-jar plugin</td></tr>
+          <tr><td class="num">2</td><td>Spring MVC</td><td>23</td><td>167</td><td><code>org.gretty</code> embedded container, <code>com.palantir.docker-run</code></td></tr>
+          <tr><td class="num">3</td><td>Spring REST</td><td>24</td><td>86</td><td><code>com.palantir.docker-run</code>, <code>com.intershop.gradle.jaxb</code></td></tr>
+          <tr><td class="num">4</td><td>Spring WebFlux</td><td>16</td><td>76</td><td><code>com.palantir.docker-run</code>, <code>shadow</code></td></tr>
+          <tr><td class="num">5</td><td>Spring Security</td><td>26</td><td>111</td><td><code>com.palantir.docker-run</code></td></tr>
+          <tr><td class="num">6</td><td>Spring Data Access</td><td>43</td><td>132</td><td>Plain <code>java</code> plugin only</td></tr>
+          <tr><td class="num">7</td><td>Spring Transaction Management</td><td>17</td><td>114</td><td>Plain <code>java</code> plugin only</td></tr>
+          <tr><td class="num">8</td><td>Spring Batch</td><td>16</td><td>64</td><td><code>shadow</code></td></tr>
+          <tr><td class="num">9</td><td>Spring Data Access with NoSQL</td><td>28</td><td>129</td><td>Plain <code>java</code> plugin only</td></tr>
+          <tr><td class="num">10</td><td>Spring Enterprise Integration</td><td>33</td><td>215</td><td><code>com.palantir.docker-run</code>, <code>jaxb</code>, <code>shadow</code></td></tr>
+          <tr><td class="num">11</td><td>Spring Messaging</td><td>32</td><td>163</td><td><code>shadow</code></td></tr>
+          <tr><td class="num">12</td><td>Spring Integration</td><td>17</td><td>77</td><td>Plain <code>java</code> plugin only</td></tr>
+          <tr><td class="num">13</td><td>Spring Testing</td><td>21</td><td>77</td><td>Testcontainers on the test classpath</td></tr>
+          <tr><td class="num">14</td><td>Caching</td><td>15</td><td>66</td><td><code>shadow</code></td></tr>
+        </tbody>
+      </table>
+      <p class="note">Module counts include each chapter's shared helper module (for example
+      <code>recipe_5_shared</code>), which is a real Gradle project but not a numbered recipe.
+      <code>ch01/springintro</code> is source that the build does <em>not</em> include as a project.</p>
+    </section>
+
+    <section id="build">
+      <span class="kicker">Topology</span>
+      <h2>Build topology</h2>
+      <p>The multi-module build is generated rather than declared: <span class="path">settings.gradle</span>
+      walks the repository from the root and includes any directory whose name begins with
+      <code>recipe</code> or <code>appendix</code>, pruning anything that does not match
+      <code>^(ch|recipe|appendix)</code>. Adding a recipe directory therefore adds a Gradle project with no
+      edit to <span class="path">settings.gradle</span>.</p>
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">How one recipe module gets compiled</span>
+          <span>Follow the arrows left to right: discovery, then the two projects every recipe inherits
+          from, then the compile classpath each contributes.</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph disc["Project discovery, settings.gradle"]
+        walk["Traverse root directory"] --&gt; match{"Name starts with recipe or appendix?"}
+        match --&gt;|yes| inc["include as Gradle project"]
+        match --&gt;|no| skip["SKIP_SUBTREE"]
+    end
+    subgraph support["Support projects"]
+        bom["spring-6-recipes-dependencies<br/>java-platform"]
+        shared["shared-resources<br/>java-library, Utils class"]
+    end
+    inc --&gt; sub["subproject applies java plugin"]
+    sub --&gt; tool["Java 19 toolchain<br/>with --enable-preview"]
+    sub --&gt; dep["enforcedPlatform BOM<br/>plus implementation shared-resources"]
+    bom --&gt; dep
+    shared --&gt; dep
+    dep --&gt; cp["Recipe compile classpath:<br/>Spring, SLF4J, Jakarta annotations, JUnit Jupiter, Mockito, spring-test"]
+    cp --&gt; out["build output: jar, uberJar, test results"]
+    tool --&gt; out
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the topology.</strong> <span class="path">build.gradle</span> in the
+      root applies <code>java</code> to every subproject except <code>spring-6-recipes-dependencies</code>,
+      then adds the BOM and <code>shared-resources</code> only to projects whose name contains
+      <code>recipe</code>. The BOM is wired as <code>enforcedPlatform</code>, which is the load-bearing
+      detail: it pins transitive Spring versions and <em>refuses</em> to let a recipe module override them,
+      so a dependency added without a version inside a recipe resolves to the platform's version. The root
+      build also excludes <code>commons-logging</code>, JUnit 4 and the vintage engine from every
+      configuration, which is why every recipe in the book tests on the JUnit Platform.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Version resolution for one recipe dependency</span>
+          <span>Shows why no recipe <span class="path">build.gradle</span> needs to state a Spring version.</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant R as Recipe build.gradle
+    participant P as Root subprojects block
+    participant B as enforcedPlatform
+    participant G as Maven Central plus Spring snapshot and milestone repos
+    R-&gt;&gt;P: declare implementation spring-context, no version
+    P-&gt;&gt;B: dependencyManagement extends platform
+    B-&gt;&gt;G: resolve spring-framework-bom 6.0.3
+    G--&gt;&gt;B: constraint set for every Spring artifact
+    B--&gt;&gt;P: pinned version 6.0.3
+    P--&gt;&gt;R: compiled against 6.0.3
+        </pre>
+      </figure>
+    </section>
+
+    <section id="platform">
+      <span class="kicker">Versions</span>
+      <h2>Dependency platform</h2>
+      <p>Everything the diagrams in these pages describe runs on the versions below, taken directly from
+      <span class="path">spring-6-recipes-dependencies/build.gradle</span>.</p>
+      <table>
+        <thead><tr><th>Platform BOM</th><th>Version</th><th>Chapter pages it underpins</th></tr></thead>
+        <tbody>
+          <tr><td><code>spring-framework-bom</code></td><td>6.0.3</td><td>Chapters 1–7, 12, 13, 14</td></tr>
+          <tr><td><code>spring-security-bom</code></td><td>6.0.1</td><td>Chapter 5</td></tr>
+          <tr><td><code>spring-data-bom</code></td><td>2022.0.0</td><td>Chapters 6, 9</td></tr>
+          <tr><td><code>spring-batch-bom</code></td><td>5.0.0</td><td>Chapter 8</td></tr>
+          <tr><td><code>spring-integration-bom</code></td><td>6.0.0</td><td>Chapters 10–12</td></tr>
+          <tr><td><code>reactor-bom</code></td><td>2022.0.0</td><td>Chapters 4, 11</td></tr>
+          <tr><td><code>jakartaee-bom</code></td><td>9.1.0</td><td>Chapters 2, 3, 6, 9 (persistence, servlet, validation APIs)</td></tr>
+          <tr><td><code>jackson-bom</code></td><td>2.14.1</td><td>Chapters 3, 4, 9, 10</td></tr>
+          <tr><td><code>junit-bom</code> / <code>mockito-bom</code></td><td>5.9.1 / 4.10.0</td><td>Chapter 13, and every recipe's tests</td></tr>
+          <tr><td><code>testcontainers-bom</code></td><td>1.17.6</td><td>Chapter 13</td></tr>
+          <tr><td><code>thymeleaf-lib</code></td><td>3.1.1.RELEASE</td><td>Chapter 2 views</td></tr>
+          <tr><td><code>micrometer-bom</code> / <code>rsocket-bom</code> / <code>cxf-bom</code></td><td>1.10.2 / 1.1.3 / 3.5.4</td><td>Chapters 4, 10, 11</td></tr>
+        </tbody>
+      </table>
+      <h4>Pinned constraints of note</h4>
+      <p><code>HikariCP 5.0.1</code> and <code>h2 2.1.214</code> for pooled relational access,
+      <code>jedis 4.3.1</code> and the Couchbase <code>java-client 3.4.1</code> for NoSQL,
+      <code>caffeine 3.1.2</code> plus <code>jcache</code> for caching, <code>jakarta.mail 2.0.1</code> and
+      <code>rome 1.18.0</code> for integration payloads, <code>gson 2.10</code> and
+      <code>openpdf 1.3.30</code> for view and report work.</p>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Hands on</span>
+      <h2>Prerequisites and running</h2>
+      <ul>
+        <li><strong>JDK 19+</strong> — the toolchain target is 19 and every compile, test and exec task adds
+          <code>--enable-preview</code>, so preview features used in the book's code require a JVM new
+          enough to accept that flag.</li>
+        <li><strong>A Gradle daemon JDK caveat.</strong> The wrapper is
+          <span class="path">gradle-7.6</span>, which cannot run on Java 21
+          (<em>Unsupported class file major version 65</em>). <span class="path">gradle.properties</span>
+          works around this by setting <code>org.gradle.java.home</code> to a local JDK 17 install while the
+          toolchain still compiles at 19. That path is machine-specific — change or remove it for your own
+          machine before building.</li>
+        <li><strong>Docker</strong> for chapters 2, 3, 4, 5 and 10, which apply
+          <code>com.palantir.docker</code> and <code>com.palantir.docker-run</code>, and for chapter 13's
+          Testcontainers recipes.</li>
+      </ul>
+      <pre><code># Everything
+./gradlew build
+
+# One chapter's recipes
+./gradlew :ch01:build
+
+# A single recipe: compile, then run its main class
+./gradlew :ch05:recipe_5_1_ii:compileJava
+./gradlew :ch05:recipe_5_1_ii:build
+
+# A web recipe that needs a servlet container (chapter 2 uses Gretty)
+./gradlew :ch02:recipe_2_1_i:war
+
+# Fat jar for a runnable recipe
+./gradlew :ch01:recipe_1_1_i:uberJar</code></pre>
+      <p>Backing services for the integration and data chapters are composed from
+      <span class="path">bin/</span> rather than per-module:</p>
+      <table>
+        <thead><tr><th>Compose file</th><th>Provides</th></tr></thead>
+        <tbody>
+          <tr><td><span class="path">bin/docker-compose-all.yml</span></td><td>The combined set of backing services</td></tr>
+          <tr><td><span class="path">bin/docker-compose-kafka.yml</span></td><td>Kafka broker — messaging recipes</td></tr>
+          <tr><td><span class="path">bin/docker-compose-rabbitmq.yml</span></td><td>RabbitMQ — AMQP recipes</td></tr>
+          <tr><td><span class="path">bin/docker-compose-vehicle.yml</span></td><td>The vehicle sample used by a security recipe</td></tr>
+          <tr><td><span class="path">ch05/recipe_5_3_v/src/main/docker/docker-compose.yml</span></td><td>A module-local service</td></tr>
+        </tbody>
+      </table>
+      <p class="note">Each chapter page lists its own prerequisites precisely, recipe by recipe —
+      this table is only the repository-level summary.</p>
+    </section>
+  </article>
+</div>
+
+<footer class="pagefoot">
+  Diagrams built from <span class="path">ch01/</span> through <span class="path">ch14/</span> in this
+  repository. Source: <em>Spring 6 Recipes</em>, Marten Deinum, Daniel Rubio and Josh Long (Apress, 2023).
+  Mermaid 12.0.0 vendored locally, so every page renders without network access.
+</footer>
+</body>
+</html>

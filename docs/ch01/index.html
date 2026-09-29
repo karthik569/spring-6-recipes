@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 1 — Spring Core Tasks — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 1</div>
+  <h1>Chapter 1 — Spring Core Tasks</h1>
+  <p class="lede">Everything in this chapter is about one object: the <code>ApplicationContext</code>. Fifty-nine runnable
+  modules take a plain <code>Sequence</code>, a shop made of <code>Product</code>, <code>ShoppingCart</code> and
+  <code>Cashier</code>, and a calculator pair, and walk them through bean definition, injection, scope, lifecycle,
+  externalised values, factory creation, profiles, AspectJ advice and load-time weaving. No web layer, no database —
+  every module is a <code>main</code> method that boots a container and prints.</p>
+  <div class="chip-row">
+    <span class="chip">59 recipe modules, 1.1–1.25</span>
+    <span class="chip">408 Java files</span>
+    <span class="chip">AnnotationConfigApplicationContext</span>
+    <span class="chip">@Configuration @Bean @ComponentScan</span>
+    <span class="chip">@EnableAspectJAutoProxy</span>
+    <span class="chip">./gradlew :ch01:recipe_1_1_i:build</span>
+    <span class="chip">Java 19 toolchain, --enable-preview</span>
+    <span class="chip">no Docker, no DB, no ports</span>
+  </div>
+
+  <nav class="pager">
+    <a href="../index.html">&larr; All chapters</a>
+    <a href="../ch02/index.html">Chapter 2 — Spring MVC &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc">
+    <h2>On this page</h2>
+    <ol>
+      <li><a href="#overview">Mental model and module map</a></li>
+      <li><a href="#injection">Injecting collaborators</a></li>
+      <li><a href="#scope-lifecycle">Scope and lifecycle</a></li>
+      <li><a href="#externalized">Externalised values and messages</a></li>
+      <li><a href="#factories-profiles">Factory beans and profiles</a></li>
+      <li><a href="#aop">AspectJ advice and pointcuts</a></li>
+      <li><a href="#weaving">Introductions and load-time weaving</a></li>
+      <li><a href="#executors-events">Task executors and application events</a></li>
+      <li><a href="#running">Building and running</a></li>
+    </ol>
+  </aside>
+  <article>
+
+    <section id="overview">
+      <span class="kicker">Overview</span>
+      <h2>Mental model and module map</h2>
+      <p>Every module in <code>ch01/</code> is the same four-act shape: a <em>configuration source</em> declares beans,
+      a <em>context</em> is booted from it, a <em>client</em> (always <code>Main</code> or a <code>Demo</code> class)
+      asks the context for a bean, and the bean does something printable. The chapter's variety comes from swapping
+      one of those four parts: a <code>@Bean</code> method instead of XML, a scanned <code>@Component</code> instead
+      of a declared bean, a prototype instead of a singleton, an advice chain wrapped around the returned object.</p>
+      <p>Two domains carry the load. The <strong>sequence</strong> examples
+      (<code>ch01/recipe_1_1_i</code> … <code>recipe_1_4_ii</code>, plus <code>recipe_1_25_*</code>) use one tiny class,
+      <code>Sequence</code> with a <code>PrefixGenerator</code> collaborator, so that injection and qualifier mechanics
+      are all that is visible. The <strong>shop</strong> examples
+      (<code>recipe_1_2</code>, <code>recipe_1_5_i</code> … <code>recipe_1_6_ii</code>, <code>recipe_1_8_*</code>,
+      <code>recipe_1_9_*</code>, <code>recipe_1_10_*</code>, <code>recipe_1_11</code>, <code>recipe_1_12</code>,
+      <code>recipe_1_24_*</code>) add state — a cart holding products, a cashier appending to a file — so scope,
+      lifecycle callbacks and events have somewhere to land. A third domain, the <strong>calculator</strong> pair
+      (<code>ArithmeticCalculator</code> / <code>UnitCalculator</code>) and the <strong>complex number</strong>
+      follow-on (<code>Complex</code>, <code>ComplexCalculator</code>), exists only to give AspectJ something to advise
+      in <code>recipe_1_13_i</code> … <code>recipe_1_22</code>. <code>recipe_1_23_*</code> swaps both for
+      <code>TaskExecutor</code> beans.</p>
+      <div class="callout info">
+        <h4>Worth knowing before you read the diagrams</h4>
+        <p>Chapter 1 contains <strong>no SpEL</strong>. Grepping the whole chapter for <code>#{</code> or
+        <code>ExpressionParser</code> returns nothing: the only expressions used are <code>${…}</code> property
+        placeholders and a <code>classpath:</code> resource string, both resolved by
+        <code>PropertySourcesPlaceholderConfigurer</code> (<code>recipe_1_6_i</code>) rather than by the SpEL engine.
+        Likewise there is no <code>BeanFactoryPostProcessor</code> implementation and no
+        <code>InitializingBean</code> / <code>DisposableBean</code> in the chapter — the init and destroy stories are told
+        with <code>@Bean(initMethod, destroyMethod)</code> and the Jakarta annotations.</p>
+      </div>
+
+      <h3>Module map</h3>
+      <table>
+        <thead>
+          <tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="num">1.1</td><td><code>1_1_i</code>, <code>1_1_ii</code></td>
+            <td>First bean: a <code>@Bean</code> method and <code>getBean(Sequence.class)</code>; then the same idea with
+            stereotype scanning, where <code>@ComponentScan</code> uses a REGEX <code>includeFilters</code> for
+            <code>*Dao</code> and <code>*Service</code> and an ANNOTATION <code>excludeFilters</code> for
+            <code>Controller</code>.</td>
+            <td><code>Sequence</code>, <code>SequenceConfiguration</code>, <code>SequenceDao</code>,
+            <code>SimpleSequenceDao</code>, <code>SequenceTest</code></td></tr>
+          <tr><td class="num">1.2</td><td><code>1_2</code></td>
+            <td>Several <code>@Bean</code> methods returning one abstract type, retrieved by bean name
+            (<code>getBean("aaa", Product.class)</code>).</td>
+            <td><code>Product</code>, <code>Battery</code>, <code>Disc</code>, <code>ShopConfiguration</code></td></tr>
+          <tr><td class="num">1.3</td><td><code>1_3_i</code> … <code>1_3_vii</code></td>
+            <td>Seven ways to hand a <code>PrefixGenerator</code> to <code>Sequence</code>: setter call inside a
+            <code>@Bean</code> method with a method parameter (i), scanned <code>@Service</code> with an
+            <code>@Autowired</code> field (ii), <code>@Autowired</code> array of all matching beans (iii), constructor
+            argument from a method parameter (iv), bare <code>@Autowired</code> field (v), <code>@Qualifier</code> by
+            bean name (vi), <code>@Import</code> of a second configuration class (vii).</td>
+            <td><code>Sequence</code>, <code>PrefixGenerator</code>, <code>DatePrefixGenerator</code>,
+            <code>NumberPrefixGenerator</code>, <code>SequenceService</code>, <code>PrefixConfiguration</code></td></tr>
+          <tr><td class="num">1.4</td><td><code>1_4_i</code>, <code>1_4_ii</code></td>
+            <td>Non-Spring injection annotations: Jakarta <code>@Resource(name = "datePrefixGenerator")</code> resolved
+            by name; <code>@Inject</code> paired with home-grown qualifier annotations declared on the candidate classes.</td>
+            <td><code>Sequence</code>, <code>DatePrefixAnnotation</code>, <code>NumberPrefixAnnotation</code>,
+            <code>appContext.xml</code></td></tr>
+          <tr><td class="num">1.5</td><td><code>1_5_i</code>, <code>1_5_ii</code></td>
+            <td>The scope trap: the same <code>getBean</code> called twice returns one shared
+            <code>ShoppingCart</code> (i) versus a fresh cart per call once <code>@Scope("prototype")</code> is added (ii).</td>
+            <td><code>ShoppingCart</code>, <code>ShopConfiguration</code></td></tr>
+          <tr><td class="num">1.6</td><td><code>1_6_i</code>, <code>1_6_ii</code></td>
+            <td><code>@PropertySource("classpath:discounts.properties")</code> plus a <code>static</code>
+            <code>PropertySourcesPlaceholderConfigurer</code> bean feeding <code>@Value</code> fields that are then passed
+            into constructors; (ii) injects <code>@Value("classpath:banner.txt")</code> as a <code>Resource</code> and
+            prints it from an <code>@PostConstruct</code> method.</td>
+            <td><code>ShopConfiguration</code>, <code>BannerLoader</code>, <code>Product</code></td></tr>
+          <tr><td class="num">1.7</td><td><code>1_7</code></td>
+            <td><code>messageSource</code> as a bean: <code>ReloadableResourceBundleMessageSource</code> with
+            <code>classpath:messages</code> basename, read through <code>context.getMessage</code> with arguments and a
+            <code>Locale</code>.</td>
+            <td><code>ShopConfiguration</code>, <code>messages_en_US.properties</code></td></tr>
+          <tr><td class="num">1.8</td><td><code>1_8_i</code> … <code>1_8_v</code></td>
+            <td>Init and destroy callbacks on <code>Cashier</code>: <code>@Bean(initMethod = "openFile",
+            destroyMethod = "closeFile")</code> (i) versus <code>@PostConstruct</code> / <code>@PreDestroy</code> (ii, iii);
+            <code>@Lazy</code> prototype cart fetched through <code>getBeanProvider</code> (iii, v);
+            (iv) is the sequence domain with <code>@DependsOn</code> and <code>@Primary</code> breaking a two-candidate tie.</td>
+            <td><code>Cashier</code>, <code>ShoppingCart</code>, <code>DatePrefixGenerator</code>,
+            <code>NumberPrefixGenerator</code></td></tr>
+          <tr><td class="num">1.9</td><td><code>1_9_i</code> … <code>1_9_iv</code></td>
+            <td>Two <code>BeanPostProcessor</code> implementations registered by component scan (i) versus declared as
+            <code>static</code> <code>@Bean</code> methods (ii); (iii, iv) are the sequence domain comparing pure XML
+            bean definitions with an inter-<code>@Bean</code>-method call.</td>
+            <td><code>AuditCheckBeanPostProcessor</code>, <code>ProductCheckBeanPostProcessor</code>,
+            <code>SequenceConfiguration</code></td></tr>
+          <tr><td class="num">1.10</td><td><code>1_10_i</code>, <code>1_10_ii</code>, <code>1_10_iii</code></td>
+            <td>Three factory shapes: a <code>static</code> factory method called from a <code>@Bean</code> method, an
+            instance factory bean holding a map of products, and <code>DiscountFactoryBean</code> extending
+            <code>AbstractFactoryBean</code> to mutate price through a factory.</td>
+            <td><code>ProductCreator</code>, <code>DiscountFactoryBean</code>, <code>ShopConfiguration</code></td></tr>
+          <tr><td class="num">1.11</td><td><code>1_11</code></td>
+            <td><code>@Profile</code> on four configuration classes; <code>setActiveProfiles("winter")</code> before
+            <code>register</code> plus <code>refresh()</code> selects which <code>aaa</code> bean definition survives.</td>
+            <td><code>ShopConfigurationSpr</code>, <code>ShopConfigurationSumWin</code>,
+            <code>ShopConfigurationAut</code>, <code>ShopConfigurationGlobal</code></td></tr>
+          <tr><td class="num">1.12</td><td><code>1_12</code></td>
+            <td>Two active profiles at once (<code>global</code>, <code>winter</code>) with <code>context.scan</code>;
+            <code>Cashier</code> now implements <code>BeanNameAware</code> and takes its file name from its bean name.</td>
+            <td><code>ShopConfigurationGlobal</code>, <code>Cashier</code></td></tr>
+          <tr><td class="num">1.13</td><td><code>1_13_i</code> … <code>1_13_v</code></td>
+            <td>Advice kinds on one aspect: <code>@Before</code> (i), plus <code>@After</code> (ii), plus
+            <code>@AfterReturning</code> binding <code>result</code> (iii), plus <code>@AfterThrowing</code> bound to
+            <code>IllegalArgumentException</code> (iv), then everything collapsed into one <code>@Around</code> with
+            <code>ProceedingJoinPoint</code> (v). All on <code>@EnableAspectJAutoProxy</code>.</td>
+            <td><code>CalculatorLoggingAspect</code>, <code>StandardArithmeticCalculator</code>,
+            <code>CalculatorConfiguration</code></td></tr>
+          <tr><td class="num">1.14</td><td><code>1_14</code></td>
+            <td>Reading the <code>JoinPoint</code> itself: kind, declaring type, method name, arguments,
+            <code>getTarget()</code> versus <code>getThis()</code>.</td>
+            <td><code>CalculatorLoggingAspect</code></td></tr>
+          <tr><td class="num">1.15</td><td><code>1_15_i</code>, <code>1_15_ii</code></td>
+            <td>Two competing aspects on the same join points, ordered by implementing <code>Ordered</code> (i) and by
+            the <code>@Order</code> annotation (ii), so validation runs before logging.</td>
+            <td><code>CalculatorValidationAspect</code>, <code>CalculatorLoggingAspect</code></td></tr>
+          <tr><td class="num">1.16</td><td><code>1_16_i</code>, <code>1_16_ii</code></td>
+            <td>Named pointcuts: one private <code>@Pointcut</code> reused by all five advices in the aspect (i);
+            the same pointcut moved into a separate <code>CalculatorPointcuts</code> type and referenced by its
+            fully-qualified name (ii). Both ship an <code>appContext.xml</code> with
+            <code>aop:aspectj-autoproxy</code>.</td>
+            <td><code>CalculatorPointcuts</code>, <code>CalculatorLoggingAspect</code></td></tr>
+          <tr><td class="num">1.17</td><td><code>1_17_i</code> … <code>1_17_iv</code></td>
+            <td>Pointcut designators, one per variant: <code>@annotation(LoggingRequired)</code>,
+            <code>@within(LoggingRequired)</code>, composition with <code>within(ArithmeticCalculator+)</code> OR
+            <code>within(UnitCalculator+)</code>, and a parameterised pointcut binding
+            <code>target(target) &amp;&amp; args(a,b)</code>.</td>
+            <td><code>LoggingRequired</code>, <code>CalculatorPointcuts</code>, <code>CalculatorLoggingAspect</code></td></tr>
+          <tr><td class="num">1.18</td><td><code>1_18</code></td>
+            <td>Introduction with <code>@DeclareParents</code>: the calculator proxy gains
+            <code>MaxCalculator</code> and <code>MinCalculator</code>, so <code>Main</code> can cast the bean to
+            interfaces its target never implements.</td>
+            <td><code>CalculatorIntroduction</code>, <code>MaxCalculator</code>, <code>SimpleMaxCalculator</code>,
+            <code>MinCalculator</code>, <code>SimpleMinCalculator</code></td></tr>
+          <tr><td class="num">1.19</td><td><code>1_19</code></td>
+            <td>A stateful mixin: <code>@DeclareParents</code> attaches <code>Counter</code> to every
+            <code>Standard*Calculator</code> and an <code>@After</code> advice bound with <code>this(counter)</code>
+            increments it after each call.</td>
+            <td><code>Counter</code>, <code>SimpleCounter</code>, <code>CalculatorIntroduction</code></td></tr>
+          <tr><td class="num">1.20</td><td><code>1_20_i</code> … <code>1_20_iii</code></td>
+            <td>From a clean un-advised <code>ComplexCalculator</code> (i) to an AspectJ <code>call(...)</code> interceptor
+            on <code>new Complex(int, int)</code> driven by <code>META-INF/aop.xml</code> (ii), to enabling AspectJ weaving
+            from code with <code>DefaultContextLoadTimeWeaver</code> and <code>AspectJWeavingEnabler</code> inside an
+            <code>ApplicationContextInitializer</code> (iii).</td>
+            <td><code>Complex</code>, <code>ComplexCachingAspect</code>,
+            <code>LoadTimeWeaverApplicationContextInitializer</code>, <code>aop.xml</code></td></tr>
+          <tr><td class="num">1.21</td><td><code>1_21</code></td>
+            <td>The woven aspect as a Spring bean: <code>Aspects.aspectOf(ComplexCachingAspect.class)</code> returned from
+            a <code>@Bean</code> method and given a pre-seeded cache.</td>
+            <td><code>CalculatorConfiguration</code>, <code>ComplexCachingAspect</code></td></tr>
+          <tr><td class="num">1.22</td><td><code>1_22</code></td>
+            <td><code>@Configurable</code> on <code>Complex</code> with <code>@EnableSpringConfigured</code>,
+            <code>@EnableLoadTimeWeaving</code> and an explicit <code>AspectJWeavingEnabler</code> bean, so an object made
+            with <code>new</code> receives an <code>@Autowired</code> <code>ComplexFormatter</code> and uses it in
+            <code>toString()</code>.</td>
+            <td><code>Complex</code>, <code>ComplexFormatter</code>, <code>CalculatorConfiguration</code></td></tr>
+          <tr><td class="num">1.23</td><td><code>1_23_i</code>, <code>1_23_ii</code></td>
+            <td>JDK <code>Executors</code> used directly (i) versus seven Spring executor beans —
+            <code>ThreadPoolTaskExecutor</code>, <code>SimpleAsyncTaskExecutor</code>, <code>SyncTaskExecutor</code>,
+            <code>TaskExecutorAdapter</code>, <code>ConcurrentTaskExecutor</code> over a virtual-thread executor,
+            <code>ScheduledExecutorFactoryBean</code> plus <code>ScheduledExecutorTask</code> — injected into one
+            <code>@PostConstruct</code> submitter (ii).</td>
+            <td><code>ExecutorsConfiguration</code>, <code>SpringExecutorsDemo</code>,
+            <code>DemonstrationRunnable</code></td></tr>
+          <tr><td class="num">1.24</td><td><code>1_24_i</code>, <code>1_24_ii</code></td>
+            <td>Publishing and consuming application events: <code>Cashier</code> implements
+            <code>ApplicationEventPublisherAware</code> and <code>CheckoutEvent</code> extends
+            <code>ApplicationEvent</code>, consumed by an <code>ApplicationListener</code> (i); (ii) drops the base class,
+            injects <code>ApplicationEventPublisher</code> through the constructor and consumes with
+            <code>@EventListener</code> on a plain bean method.</td>
+            <td><code>CheckoutEvent</code>, <code>CheckoutListener</code>, <code>Cashier</code></td></tr>
+          <tr><td class="num">1.25</td><td><code>1_25_i</code>, <code>1_25_ii</code>, <code>1_25_iii</code></td>
+            <td>No configuration class at all: <code>ctx.registerBean(Class, Supplier)</code> on an empty context (i),
+            the supplier wiring itself with <code>getBeanProvider(...).ifUnique(...)</code> (ii), and a
+            <code>BeanDefinitionCustomizer</code> that sets prototype scope and lazy initialisation (iii).</td>
+            <td><code>Sequence</code>, <code>DatePrefixGenerator</code>,
+            <code>SequenceBeanDefinitionCustomizer</code></td></tr>
+          <tr><td class="num">—</td><td><code>springintro</code></td>
+            <td>Chapter scaffolding only. The directory holds a single Eclipse <code>.project</code> descriptor; there are
+            no sources, so no module path to build.</td>
+            <td>—</td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flow</span>
+          <span class="dtitle">Five configuration sources, one container, one lookup</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    jc["Java config, Bean methods on ShopConfiguration (1_2)"] --> ann["AnnotationConfigApplicationContext"]
+    cs["Stereotype scan, ComponentScan with REGEX includeFilters (1_1_ii)"] --> ann
+    prm["Programmatic, registerBean with a Supplier (1_25_i)"] --> ann
+    imp["Imported config, Import of PrefixConfiguration (1_3_vii)"] --> ann
+    prp["PropertySource plus PropertySourcesPlaceholderConfigurer (1_6_i)"] --> env["Environment and property sources"]
+    env --> ann
+    xml["XML bean and property elements (1_9_iii)"] --> xmlctx["GenericXmlApplicationContext (1_4_i)"]
+    ann --> get["getBean by type, by name, or getBeanProvider"]
+    xmlctx --> get
+    get --> prod["Product singleton named aaa"]
+    get --> cart["ShoppingCart, fresh per call (1_5_ii)"]
+    get --> calc["ArithmeticCalculator, an advised proxy (1_13_i)"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The left column is what you hand the container: a
+      <code>@Configuration</code> class (<code>recipe_1_2/…/shop/config/ShopConfiguration.java</code>), a package name to
+      scan (<code>recipe_1_1_ii/…/sequence/Main.java</code> passes the base package straight into the constructor), a
+      programmatic supplier (<code>recipe_1_25_i</code>), an <code>@Import</code>ed second config
+      (<code>recipe_1_3_vii</code>) or an XML document (<code>recipe_1_9_iii/…/resources/appContext.xml</code>). The middle
+      node is the <code>ApplicationContext</code>, which is also a <code>BeanDefinitionRegistry</code> and a
+      <code>PropertySourcesCapableEnvironment</code>. The right column is what comes back out of
+      <code>getBean</code>: a shared <code>Product</code>, a <code>ShoppingCart</code> whose scope decides whether the second
+      call is the same object, and — from <code>recipe_1_13_i</code> onwards — not the target object at all but a proxy that
+      wraps it.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The shop domain as it is actually written across the chapter</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Product {
+        String name
+        double price
+        String getName()
+        double getPrice()
+    }
+    class Battery {
+        boolean rechargeable
+        boolean isRechargeable()
+    }
+    class Disc {
+        int capacity
+        int getCapacity()
+    }
+    class ShoppingCart {
+        List items
+        void addItem(item)
+        List getItems()
+    }
+    class Cashier {
+        String fileName
+        void openFile()
+        void checkout(cart)
+        void closeFile()
+    }
+    class CheckoutEvent {
+        ShoppingCart cart
+        LocalDateTime time
+        LocalDateTime getTime()
+    }
+    class CheckoutListener {
+        void onApplicationEvent(event)
+    }
+    Product -- Battery : abstract superclass, same in every shop module
+    Product -- Disc : abstract superclass, same in every shop module
+    ShoppingCart o-- Product : items list, unmodifiable view returned
+    Cashier .. ShoppingCart : checkout reads getItems
+    CheckoutEvent o-- ShoppingCart : cart passed as event source
+    CheckoutListener .. CheckoutEvent : consumes the published event
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the graph.</strong> <code>Product</code> is abstract in every module
+      (<code>ch01/recipe_1_2/src/main/java/com/apress/spring6recipes/shop/Product.java</code>) with two concrete
+      subtypes, <code>Battery</code> and <code>Disc</code>; that single abstract type is what makes bean ambiguity interesting
+      later, because three <code>@Bean</code> methods all declare <code>Product</code> as their return type.
+      <code>ShoppingCart</code> holds a list of <code>Product</code> and, in most variants, hands out
+      <code>Collections.unmodifiableList</code> from <code>getItems()</code> — <code>recipe_1_12</code> is the exception and
+      returns the live list. <code>Cashier</code> depends on <code>ShoppingCart</code> only as a method argument, never as a
+      field, so it is a stateless service bean while the cart is stateful; that asymmetry is the whole point of recipe 1.5.
+      <code>CheckoutEvent</code> and <code>CheckoutListener</code> exist only in <code>recipe_1_24_i</code> and
+      <code>recipe_1_24_ii</code>. In <code>recipe_1_6_i</code> and <code>recipe_1_6_ii</code> <code>Product</code> grows a third
+      constructor argument, <code>discount</code>, plus <code>getDiscount()</code>, and in <code>recipe_1_10_iii</code> its
+      <code>price</code> field loses <code>final</code> so the factory bean can call the package-private
+      <code>setPrice</code>.</p>
+
+      <h3>The three bean-declaration styles you will see repeatedly</h3>
+      <table>
+        <thead><tr><th>Style</th><th>Modules</th><th>How the definition is created</th></tr></thead>
+        <tbody>
+          <tr><td>Declared <code>@Bean</code> method</td><td><code>1_1_i</code>, <code>1_2</code>, <code>1_3_i</code>,
+            <code>1_10_*</code>, <code>1_23_ii</code></td>
+            <td>The container reads the annotated method, calls it once for a singleton, and registers the result under
+            the method name — which is why <code>getBean("aaa", Product.class)</code> works.</td></tr>
+          <tr><td>Scanned stereotype</td><td><code>1_1_ii</code>, <code>1_3_ii</code>, <code>1_5_*</code>,
+            <code>1_8_*</code>, all calculator modules</td>
+            <td><code>@ComponentScan</code> (or <code>context.scan</code>) produces a scanned bean definition per class,
+            named from the decapitalised class name: <code>@Component</code> on <code>ShoppingCart</code> gives the bean
+            id <code>shoppingCart</code>.</td></tr>
+          <tr><td>Programmatic registration</td><td><code>1_25_i</code>, <code>1_25_ii</code>,
+            <code>1_25_iii</code></td>
+            <td><code>AnnotationConfigApplicationContext.registerBean(Class, Supplier)</code> plus an optional
+            <code>BeanDefinitionCustomizer</code>, with no annotation on the bean class at all.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="injection">
+      <span class="kicker">Recipes 1.3 – 1.4</span>
+      <h2>Injecting collaborators</h2>
+      <p>Recipe 1.3 is the chapter's "same problem, seven mechanisms" set. The problem: <code>Sequence</code> needs a
+      <code>PrefixGenerator</code>, and there is more than one implementation in the container. The seven modules solve it at
+      seven different points, and the differences are visible in two places only — the annotations on
+      <code>Sequence</code> and the signature of the <code>@Bean</code> method in
+      <code>…/sequence/config/SequenceConfiguration.java</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Setter, constructor and autowired injection compared on one collaborator pair</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Sequence {
+        PrefixGenerator prefixGenerator
+        String suffix
+        int initial
+        void setPrefixGenerator(generator)
+        String nextValue()
+    }
+    class PrefixGenerator {
+        String getPrefix()
+    }
+    class DatePrefixGenerator {
+        DateTimeFormatter formatter
+        void setPattern(pattern)
+    }
+    class NumberPrefixGenerator {
+    }
+    class SequenceConfiguration {
+        Sequence sequenceGenerator(generator)
+        DatePrefixGenerator datePrefixGenerator()
+        NumberPrefixGenerator numberPrefixGenerator()
+    }
+    class SequenceService {
+        SequenceDao sequenceDao
+        String generate(sequenceId)
+    }
+    PrefixGenerator -- DatePrefixGenerator : implements
+    PrefixGenerator -- NumberPrefixGenerator : implements
+    Sequence o-- PrefixGenerator : the collaborator being injected
+    SequenceConfiguration .. Sequence : 1_3_i setter call, 1_3_iv constructor argument
+    SequenceConfiguration .. PrefixGenerator : method parameter resolved by type
+    Sequence .. PrefixGenerator : 1_3_v Autowired field, config declares nothing
+    Sequence .. DatePrefixGenerator : 1_3_vi and 1_4_i pick by name
+    Sequence .. NumberPrefixGenerator : 1_3_iii array receives every candidate
+    SequenceService .. Sequence : 1_3_ii Service generates from a scanned Dao
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the graph.</strong> Follow one edge at a time.
+      <em>Constructor-inject from a method parameter</em>: in <code>recipe_1_3_iv</code>
+      <code>sequenceGenerator(PrefixGenerator prefixGenerator)</code> declares the dependency in its signature, the container
+      resolves that parameter by type and hands it in, and the constructor stores it — no annotation anywhere on
+      <code>Sequence</code>. <em>Setter-inject</em>: <code>recipe_1_3_i</code> keeps the same parameter mechanism but calls
+      <code>generator.setPrefixGenerator(prefixGenerator)</code> on the object it constructed with
+      <code>new Sequence("A", 100000)</code>. <em>Annotation-driven</em>: <code>recipe_1_3_v</code> drops the parameter and puts
+      <code>@Autowired</code> on the field, so <code>AutowiredAnnotationBeanPostProcessor</code> populates it after
+      instantiation; <code>recipe_1_3_iii</code> declares the field as an array and gets every
+      <code>PrefixGenerator</code> bean. <code>recipe_1_3_vi</code> adds <code>@Qualifier("datePrefixGenerator")</code> on the
+      field, the setter parameter <em>and</em> the <code>@Bean</code> method parameter, because those are three separate
+      resolution points. <code>recipe_1_4_i</code> swaps Spring's annotation for Jakarta's
+      <code>@Resource(name = "datePrefixGenerator")</code>, which resolves by bean name first;
+      <code>recipe_1_4_ii</code> uses <code>@Inject</code> with <code>@DatePrefixAnnotation</code>, a custom annotation itself
+      meta-annotated with <code>jakarta.inject.Qualifier</code> and placed on the candidate class rather than on the
+      injection point.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flow</span>
+          <span class="dtitle">How each 1.3 / 1.4 variant changes the wiring, in module order</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    v1["1_3_i  Bean method takes a PrefixGenerator parameter, setter called in the method body"] --> v3
+    v2["1_3_ii  Service and Component scanned from a package string, Autowired field"] --> v3
+    v3["1_3_iii  Two candidate Beans, Autowired array collects every match"] --> v4
+    v4["1_3_iv  Constructor argument supplied from the Bean method parameter"] --> v5
+    v5["1_3_v  Autowired field, no collaborator declared in the config class"] --> v6
+    v6["1_3_vi  Qualifier by bean name on field, setter parameter and Bean method parameter"] --> v7
+    v7["1_3_vii  Split config, Import of PrefixConfiguration for the generator Bean"] --> v8
+    v8["1_4_i  Resource by name instead of Qualifier, context loaded from appContext dot xml"] --> v9
+    v9["1_4_ii  Inject with custom qualifier annotations on the candidate classes"]
+    v1 -.- note1["Sequence built with new, suffix and initial from constructor"]
+    v8 -.- note2["GenericXmlApplicationContext, see the caveat below"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the chain.</strong> The interesting hop is
+      <code>1_3_iii → 1_3_iv</code>: three <code>@Bean</code> methods competing on type is exactly when a qualifier becomes
+      mandatory. <code>1_3_vii</code> is the structural one — <code>SequenceConfiguration</code> declares only
+      <code>sequence(PrefixGenerator prefixGenerator)</code>, and <code>@Import(PrefixConfiguration.class)</code> pulls in a
+      second configuration class that owns <code>datePrefixGenerator()</code>; the container treats imported definitions as if
+      they were declared locally, so the method parameter still resolves. <code>1_3_ii</code> is the outlier: it has no config
+      class at all, because <code>new AnnotationConfigApplicationContext("com.apress.springrecipes.sequence")</code> scans a
+      package and <code>@Service SequenceService</code> / <code>@Component("sequenceDao") SimpleSequenceDao</code> register
+      themselves. <code>1_3_iii</code>'s <code>Sequence</code> also shows the cost of field injection: its
+      <code>Sequence(String suffix, int initial)</code> constructor assigns nothing to the autowired array, and
+      <code>getSequence()</code> iterates it, so the object is only usable after the post-processor has run.</p>
+      <div class="callout">
+        <h4>Stale references in the 1.4 / 1.3 XML path</h4>
+        <p><code>recipe_1_4_i/src/main/resources/appContext.xml</code> runs
+        <code>context:component-scan base-package="com.apress.springrecipes.sequence.config"</code> — the pre-Spring-6
+        package, which contains no classes on this module's classpath — and <code>recipe_1_4_ii</code> boots the same way from
+        <code>Main</code> but ships no <code>appContext.xml</code> in <code>src/main/resources</code> at all. The Java sources
+        under <code>com.apress.spring6recipes.sequence</code> are the authoritative part of these two modules;
+        <code>getBean("sequenceGenerator")</code> there is reading for shape, not something to execute.</p>
+      </div>
+    </section>
+
+    <section id="scope-lifecycle">
+      <span class="kicker">Recipes 1.5, 1.8, 1.9, 1.25</span>
+      <h2>Scope and lifecycle</h2>
+      <p><code>recipe_1_5_i</code> and <code>recipe_1_5_ii</code> differ by exactly one annotation, and the difference shows up
+      in the printed output. Both <code>Main</code> classes look the cart up twice — by type in <code>recipe_1_5_i</code>, by
+      bean name in <code>recipe_1_5_ii</code> — and put different products
+      in each cart; with the bare <code>@Component</code> the second call returns the same object, so cart 2 prints AAA, CD-RW
+      and DVD-RW together.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Two lookups, one cart versus two carts</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main
+    participant C as AnnotationConfigApplicationContext
+    participant R as Bean definition for shoppingCart
+    participant S as ShoppingCart instance
+    M->>C: getBean(shoppingCart, ShoppingCart) first call
+    C->>R: read scope attribute
+    Note over R: 1_5_i default singleton, 1_5_ii Scope prototype
+    C->>S: instantiate and register
+    C-->>M: cart1
+    M->>S: addItem(aaa) then addItem(cdrw)
+    M->>C: getBean(shoppingCart, ShoppingCart) second call
+    alt singleton scope
+        C-->>M: the same cart1 object
+        Note over M,C: cart2 now also reports AAA and CD-RW
+    else prototype scope
+        C->>S: create a brand new instance
+        C-->>M: cart2, a distinct object with an empty list
+    end
+    Note over C,S: 1_8_iii and 1_8_v add Lazy, so the prototype definition is not instantiated until requested
+    M->>C: getBeanProvider(ShoppingCart) then getIfAvailable
+    C-->>M: provider hands out a new cart per call
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the sequence.</strong> Hop 1 is the client asking the context by bean
+      <em>name</em> in <code>recipe_1_5_ii/…/shop/Main.java</code>, or by type in <code>recipe_1_5_i/…/shop/Main.java</code> — the
+      resolution outcome is identical, because the scanned definition is the only <code>ShoppingCart</code>. Hop 2 is the
+      container consulting the scope recorded on the definition: <code>@Component</code> alone leaves it
+      <code>singleton</code>, so the first instantiation is cached and later lookups are cache hits; <code>@Scope("prototype")</code>
+      makes the container run the full creation path every time. That is why <code>recipe_1_5_i</code> prints three items in
+      cart 2. Two corollaries the source makes explicit: <code>recipe_1_8_iii</code> and <code>recipe_1_8_v</code> add
+      <code>@Lazy</code> to the prototype so nothing is pre-instantiated, and they retrieve through
+      <code>context.getBeanProvider(ShoppingCart.class).getIfAvailable()</code>, which is the idiomatic way to keep asking for a
+      new instance without holding the context. A prototype handed to a singleton is injected <em>once</em>, which is why no
+      ch01 bean tries it: the cart is always fetched from the context directly.
+      <code>recipe_1_25_iii</code> reaches the same scope switch from code, with a <code>BeanDefinitionCustomizer</code> calling
+      <code>bd.setScope(BeanDefinition.SCOPE_PROTOTYPE)</code> and <code>bd.setLazyInit(true)</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Creating, initialising and destroying the Cashier bean with post-processors watching</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant C as Context refresh
+    participant B as Bean factory
+    participant P as AuditCheckBeanPostProcessor
+    participant K as Cashier
+    participant W as temp directory file
+    C->>B: process the cashier Bean definition
+    B->>K: invoke the cashier Bean method, constructor with fileName and path
+    B->>P: postProcessBeforeInitialization(bean, beanName)
+    P-->>B: returns the same reference, prints the bean type
+    B->>K: openFile, via initMethod in 1_8_i, via PostConstruct in 1_8_ii
+    K->>W: Files.newBufferedWriter with CREATE and APPEND
+    K-->>B: callback complete, bean is now usable
+    B->>P: postProcessAfterInitialization(bean, beanName)
+    P-->>B: bean handed back to Main
+    B->>K: checkout(cart) writes timestamp plus items
+    C->>K: close, destroyMethod or PreDestroy
+    K->>W: writer.close
+    Note over B,P: 1_9_i registers the processors by scan, 1_9_ii declares them as static Bean methods
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the sequence.</strong> The <code>Cashier</code> bean keeps a
+      <code>BufferedWriter</code>, so it needs a start-up and a shut-down step, and the chapter shows three ways to attach them.
+      <code>recipe_1_8_i/…/shop/config/ShopConfiguration.java</code> declares
+      <code>@Bean(initMethod = "openFile", destroyMethod = "closeFile")</code> and the <code>Cashier</code> class carries no
+      annotation at all; <code>recipe_1_8_ii</code> and <code>recipe_1_8_iii</code> move the same contract onto the class with
+      <code>@PostConstruct</code> and <code>@PreDestroy</code>; <code>recipe_1_8_v</code> strips both mechanisms — its
+      <code>Cashier</code> still declares <code>openFile()</code> and <code>closeFile()</code>, but nothing in the module names
+      them, so no container callback reaches them. The <code>BeanPostProcessor</code> pair is the other half of this recipe:
+      <code>AuditCheckBeanPostProcessor</code> prints every bean type it sees and returns the reference untouched, while
+      <code>ProductCheckBeanPostProcessor</code> pattern-matches <code>bean instanceof Product</code> in both hooks. The
+      registration difference between <code>recipe_1_9_i</code> and <code>recipe_1_9_ii</code> is the lesson: (i) lets
+      <code>@ComponentScan</code> find the processors, (ii) declares them as <code>static</code> <code>@Bean</code> methods so the
+      container can instantiate a post-processor without first instantiating and proxying the configuration class that declares
+      it. Because post-processors run around every bean, the same two hooks also fire for <code>aaa</code>, <code>cdrw</code>
+      and <code>dvdrw</code> — which is why the (ii) processor prints the product names.</p>
+      <p><code>recipe_1_8_iv</code> belongs to this cluster conceptually but uses the sequence domain: two
+      <code>@Component</code> implementations of <code>PrefixGenerator</code> compete, and
+      <code>@Primary</code> on <code>DatePrefixGenerator</code> plus <code>@DependsOn("datePrefixGenerator")</code> on the
+      consumer's <code>@Bean</code> method settles both which candidate wins and which definition gets created first.</p>
+    </section>
+
+    <section id="externalized">
+      <span class="kicker">Recipes 1.6 – 1.7</span>
+      <h2>Externalised values and messages</h2>
+      <p><code>recipe_1_6_i</code> and its <code>_ii</code> sibling are the only modules in the chapter that load a properties
+      file into the container. The
+      mechanism is two-part and easy to misread: <code>@PropertySource("classpath:discounts.properties")</code> puts the file
+      into the environment, and <code>PropertySourcesPlaceholderConfigurer</code> — declared as a <code>static</code>
+      <code>@Bean</code> method — is what actually rewrites <code>${…}</code> strings. The three <code>@Value</code> fields on the
+      configuration class are then read by ordinary field injection and passed into product constructors.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flow</span>
+          <span class="dtitle">discounts.properties to a Battery constructor argument</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    disk["discounts.properties on the classpath, three keys"] --> ps["PropertySource on ShopConfiguration (1_6_i)"]
+    ps --> env["Environment property sources"]
+    env --> pspc["static Bean method pspc, PropertySourcesPlaceholderConfigurer"]
+    pspc --> defs["Bean definitions, placeholder text resolved"]
+    defs --> flds["Value fields on the config class, default 0 when a key is absent"]
+    flds --> aaa["Bean method aaa, new Battery AAA 2.5 true 0.1"]
+    flds --> cdrw["Bean method cdrw, new Disc CD-RW 1.5 700 0.15"]
+    env --> res["Value classpath banner.txt resolved to a Resource (1_6_ii)"]
+    res --> bln["bannerLoader Bean, PostConstruct prints the file"]
+    disk -.- raw["Main reads the same file with ClassPathResource and PropertiesLoaderUtils"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Everything left of <em>defs</em> happens during context refresh,
+      before any application bean exists: the annotation registers a <code>PropertySource</code> with the
+      <code>Environment</code>, and the configurer walks the registered definitions. The step that surprises people is
+      <em>defs to flds</em>: <code>@Value("${specialcustomer.discount:0}")</code> is not resolved inside the definition, it is a
+      field on <code>ShopConfiguration</code> itself, injected by <code>AutowiredAnnotationBeanPostProcessor</code> before the
+      container invokes any <code>@Bean</code> method on that instance — which is why <code>new Battery("AAA", 2.5, true,
+      specialCustomerDiscountField)</code> sees <code>0.1</code> rather than zero. The <code>:0</code> suffix is the default that
+      keeps the module working if a key is missing; <code>discounts.properties</code> supplies 0.1, 0.15 and 0.2.
+      <code>recipe_1_6_ii</code> adds the resource branch: <code>@Value("classpath:banner.txt")</code> injects a
+      <code>Resource</code>, that resource goes into the <code>BannerLoader</code> constructor, and the loader's
+      <code>@PostConstruct showBanner()</code> opens <code>banner.getURI()</code> with <code>Files.lines</code> — proof that the
+      annotation is resolved to a real file, not a string. The dotted edge at the bottom is deliberately outside the container:
+      the same module's <code>Main</code> also reads the file directly with <code>PropertiesLoaderUtils</code> after the context
+      is closed, showing the properties file is an ordinary classpath resource.</p>
+      <p><code>recipe_1_7</code> keeps the same "the container resolves the value" idea for text instead of numbers. Its
+      configuration class declares exactly one bean, <code>messageSource()</code> returning a
+      <code>ReloadableResourceBundleMessageSource</code> with basename <code>classpath:messages</code> and
+      <code>setCacheSeconds(1)</code>; the bean <em>name</em> matters, because the context looks up a <code>MessageSource</code>
+      by that id and delegates <code>getMessage</code> to it. <code>Main</code> then resolves two keys against
+      <code>messages_en_US.properties</code>, the second with an argument array —
+      <code>new Object[] { "[DVD-RW 3.0]", LocalDateTime.now() }</code> — matching the <code>{0}</code> and <code>{1}</code>
+      placeholders in the bundle.</p>
+    </section>
+
+    <section id="factories-profiles">
+      <span class="kicker">Recipes 1.10 – 1.12</span>
+      <h2>Factory beans and profiles</h2>
+      <p>Recipe 1.10 asks: what if the object a <code>@Bean</code> method returns is not created by calling a constructor?
+      <code>recipe_1_10_i</code> answers with a static helper, <code>ProductCreator.createProduct("aaa")</code> whose body is a
+      switch expression; the container never learns about the helper, because the <code>@Bean</code> method hides it.
+      <code>recipe_1_10_ii</code> promotes the helper into a bean of its own — <code>productCreatorFactory()</code> returns a
+      <code>ProductCreator</code> built over a <code>Map.of("aaa", …, "cdrw", …, "dvdrw", …)</code> — and the three product
+      <code>@Bean</code> methods each declare <code>ProductCreator productCreator</code> as a parameter, so the factory instance
+      is injected by type. <code>recipe_1_10_iii</code> is the genuine Spring construct:
+      <code>DiscountFactoryBean extends AbstractFactoryBean&lt;Product&gt;</code> with <code>setProduct</code>,
+      <code>setDiscount</code>, <code>getObjectType()</code> returning <code>product.getClass()</code> and
+      <code>createInstance()</code> that discounts the price in place and returns the same object. Requesting
+      <code>discountFactoryBeanAAA</code> therefore yields a <code>Product</code>, not the factory — while the module's
+      <code>Main</code> keeps asking for the untouched <code>aaa</code>, <code>cdrw</code> and <code>dvdrw</code> beans, so the
+      discounted and undiscounted objects are both visible.</p>
+      <p>The same <code>FactoryBean</code> shape reappears once more in the chapter, at
+      <code>recipe_1_23_ii/…/executors/ExecutorsConfiguration.java</code>:
+      <code>ScheduledExecutorFactoryBean</code> is a bean whose product is a
+      <code>ScheduledExecutorService</code>, and the factory is configured with a <code>ScheduledExecutorTask</code> that itself
+      takes the <code>Runnable</code>. <code>PropertySourcesPlaceholderConfigurer</code> (recipe 1.6) is the third
+      <code>FactoryBean</code>-adjacent infrastructure bean.</p>
+      <p>Recipes 1.11 and 1.12 change the question to <em>which</em> definition is registered at all. Four configuration
+      classes declare the same bean ids <code>aaa</code>, <code>cdrw</code>, <code>dvdrw</code> with different prices;
+      <code>@Profile</code> decides which class contributes.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flow</span>
+          <span class="dtitle">Profile matching in recipe_1_12, where two profiles are active</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    boot["Main: empty AnnotationConfigApplicationContext"] --> act["getEnvironment().setActiveProfiles(global, winter)"]
+    act --> reg["context.scan(com.apress.spring6recipes.shop)"]
+    reg --> ref["context.refresh()"]
+    ref --> test{"Profile expression matched against the active set"}
+    test -->|global matches| glob["ShopConfigurationGlobal, no profile on 1_11, cashier plus component scan"]
+    test -->|winter matches| sw["ShopConfigurationSumWin, prices 2.0, 1.0 and 2.5"]
+    test -->|spring not active| spr["ShopConfigurationSpr, skipped, no aaa definition from here"]
+    test -->|autumn not active| aut["ShopConfigurationAut, skipped"]
+    glob --> beans["cashier bean, BeanNameAware file name"]
+    sw --> beans2["aaa, cdrw, dvdrw beans"]
+    beans --> out["Main gets winter prices and a working cashier"]
+    beans2 --> out
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The three setup hops in <code>Main</code> are the recipe:
+      profiles are set on the environment <em>before</em> the definitions are read, the classes are registered (by
+      <code>scan</code> here, by <code>context.register(ShopConfigurationGlobal.class)</code> in
+      <code>recipe_1_11/…/shop/Main.java</code>), and only then does <code>refresh()</code> evaluate the conditions. Two
+      <code>@Profile</code> values on one class, <code>{ "summer", "winter" }</code>, are an <em>any-of</em> test, so
+      <code>ShopConfigurationSumWin</code> is active for either. Skipped classes contribute nothing, which means the bean ids
+      <code>aaa</code>, <code>cdrw</code> and <code>dvdrw</code> come from a single class and never collide. The <code>1_11</code>
+      to <code>1_12</code> delta is deliberate: <code>recipe_1_11</code>'s <code>ShopConfigurationGlobal</code> has no
+      <code>@Profile</code> so it always applies, while in <code>recipe_1_12</code> it is annotated
+      <code>@Profile("global")</code> and the second active profile is what brings it back — and its <code>Cashier</code> switches
+      from <code>new Cashier("checkout", path)</code> to <code>new Cashier(path)</code> plus
+      <code>setBeanName(name)</code>, taking the output file name from the bean id.</p>
+    </section>
+
+    <section id="aop">
+      <span class="kicker">Recipes 1.13 – 1.17</span>
+      <h2>AspectJ advice and pointcuts</h2>
+      <p>Five annotations do all the work in this cluster: <code>@EnableAspectJAutoProxy</code> on
+      <code>CalculatorConfiguration</code> (which registers the auto-proxy creator), <code>@Aspect @Component</code> on the
+      advice class, and an <code>execution</code> pointcut on each advice method. Because
+      <code>StandardArithmeticCalculator</code> is a package-private class implementing an interface, the object that
+      <code>getBean</code> returns is a JDK dynamic proxy, not the target — the reason recipe 1.14 can print a different value
+      for <code>joinPoint.getTarget()</code> and <code>joinPoint.getThis()</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">One div(4, 2) call through the ordered advice chain</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main
+    participant X as Calculator proxy
+    participant I as Interceptor chain
+    participant V as CalculatorValidationAspect, Order 0
+    participant L as CalculatorLoggingAspect, Order 1
+    participant T as StandardArithmeticCalculator
+    M->>X: getBean(ArithmeticCalculator) then div(4, 2)
+    X->>I: build the chain once per call, ordered by aspect
+    I->>V: Before advice validateBefore(joinPoint)
+    V->>V: every double argument tested for negatives
+    I->>L: Before advice logBefore(joinPoint)
+    L-->>I: logs method name plus arguments array
+    I->>T: invoke div on the target object
+    alt b equals zero
+        T-->>X: IllegalArgumentException Division by zero
+        X-->>M: exception propagates out of the proxy
+        Note over T,X: 1_13_iv would catch it with AfterThrowing bound to IllegalArgumentException
+    else normal result
+        T-->>I: 2.0
+        I-->>X: return value passed back down the chain
+        X-->>M: 2.0
+        Note over I,X: 1_13_iii logs it via AfterReturning with returning equals result
+    end
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the sequence.</strong> Hop 1: <code>Main</code> never holds a
+      <code>StandardArithmeticCalculator</code>; it holds the proxy registered under that bean definition. Hop 2: the proxy asks
+      its interceptor chain for the advices applicable to <code>div</code>, sorted by aspect order — in
+      <code>recipe_1_15_ii</code> that is <code>@Order(0)</code> on <code>CalculatorValidationAspect</code> and
+      <code>@Order(1)</code> on <code>CalculatorLoggingAspect</code>, and <code>recipe_1_15_i</code> achieves the same ordering by
+      having both aspects implement <code>org.springframework.core.Ordered</code> and return 0 and 1 from
+      <code>getOrder()</code>. Validation therefore runs first, and it only matches methods with two
+      <code>double</code> parameters because its pointcut is <code>execution(* *.*(double, double))</code>. Hop 3 is the target
+      invocation itself; <code>div</code> throws <code>IllegalArgumentException("Division by zero")</code> when
+      <code>b == 0</code>. The return edge is where <code>@AfterReturning(returning = "result")</code> in
+      <code>recipe_1_13_iii</code> binds the value, and the failure edge is where <code>@AfterThrowing(throwing = "ex")</code> in
+      <code>recipe_1_13_iv</code> logs instead; <code>recipe_1_13_v</code> replaces the whole set with one
+      <code>@Around</code> that calls <code>joinPoint.proceed()</code> inside a try/catch, which is the only variant that can
+      both log and rethrow from a single method. Recipes 1.16 and 1.17 do not change the chain — they change how its
+      <em>matching</em> is expressed: <code>@Pointcut</code> named <code>loggingOperation()</code> reused by all five advices
+      inside one aspect (1.16 i), moved to a separate <code>CalculatorPointcuts</code> type and referenced by fully-qualified
+      name (1.16 ii), then replaced by <code>@annotation</code>, <code>@within</code>, <code>within(Type+)</code> composed with
+      <code>||</code>, and a parameter-binding pointcut
+      <code>execution(* *.*(..)) &amp;&amp; target(target) &amp;&amp; args(a,b)</code> that lets <code>logParameter(Object target,
+      double a, double b)</code> take the arguments as method parameters (1.17).</p>
+    </section>
+
+    <section id="weaving">
+      <span class="kicker">Recipes 1.18 – 1.22</span>
+      <h2>Introductions and load-time weaving</h2>
+      <p>Spring's proxy-based AOP can only add advice to interfaces the target already implements — except with
+      <code>@DeclareParents</code>. In <code>recipe_1_18/…/calculator/CalculatorIntroduction.java</code> two fields declare
+      <code>MaxCalculator</code> and <code>MinCalculator</code> against
+      <code>com.apress.spring6recipes.calculator.StandardArithmeticCalculator</code> with <code>defaultImpl</code> pointing at
+      <code>SimpleMaxCalculator</code> and <code>SimpleMinCalculator</code>. That is what makes
+      <code>(MaxCalculator) arithmeticCalculator</code> legal in <code>Main</code>. <code>recipe_1_19</code> pushes it further:
+      <code>@DeclareParents(value = "com.apress.spring6recipes.calculator.Standard*Calculator", defaultImpl =
+      SimpleCounter.class)</code> attaches <code>Counter</code> to <em>both</em> calculators, and
+      <code>@After("execution(* com.apress.spring6recipes.calculator.*Calculator.*(..)) &amp;&amp; this(counter)")</code> binds the
+      introduced mixin as an advice parameter so each call increments that proxy's own counter —
+      <code>Main</code> then prints two different counts.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Introduced interfaces, default implementations and the weaving paths</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class ArithmeticCalculator {
+        double add(a, b)
+        double div(a, b)
+    }
+    class StandardArithmeticCalculator {
+        double add(a, b)
+        double div(a, b)
+    }
+    class MaxCalculator {
+        double max(a, b)
+    }
+    class MinCalculator {
+        double min(a, b)
+    }
+    class Counter {
+        void increase()
+        int getCount()
+    }
+    class SimpleMaxCalculator {
+    }
+    class SimpleCounter {
+    }
+    class CalculatorIntroduction {
+        MaxCalculator maxCalculator
+        MinCalculator minCalculator
+        Counter counter
+        increaseCount(counter)
+    }
+    class ComplexCachingAspect {
+        Map cache
+        Object cacheAround(pjp, a, b)
+    }
+    class Complex {
+        int real
+        int imaginary
+        void setFormatter(formatter)
+        String toString()
+    }
+    class ComplexFormatter {
+        String pattern
+        String format(complex)
+    }
+    ArithmeticCalculator -- StandardArithmeticCalculator : implemented by the target
+    StandardArithmeticCalculator .. MaxCalculator : never implemented in source
+    CalculatorIntroduction .. MaxCalculator : DeclareParents with SimpleMaxCalculator
+    CalculatorIntroduction .. MinCalculator : DeclareParents with SimpleMinCalculator
+    CalculatorIntroduction .. Counter : DeclareParents for every Standard Star Calculator
+    MaxCalculator -- SimpleMaxCalculator : defaultImpl
+    Counter -- SimpleCounter : defaultImpl
+    ComplexCachingAspect .. Complex : Around advice on the constructor call, 1_20_ii
+    Complex .. ComplexFormatter : Configurable plus Autowired setter, 1_22
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the graph.</strong> Two edges carry the introduction story: the solid
+      <em>implemented by the target</em> line is what the JDK proxy could do on its own, and the dotted
+      <em>never implemented in source</em> line is the gap <code>CalculatorIntroduction</code> fills — the proxy is created
+      implementing the introduced interfaces and delegates <code>max()</code> to a <code>SimpleMaxCalculator</code>. For
+      <code>Counter</code> the delegation is observable per proxy, which is why <code>recipe_1_19/Main</code> prints two distinct
+      counts. The right-hand pair of edges is a different mechanism: <code>ComplexCachingAspect</code> advises
+      <code>call(... Complex.new(int, int))</code>, i.e. the <em>calling</em> code, not the target object, and Spring's proxy
+      AOP cannot do that. It needs AspectJ, which this chapter wires up four different ways:
+      <code>recipe_1_20_ii</code> relies on <code>META-INF/aop.xml</code> with a
+      <code>weaver/include within="com.apress.spring6recipes.calculator.*"</code> element and an
+      <code>aspects/aspect name=ComplexCachingAspect</code> declaration; <code>recipe_1_20_iii</code> (and
+      <code>recipe_1_21</code>) turn weaving on from code, in an <code>ApplicationContextInitializer</code> that wraps the bean
+      classloader in <code>DefaultContextLoadTimeWeaver</code> and calls
+      <code>AspectJWeavingEnabler.enableAspectJWeaving(ltw, beanClassLoader)</code> before <code>refresh()</code>;
+      <code>recipe_1_22</code> declares the same intent declaratively with <code>@EnableLoadTimeWeaving</code>,
+      <code>@EnableSpringConfigured</code> and a <code>static</code> <code>AspectJWeavingEnabler</code> bean, and its commented-out
+      initializer line in <code>Main</code> is the difference between the two styles. <code>recipe_1_21</code> adds the only trick
+      that makes a woven aspect injectable-aware: <code>Aspects.aspectOf(ComplexCachingAspect.class)</code> returns the AspectJ
+      instance, which the <code>@Bean</code> method then primes with a cache pre-loaded with keys <code>"2,3"</code> and
+      <code>"3,5"</code> — so the first <code>new Complex(2, 3)</code> is a cache hit. <code>recipe_1_22</code>'s
+      <code>Complex</code> is the payoff of weaving: an object created with <code>new</code> inside
+      <code>StandardComplexCalculator.add</code> still gets its <code>@Autowired setFormatter(ComplexFormatter)</code> called, so
+      <code>toString()</code> can delegate to the formatter instead of hard-coding the pattern. All four weaving modules require
+      the AspectJ weaver on the JVM (<code>-javaagent:aspectjweaver.jar</code>, declared through the
+      <code>spring-instrument</code> or <code>aspectjweaver</code> dependencies in their build files), so they are the least
+      runnable part of the chapter.</p>
+    </section>
+
+    <section id="executors-events">
+      <span class="kicker">Recipes 1.23 – 1.24</span>
+      <h2>Task executors and application events</h2>
+      <p><code>recipe_1_23_i/…/executors/ExecutorsDemo.java</code> is pure JDK: cached, fixed, single-thread,
+      result-bearing, virtual-thread and scheduled executors, each wrapping the same <code>DemonstrationRunnable</code>.
+      <code>recipe_1_23_ii</code> keeps that class as the <code>@Component</code> and moves the executors into the container.
+      Seven <code>@Bean</code> methods in <code>ExecutorsConfiguration</code> cover the Spring-side map:
+      <code>SyncTaskExecutor</code> runs on the calling thread, <code>SimpleAsyncTaskExecutor</code> spawns a thread per task,
+      <code>TaskExecutorAdapter</code> wraps <code>Executors.newCachedThreadPool()</code>,
+      <code>ThreadPoolTaskExecutor</code> is tuned with core 50, max 100,
+      <code>setAllowCoreThreadTimeOut(true)</code> and <code>setWaitForTasksToCompleteOnShutdown(true)</code>,
+      <code>ConcurrentTaskExecutor</code> wraps <code>Executors.newVirtualThreadPerTaskExecutor()</code>, and
+      <code>ScheduledExecutorFactoryBean</code> plus <code>ScheduledExecutorTask</code> (period 50) is the factory-bean case.
+      <code>SpringExecutorsDemo</code> <code>@Autowired</code>s all of them plus the runnable and submits from a
+      <code>@PostConstruct submitJobs()</code>, so <code>SpringExecutorsDemo.main</code> — this module has no
+      <code>Main</code> class — is just <code>try (var ctx = new
+      AnnotationConfigApplicationContext(cfg)) {}</code> — closing the context is what shuts the thread pools down, and
+      <code>ThreadPoolTaskExecutor</code>'s wait-for-completion flag is what makes that shutdown orderly.</p>
+      <p><code>recipe_1_24_i</code> and <code>recipe_1_24_ii</code> are the publish/consume pair, and the two variants differ on
+      <em>both</em> sides at once.</p>
+      <table>
+        <thead><tr><th>Concern</th><th>recipe_1_24_i</th><th>recipe_1_24_ii</th></tr></thead>
+        <tbody>
+          <tr><td>How <code>Cashier</code> obtains a publisher</td>
+            <td>implements <code>ApplicationEventPublisherAware</code>, callback sets the field; declared as a
+            <code>@Bean</code> method with <code>new Cashier()</code></td>
+            <td>constructor parameter <code>ApplicationEventPublisher</code>; the class is a <code>@Component</code> and there
+            is no <code>cashier</code> <code>@Bean</code> method in its config</td></tr>
+          <tr><td>Event type</td>
+            <td><code>CheckoutEvent extends ApplicationEvent</code>, <code>super(cart)</code> sets the source</td>
+            <td>plain POJO with cart and time fields — Spring 4.2-plus payload events</td></tr>
+          <tr><td>Listener</td>
+            <td><code>@Component CheckoutListener implements ApplicationListener&lt;CheckoutEvent&gt;</code>,
+            <code>onApplicationEvent</code> is the container callback</td>
+            <td><code>@Component CheckoutListener</code> with <code>@EventListener</code> on
+            <code>onApplicationEvent(CheckoutEvent event)</code>; the annotation is what the infrastructure
+            post-processors turn into a registered listener</td></tr>
+          <tr><td>Delivery</td>
+            <td colspan="2">Synchronous on the publishing thread, in both variants — the print appears before
+            <code>Main</code> returns from <code>cashier.checkout(cart1)</code>. There is no <code>@Async</code> or
+            <code>@EnableAsync</code> anywhere in <code>ch01</code>; combining the recipe 1.23 executors with an async listener is
+            left as an exercise the source does not do.</td></tr>
+        </tbody>
+      </table>
+      <p>Both modules publish twice — <code>cashier.checkout(cart1)</code> and <code>cashier.checkout(cart2)</code> — and both
+      carts are prototype-scoped, so the two <code>CheckoutEvent</code> objects carry distinct item lists. That is the payoff for
+      the scope work in recipe 1.5: had the cart still been a singleton, cart 2's event would have replayed cart 1's
+      contents.</p>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Build and run</span>
+      <h2>Building and running</h2>
+      <p>Each recipe is its own Gradle subproject; <code>settings.gradle</code> walks the tree and includes any directory whose
+      name matches <code>^ch.*</code> and contains <code>recipe</code>, so module paths look like
+      <code>:ch01:recipe_1_1_i</code>. Chapter modules do <strong>not</strong> apply the <code>application</code> plugin —
+      <code>ch01/build.gradle</code> applies <code>com.github.johnrengelman.shadow</code> to every subproject and wires
+      <code>build</code> to be <code>finalizedBy('shadowJar')</code>, which is why there is no <code>run</code> task.</p>
+      <pre><code># build one module and its fat jar
+./gradlew :ch01:recipe_1_1_i:build
+
+# run it: classpath jar plus the real main class
+java -cp ch01/recipe_1_1_i/build/libs/recipe_1_1_i-6.0.0-SNAPSHOT-all.jar \
+     com.apress.spring6recipes.sequence.Main
+
+# the JUnit ones (only recipe_1_1_i, recipe_1_1_ii and recipe_1_25_i carry tests)
+./gradlew :ch01:recipe_1_1_i:test</code></pre>
+      <ul>
+        <li><strong>Toolchain.</strong> <code>build.gradle</code> pins a Java 19 toolchain and adds
+        <code>--enable-preview</code> to compile, test and exec JVM args; <code>gradle.properties</code> sets
+        <code>org.gradle.java.home</code> to a JDK 17 and <code>-parameters</code> is enabled for the whole build. Run the
+        compiled jars with a JDK 19 that also gets <code>--enable-preview</code>, or the class files are rejected.</li>
+        <li><strong>Dependencies.</strong> <code>spring-context</code> everywhere (added by
+        <code>ch01/build.gradle</code>); <code>spring-aop</code> plus <code>aspectjrt</code>/<code>aspectjweaver</code> from
+        <code>recipe_1_13_i</code> on; <code>spring-instrument</code> in <code>recipe_1_20_iii</code> and
+        <code>spring-aspects</code> in <code>recipe_1_22</code>; <code>jakarta.inject-api</code> in
+        <code>recipe_1_4_ii</code>. Every module also gets <code>shared-resources</code>, whose only class is
+        <code>com.apress.spring6recipes.utils.Utils</code> (used by recipe 1.23) plus a
+        <code>simplelogger.properties</code>.</li>
+        <li><strong>No infrastructure.</strong> Nothing in <code>ch01</code> needs Docker, a database, a broker or a port.
+        Side effects on disk are limited to <code>Cashier</code> appending <code>checkout.txt</code> under
+        <code>java.io.tmpdir</code> (recipes 1.8, 1.9, 1.11, 1.12) and <code>BannerLoader</code> reading
+        <code>banner.txt</code>.</li>
+      </ul>
+      <div class="callout danger">
+        <h4>Before you run: verified stale spots</h4>
+        <p>These modules carry first-edition leftovers, confirmed by reading the files rather than by guessing:</p>
+        <ul>
+          <li>Thirteen calculator <code>Main</code> classes (<code>recipe_1_13_ii</code> …
+          <code>recipe_1_17_iv</code>) ask for <code>getBean("arithmeticCalculator", …)</code>, but
+          <code>StandardArithmeticCalculator</code> is annotated with a bare <code>@Component</code> in every one of them — the
+          generated id is <code>standardArithmeticCalculator</code>. <code>recipe_1_13_i</code>, <code>1_18</code> and
+          <code>1_19</code> avoid the issue by requesting <code>getBean(ArithmeticCalculator.class)</code> and
+          <code>getBean(UnitCalculator.class)</code>. From <code>recipe_1_13_ii</code> onwards
+          <code>StandardUnitCalculator</code> does declare <code>@Component("unitCalculator")</code>, so only the arithmetic
+          lookup is broken in those thirteen modules.</li>
+          <li>Every <code>appContext.xml</code> in the chapter scans
+          <code>com.apress.springrecipes.*</code> (no <code>6</code>) while all classes live in
+          <code>com.apress.spring6recipes.*</code> — in <code>recipe_1_16_i</code>, <code>recipe_1_16_ii</code> and
+          <code>recipe_1_17_ii</code> that XML is unused anyway, because those <code>Main</code> classes boot from the Java
+          config.</li>
+          <li><code>recipe_1_9_iv/…/sequence/Main.java</code> and
+          <code>recipe_1_4_ii/…/sequence/Main.java</code> load <code>appContext.xml</code>, which does not exist in either
+          module; <code>recipe_1_3_ii</code> scans <code>com.apress.springrecipes.sequence</code>.</li>
+          <li><code>recipe_1_8_iv/…/sequence/Main.java</code> asks for bean <code>"sequence"</code> while its config
+          declares <code>sequenceGenerator()</code>.</li>
+          <li>48 of the 56 <code>build.gradle</code> files in <code>ch01</code> set <code>Main-Class</code> to
+          <code>com.apress.springrecipes.&lt;domain&gt;.Main</code> — the pre-Spring-6 package — so <code>java -jar</code> on
+          the fat jar fails even when the code compiles; use <code>-cp</code> with the real class name as shown above. Only
+          <code>recipe_1_1_ii</code>, <code>recipe_1_8_ii</code>, <code>recipe_1_8_iii</code>,
+          <code>recipe_1_20_i</code> … <code>recipe_1_22</code> name the correct package.</li>
+          <li><code>recipe_1_25_i</code>, <code>recipe_1_25_ii</code> and <code>recipe_1_25_iii</code> have no
+          <code>build.gradle</code>; they inherit the Java and shadow plugins from the parent builds.</li>
+        </ul>
+        <p>Everything cited in the diagrams above was read from the source in this chapter, and the diagrams are drawn from
+        variants that do line up.</p>
+      </div>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch01/</code> — 59 recipe modules and <code>springintro/</code>.
+  <a href="../index.html">&larr; All chapters</a>
+</footer>
+</body>
+</html>

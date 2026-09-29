@@ -1,0 +1,1054 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 6 — Spring Data Access — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 6</div>
+  <h1>Chapter 6 — Spring Data Access</h1>
+  <p class="lede">The chapter is a ladder of removals: every recipe strips one more piece of
+  JDBC/ORM boilerplate off the same two toy domains until no persistence code is left to write.
+  Recipes 6.0–6.5 push a <code>VEHICLE</code> table around with plain JDBC, then
+  <code>JdbcTemplate</code>, then named parameters, then Spring's exception translation. Recipes
+  6.6–6.10 do the same for a <code>COURSE</code> entity: raw Hibernate, raw JPA, Spring-built
+  <code>SessionFactory</code>/<code>EntityManagerFactory</code>, declarative transactions, and
+  finally an interface-only Spring Data repository. 6.11 repeats the arc on the reactive R2DBC
+  stack.</p>
+  <div class="chip-row">
+    <span class="chip">43 modules, 12 recipe numbers, 41 Main classes</span>
+    <span class="chip">spring-jdbc, spring-orm, spring-r2dbc, spring-data-jpa, spring-data-r2dbc</span>
+    <span class="chip">Hibernate 6.1.6.Final, HikariCP 5.0.1, PostgreSQL driver 42.4.1</span>
+    <span class="chip">Spring Framework 6.0.3, Spring Data 2022.0.0</span>
+    <span class="chip">./gradlew :ch06:recipe_6_1_i:build</span>
+    <span class="chip">requires PostgreSQL on localhost:5432 (Docker)</span>
+    <span class="chip">no test sources, no Spring Boot, no application plugin</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch05/index.html">&larr; Chapter 5 — Spring Security</a>
+    <a href="../ch07/index.html">Chapter 7 — Spring Transaction Management &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc"><h2>On this page</h2><ol>
+    <li><a href="#overview">Overview and module map</a></li>
+    <li><a href="#datasources">Data sources and pooling</a></li>
+    <li><a href="#jdbctemplate">The JdbcTemplate call path</a></li>
+    <li><a href="#namedparams">Named parameters</a></li>
+    <li><a href="#mapping">Objects, tables and the one entity</a></li>
+    <li><a href="#exceptions">Exception translation</a></li>
+    <li><a href="#ormbootstrap">SessionFactory and EntityManagerFactory bootstrap</a></li>
+    <li><a href="#transactions">Declarative transactions</a></li>
+    <li><a href="#repositories">Spring Data repositories, imperative and reactive</a></li>
+    <li><a href="#running">Building and running</a></li>
+  </ol></aside>
+  <article>
+
+    <section id="overview">
+      <h2>Overview and module map</h2>
+      <p>Two unrelated domains are used on purpose. <code>Vehicle</code>
+      (<span class="path">ch06/recipe_6_vehicle/src/main/java/com/apress/spring6recipes/vehicle/Vehicle.java</span>)
+      is a plain POJO with a caller-assigned natural key, and it is the subject of every
+      <em>relational-template</em> recipe. <code>Course</code>
+      (<span class="path">ch06/recipe_6_course/src/main/java/com/apress/spring6recipes/course/Course.java</span>)
+      is the chapter's <strong>only</strong> <code>@Entity</code>, and it is the subject of every
+      <em>ORM</em> recipe. There is no relationship anywhere in the chapter — no
+      <code>@ManyToOne</code>, no <code>@OneToMany</code>, no second table to join to — so the
+      "entity graph" of Chapter 6 is a single node. That is deliberate: the recipes are about the
+      plumbing between an object and one table, not about the object-relational metadata.</p>
+      <p>Two modules are not recipes at all. <code>recipe_6_vehicle</code> and
+      <code>recipe_6_course</code> are <code>java-library</code> modules that
+      <span class="path">ch06/build.gradle</span> attaches to every other module: the
+      <code>vehicle</code> one pulls in <code>spring-jdbc</code>, the <code>course</code> one pulls
+      in <code>spring-orm</code> and <code>hibernate-core</code>. Everything from 6.0 to 6.5 depends
+      on <code>recipe_6_vehicle</code>; everything from 6.6 to 6.10 depends on
+      <code>recipe_6_course</code>; the 6.11 modules declare their own local <code>Vehicle</code>
+      and <code>VehicleDao</code> because they need reactive return types.</p>
+
+      <table>
+        <thead><tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr></thead>
+        <tbody>
+          <tr><td><span class="num">6.0</span></td><td><code>_i</code>, <code>_ii</code>, <code>_iii</code></td>
+            <td>Insert and read a <code>Vehicle</code> with hand-written JDBC. <code>_i</code> uses
+              <code>SimpleDriverDataSource</code> (a new physical connection per request);
+              <code>_ii</code> and <code>_iii</code> use <code>HikariDataSource</code>. The DAO
+              itself is identical in all three — only the <code>DataSource</code> changes.</td>
+            <td><code>PlainJdbcVehicleDao</code>, <code>VehicleDao</code>, <code>VehicleConfiguration</code></td></tr>
+          <tr><td><span class="num">6.1</span></td><td><code>_i</code>..<code>_v</code></td>
+            <td>Move <code>INSERT</code> onto <code>JdbcTemplate</code>: inner
+              <code>PreparedStatementCreator</code> class (<code>_i</code>), the same creator as a
+              lambda (<code>_ii</code>), <code>update(sql, PreparedStatementSetter)</code>
+              (<code>_iii</code>), varargs parameter values (<code>_iv</code>), and
+              <code>batchUpdate</code> over a collection (<code>_v</code>). Reads still use raw
+              JDBC in every one of these.</td>
+            <td><code>JdbcVehicleDao</code></td></tr>
+          <tr><td><span class="num">6.2</span></td><td><code>_i</code>..<code>_vi</code></td>
+            <td>Move reads onto <code>JdbcTemplate</code>: <code>RowCallbackHandler</code> lambda
+              (<code>_i</code>), private inner <code>RowMapper</code> (<code>_ii</code>),
+              <code>BeanPropertyRowMapper</code> (<code>_iii</code>), <code>queryForList</code>
+              returning maps (<code>_iv</code>), a top-level <code>VehicleRowMapper</code> class
+              (<code>_v</code>), and single-value queries <code>getColor</code> /
+              <code>countAll</code> (<code>_vi</code>).</td>
+            <td><code>JdbcVehicleDao</code>, <code>VehicleRowMapper</code></td></tr>
+          <tr><td><span class="num">6.3</span></td><td><code>_i</code>, <code>_ii</code></td>
+            <td>Stop creating a <code>new JdbcTemplate(dataSource)</code> inside every method: a
+              single shared <code>jdbcTemplate</code> bean is constructor-injected
+              (<code>_i</code>); <code>_ii</code> extends <code>JdbcDaoSupport</code> and calls
+              <code>getJdbcTemplate()</code> instead.</td>
+            <td><code>JdbcVehicleDao</code>, <code>JdbcTemplate</code>, <code>JdbcDaoSupport</code></td></tr>
+          <tr><td><span class="num">6.4</span></td><td><code>_i</code>..<code>_iv</code></td>
+            <td><code>NamedParameterJdbcTemplate</code> via
+              <code>NamedParameterJdbcDaoSupport</code>: <code>HashMap</code> of parameters
+              (<code>_i</code>), <code>MapSqlParameterSource</code> (<code>_ii</code>),
+              <code>BeanPropertySqlParameterSource</code> straight off the POJO
+              (<code>_iii</code>), and named-parameter batching with a
+              <code>SqlParameterSource</code> array (<code>_iv</code>).</td>
+            <td><code>NamedJdbcVehicleDao</code>, <code>JdbcVehicleDao</code> (<code>_iii</code> only)</td></tr>
+          <tr><td><span class="num">6.5</span></td><td><code>_i</code>, <code>_ii</code>, <code>_iii</code></td>
+            <td>Spring's exception translation. Same DAO in all three; only <code>Main</code> and
+              the classpath differ. <code>_i</code> lets the <code>DataAccessException</code>
+              escape, <code>_ii</code> catches it and unwraps the <code>SQLException</code> cause,
+              <code>_iii</code> adds <code>sql-error-codes.xml</code> mapping SQL state 23505 to a
+              custom exception type.</td>
+            <td><code>NamedJdbcVehicleDao</code>, <code>MyDuplicateKeyException</code></td></tr>
+          <tr><td><span class="num">6.6</span></td><td><code>_i</code>, <code>_ii</code>, <code>_iii</code></td>
+            <td>Persistence <em>without</em> Spring. <code>_i</code> builds a Hibernate
+              <code>SessionFactory</code> from <code>Configuration.addClass(Course.class)</code>
+              and manages <code>session.getTransaction()</code> by hand; <code>_ii</code> is the
+              same class using <code>addAnnotatedClass</code>; <code>_iii</code> calls
+              <code>Persistence.createEntityManagerFactory("course")</code> against a real
+              <code>persistence.xml</code>. <code>Main</code> creates the DAO with <code>new</code>
+              — there is no container in these three.</td>
+            <td><code>HibernateCourseDao</code>, <code>JpaCourseDao</code></td></tr>
+          <tr><td><span class="num">6.7</span></td><td><code>_i</code>..<code>_v</code></td>
+            <td>Let Spring build the factory. <code>_i</code>
+              <code>LocalSessionFactoryBuilder(null)</code> with a JDBC URL in Hibernate properties;
+              <code>_ii</code> the same builder fed a container-managed <code>DataSource</code>;
+              <code>_iii</code> <code>LocalEntityManagerFactoryBean</code> reading
+              <code>persistence.xml</code>; <code>_iv</code>
+              <code>LocalContainerEntityManagerFactoryBean</code> +
+              <code>HibernateJpaVendorAdapter</code> + <code>persistence.xml</code>;
+              <code>_v</code> the same bean with <code>setPackagesToScan</code>, dropping
+              <code>persistence.xml</code> entirely.</td>
+            <td><code>CourseConfiguration</code>, <code>HibernateCourseDao</code>, <code>JpaCourseDao</code></td></tr>
+          <tr><td><span class="num">6.8</span></td><td><code>_i</code>, <code>_ii</code>, <code>_iii</code></td>
+            <td>Hibernate with declarative transactions: <code>@EnableTransactionManagement</code>,
+              a <code>HibernateTransactionManager</code> bean, and DAO methods annotated
+              <code>@Transactional</code> that call <code>sessionFactory.getCurrentSession()</code>
+              with no begin/commit at all. <code>_ii</code> swaps the builder for the
+              <code>LocalSessionFactoryBean</code> FactoryBean; <code>_iii</code> deletes the
+              explicit <code>courseDao</code> bean and discovers <code>@Repository("courseDao")</code>
+              through <code>@ComponentScan</code>.</td>
+            <td><code>HibernateCourseDao</code>, <code>HibernateTransactionManager</code></td></tr>
+          <tr><td><span class="num">6.9</span></td><td><code>_i</code>, <code>_ii</code></td>
+            <td>The JPA equivalent: <code>@PersistenceContext EntityManager</code> instead of a
+              factory field, <code>JpaTransactionManager</code> instead of the Hibernate one,
+              <code>LocalContainerEntityManagerFactoryBean</code> with
+              <code>setGenerateDdl(true)</code>. <code>_ii</code> is <code>_i</code> plus
+              <code>@Repository</code> and component scanning.</td>
+            <td><code>JpaCourseDao</code>, <code>JpaTransactionManager</code></td></tr>
+          <tr><td><span class="num">6.10</span></td><td><code>recipe_6_10</code></td>
+            <td>Spring Data JPA. No DAO implementation exists: one interface
+              <code>CourseRepository extends CrudRepository&lt;Course, Long&gt;</code> with an empty
+              body, switched on by <code>@EnableJpaRepositories</code>.</td>
+            <td><code>CourseRepository</code>, <code>CourseConfiguration</code></td></tr>
+          <tr><td><span class="num">6.11</span></td><td><code>_i</code>, <code>_ii</code>, <code>_iii</code>, <code>_iv</code></td>
+            <td>The same ladder on R2DBC. <code>_i</code> drives
+              <code>io.r2dbc.spi.ConnectionFactory</code> directly with
+              <code>Mono.usingWhen</code>; <code>_ii</code> uses Spring's
+              <code>DatabaseClient</code>; <code>_iii</code> uses
+              <code>R2dbcEntityTemplate</code> plus <code>Criteria.where</code> and adds
+              <code>@Id</code> to <code>vehicleNo</code>; <code>_iv</code> deletes the DAO
+              implementation and extends <code>ReactiveCrudRepository</code>.</td>
+            <td><code>R2dbcVehicleDao</code>, <code>VehicleDao</code>, <code>Vehicle</code>, <code>ConnectionFactoryInitializer</code></td></tr>
+          <tr><td><span class="num">shared</span></td><td><code>recipe_6_vehicle</code>, <code>recipe_6_course</code></td>
+            <td>Library modules wired in by <code>ch06/build.gradle</code>; hold the domain types,
+              the imperative <code>VehicleDao</code>/<code>CourseDao</code> contracts and
+              <code>vehicle.sql</code>.</td>
+            <td><code>Vehicle</code>, <code>PlainJdbcVehicleDao</code>, <code>Course</code>, <code>CourseDao</code></td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">The chapter's two ladders, by abstraction level</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+  subgraph VEH["Vehicle domain -- spring-jdbc and spring-r2dbc"]
+    r60["6.0 Plain JDBC, DataSource only"] --> r61["6.1 JdbcTemplate updates"]
+    r61 --> r62["6.2 JdbcTemplate queries and row mapping"]
+    r62 --> r63["6.3 One injected JdbcTemplate bean"]
+    r63 --> r64["6.4 Named parameter templates"]
+    r64 --> r65["6.5 DataAccessException translation"]
+  end
+  subgraph CRS["Course domain -- spring-orm and spring-data-jpa"]
+    r66["6.6 Hibernate or JPA with no container"] --> r67["6.7 Spring builds the factory"]
+    r67 --> r68["6.8 getCurrentSession plus Transactional"]
+    r68 --> r69["6.9 Shared EntityManager plus JpaTransactionManager"]
+    r69 --> r610["6.10 Spring Data JPA CrudRepository"]
+  end
+  r65 -.-> r66
+  r610 -.->|"same idea on the reactive stack"| r611["6.11 R2DBC, four steps from raw ConnectionFactory to ReactiveCrudRepository"]
+  r65 ~~~ r611
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Each arrow means "delete code that the
+      next recipe lets you delete". 6.0 to 6.1 removes <code>try</code>-with-resources and
+      <code>SQLException</code> handling; 6.1 to 6.2 removes the <code>ResultSet</code> loop;
+      6.2 to 6.3 removes the <code>new JdbcTemplate(dataSource)</code> that every 6.1/6.2 method
+      builds for itself; 6.3 to 6.4 replaces positional <code>?</code> placeholders with
+      <code>:name</code> ones; 6.5 changes nothing in the DAO and only varies how the resulting
+      failure is observed. The dotted edge from 6.5 to 6.6 is the chapter changing domain, not
+      technology — <code>recipe_6_6_i</code> is <em>less</em> Spring-integrated than
+      <code>recipe_6_5_i</code>, since its <code>Main</code> still does
+      <code>new HibernateCourseDao()</code>. 6.6 to 6.7 moves factory creation into
+      <code>@Bean</code> methods, 6.7 to 6.8/6.9 moves transaction boundaries into annotations, and
+      6.9 to 6.10 deletes the DAO implementation class outright.</p>
+    </section>
+
+    <section id="datasources">
+      <h2>Data sources and pooling</h2>
+      <p>Recipe 6.0 exists to make the <code>DataSource</code> itself the subject. All three
+      variants use the same <code>PlainJdbcVehicleDao</code>, which calls
+      <code>dataSource.getConnection()</code> four times per operation and never caches anything, so
+      the bean handed to it decides the behaviour:</p>
+      <table>
+        <thead><tr><th>Module</th><th><code>dataSource()</code> bean</th><th>Effect on the DAO</th></tr></thead>
+        <tbody>
+          <tr><td><code>ch06/recipe_6_0_i</code></td>
+            <td><code>SimpleDriverDataSource</code> with <code>setDriverClass(Driver.class)</code>
+              and <code>jdbc:postgresql://localhost:5432/vehicle</code></td>
+            <td>Every <code>getConnection()</code> opens a real TCP socket and a new backend
+              process. Correct, slow, and the baseline the other two improve on.</td></tr>
+          <tr><td><code>ch06/recipe_6_0_ii</code></td>
+            <td><code>HikariDataSource</code> with <code>setDataSourceClassName("org.postgresql.ds.PGSimpleDataSource")</code>,
+              <code>setMinimumIdle(2)</code>, <code>setMaximumPoolSize(5)</code></td>
+            <td>Same DAO code, pooled connections, driver-level DataSource created by Hikari.</td></tr>
+          <tr><td><code>ch06/recipe_6_0_iii</code></td>
+            <td><code>HikariDataSource</code> with <code>setJdbcUrl(...)</code> only — no
+              <code>dataSourceClassName</code></td>
+            <td>Pooling via the JDBC URL instead of a driver class. Note the
+              <code>Main</code> here loads <code>vehicle-context.xml</code>, and no such file exists
+              in the module; the Java <code>VehicleConfiguration</code> beside it is the working
+              half of this variant.</td></tr>
+        </tbody>
+      </table>
+      <p>From 6.1 upward the same pooled bean is copy-pasted into every
+      <code>VehicleConfiguration</code>, and the course recipes point an identical
+      <code>HikariDataSource</code> at a second database, <code>.../5432/course</code>.</p>
+
+      <p>The bean graph that recipe 6.3_<code>_i</code>
+      (<span class="path">ch06/recipe_6_3_i/src/main/java/com/apress/spring6recipes/vehicle/config/VehicleConfiguration.java</span>)
+      assembles is three <code>@Bean</code> methods resolving right to left:
+      <code>dataSource()</code> needs nothing and returns the <code>HikariDataSource</code>
+      (<code>setMinimumIdle(2)</code>, <code>setMaximumPoolSize(5)</code>);
+      <code>jdbcTemplate(DataSource)</code> is called with that instance;
+      <code>vehicleDao(JdbcTemplate)</code> is called with the template. <code>Main</code> registers
+      the configuration class with an <code>AnnotationConfigApplicationContext</code> and asks for
+      <code>VehicleDao</code>. This is the one structural change of recipe 6.3: in 6.1 and 6.2 the
+      container only supplied a <code>DataSource</code> and the DAO built a throwaway
+      <code>JdbcTemplate</code> per method call; here the template is a singleton, so its
+      prepared-statement handling and its <code>SQLException</code> translation are shared. In
+      6.3_<code>_ii</code> the last edge changes shape: <code>JdbcVehicleDao</code> extends
+      <code>JdbcDaoSupport</code> and the bean method calls
+      <code>setJdbcTemplate(jdbcTemplate)</code> instead of passing it through the constructor —
+      which is also how every 6.4 and 6.5 DAO is wired, via
+      <code>NamedParameterJdbcDaoSupport</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">One update, from pool to backend and back</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main
+    participant D as JdbcVehicleDao
+    participant T as JdbcTemplate
+    participant P as HikariDataSource
+    participant DB as PostgreSQL, database vehicle
+    M->>D: insert(new Vehicle TEM0031, Red, 4, 4)
+    D->>T: update INSERT_SQL with color, wheel, seat, vehicleNo
+    T->>P: getConnection
+    P-->>T: an idle pooled Connection
+    T->>DB: prepareStatement then executeUpdate
+    DB-->>T: update count
+    T->>P: close on the wrapper, connection returns to the pool
+    T-->>D: int update count
+    D-->>M: void
+    Note over T,P: No transaction is active here, so nothing is bound to the thread
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Steps 4 to 8 are exactly what
+      <code>JdbcTemplate</code> replaces from recipe 6.0: it obtains the connection, executes, and
+      closes the handle in a <code>finally</code>. Because Hikari owns the physical socket, that
+      <code>close</code> is a pool return, not a disconnect — which is why 6.0's
+      <code>SimpleDriverDataSource</code> and 6.0's pooled variants run identically but differ in
+      cost. <code>Note over T,P</code> is the important part for the rest of the book: none of the
+      JDBC recipes in this chapter declares a transaction, and there is no
+      <code>DataSourceTransactionManager</code> bean anywhere in <code>ch06/</code>. Each
+      <code>update</code> runs in its own implicit autocommitted transaction. Transactions first
+      appear in 6.8, and only for Hibernate and JPA.</p>
+    </section>
+
+    <section id="jdbctemplate">
+      <h2>The JdbcTemplate call path</h2>
+      <p>The layering the whole chapter converges on is four deep, and each recipe deletes one
+      level of it. The names below are all real types used in <code>ch06/</code>; note that
+      <code>JdbcTemplate</code> is <em>the</em> implementation of Spring's
+      <code>JdbcOperations</code> contract, but no ch06 source ever declares a field of that
+      interface type — every DAO and <code>@Bean</code> method spells <code>JdbcTemplate</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Repository to template to DataSource to database, with the transaction interceptor</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+  main["Main"] --> ifc["VehicleDao or CourseDao interface, the container injects the bean"]
+  subgraph JDBC["Recipes 6.0 to 6.5, spring-jdbc"]
+    ifc --> plain["PlainJdbcVehicleDao, raw getConnection"]
+    ifc --> jdbcDao["JdbcVehicleDao"]
+    ifc --> namedDao["NamedJdbcVehicleDao"]
+    jdbcDao --> tpl["JdbcTemplate"]
+    namedDao --> ntpl["NamedParameterJdbcTemplate"]
+    tpl --> dsrc["HikariDataSource"]
+    ntpl --> dsrc
+  end
+  subgraph ORM["Recipes 6.6 to 6.10, spring-orm"]
+    ifc --> hdao["HibernateCourseDao"]
+    ifc --> jdao["JpaCourseDao"]
+    jdao -->|"Transactional proxy, recipes 6.8 onward"| adv["Transaction advice"]
+    hdao --> adv
+    adv --> tm["HibernateTransactionManager or JpaTransactionManager"]
+    jdao --> em["shared EntityManager from PersistenceContext"]
+    hdao --> sf["SessionFactory getCurrentSession"]
+    tm --> dsrc
+    em --> dsrc
+    sf --> dsrc
+  end
+  dsrc --> pg[("PostgreSQL")]
+  repo10["CourseRepository, recipe 6_10, no implementation class"] -->|"generated proxy"| adv
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Follow <code>JdbcVehicleDao</code> down:
+      the DAO hands SQL plus arguments to <code>JdbcTemplate</code>, the template asks
+      <code>HikariDataSource</code> for a connection, PostgreSQL answers, and the template converts
+      any <code>SQLException</code> before it reaches the DAO. Nothing intercepts that path — there
+      is no proxy on any vehicle DAO, because no vehicle recipe enables
+      <code>@EnableTransactionManagement</code>. On the ORM side the picture changes at 6.8: the
+      <code>CourseDao</code> bean the container hands to <code>Main</code> is a proxy, and the
+      transaction advice runs <em>before</em> <code>store</code> reaches
+      <code>HibernateCourseDao</code>. That advice is what makes
+      <code>sessionFactory.getCurrentSession()</code> and the injected
+      <code>EntityManager</code> resolve to a thread-bound resource instead of throwing. The bottom
+      edge shows recipe 6.10's odd position: <code>CourseRepository</code> has no class to annotate,
+      so the generated proxy applies transaction advice around a Spring Data-supplied
+      implementation that ultimately uses an <code>EntityManager</code> too.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The imperative DAO family and what each variant inherits</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class VehicleDao {
+        &lt;&lt;interface&gt;&gt;
+        insert(Vehicle)
+        insert(Collection)
+        update(Vehicle)
+        delete(Vehicle)
+        findByVehicleNo(String)
+        findAll()
+        getColor(String)
+        countAll()
+    }
+    class PlainJdbcVehicleDao {
+        DataSource field
+        toVehicle(ResultSet)
+    }
+    class JdbcVehicleDao {
+        DataSource or JdbcTemplate field
+        prepareStatement(PreparedStatement, Vehicle)
+    }
+    class NamedJdbcVehicleDao {
+        toParameterMap(Vehicle)
+    }
+    class JdbcDaoSupport {
+        setJdbcTemplate(JdbcTemplate)
+        getJdbcTemplate()
+    }
+    class NamedParameterJdbcDaoSupport {
+        setJdbcTemplate(JdbcTemplate)
+        getNamedParameterJdbcTemplate()
+        getJdbcTemplate()
+    }
+    class JdbcTemplate {
+        update(String, Object)
+        query(String, RowMapper)
+        queryForObject(String, RowMapper, Object)
+        queryForList(String)
+        batchUpdate(String, Collection, int, ParameterSetter)
+    }
+    class NamedParameterJdbcTemplate {
+        update(String, SqlParameterSource)
+        batchUpdate(String, SqlParameterSource)
+    }
+    class RowMapper {
+        &lt;&lt;interface&gt;&gt;
+        mapRow(ResultSet, int)
+    }
+    class BeanPropertyRowMapper {
+        newInstance(Class)
+    }
+    class VehicleRowMapper {
+        mapRow(ResultSet, int)
+    }
+    VehicleDao <|.. PlainJdbcVehicleDao : recipe 6.0
+    VehicleDao <|.. JdbcVehicleDao : recipes 6.1 to 6.3
+    VehicleDao <|.. NamedJdbcVehicleDao : recipes 6.4 and 6.5
+    JdbcDaoSupport <|-- JdbcVehicleDao : recipe 6.3_ii only
+    NamedParameterJdbcDaoSupport <|-- NamedJdbcVehicleDao : recipes 6.4 onward
+    NamedParameterJdbcDaoSupport o-- NamedParameterJdbcTemplate : owns
+    NamedParameterJdbcDaoSupport o-- JdbcTemplate : inherits getJdbcTemplate
+    JdbcTemplate o-- DataSource : obtains connections
+    NamedParameterJdbcTemplate o-- DataSource : or delegates to JdbcTemplate
+    RowMapper <|-- VehicleRowMapper : recipe 6.2_v
+    RowMapper <|-- BeanPropertyRowMapper : reflection
+    BeanPropertyRowMapper ..> Vehicle : maps columns to setters
+    VehicleRowMapper ..> Vehicle : maps columns by name
+    JdbcVehicleDao ..> RowMapper : passed to query
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Three things are worth noticing. The
+      hollow triangle (<code>implements</code>) chain is stable across the whole chapter: the
+      container always hands <code>Main</code> a <code>VehicleDao</code>, so swapping
+      <code>PlainJdbcVehicleDao</code> for <code>NamedJdbcVehicleDao</code> is a one-line config
+      edit. The <code>&lt;|--</code> edge into <code>JdbcDaoSupport</code> only exists in
+      <code>recipe_6_3_ii</code> — that inheritance is why the DAO can call
+      <code>getJdbcTemplate()</code> with no field of its own, and the book treats it as the older
+      style. Finally <code>NamedJdbcVehicleDao</code> keeps calling
+      <code>getJdbcTemplate()</code> for its positional <code>SELECT</code> statements while only
+      <code>insert</code> uses <code>getNamedParameterJdbcTemplate()</code>; both templates come
+      from the same <code>DataSource</code>. Vehicle is the shared POJO from
+      <code>recipe_6_vehicle</code>; it is not drawn as a class with relationships because none of
+      these collaborators hold one another across calls.</p>
+
+      <table>
+        <thead><tr><th>Variant</th><th>The call that replaced the boilerplate</th></tr></thead>
+        <tbody>
+          <tr><td>6.1_<code>_i</code></td><td><code>jdbcTemplate.update(new InsertVehicleStatementCreator(vehicle))</code> — a private inner <code>PreparedStatementCreator</code></td></tr>
+          <tr><td>6.1_<code>_ii</code></td><td><code>jdbcTemplate.update(conn -&gt; { ... return ps; })</code> — the same creator as a lambda</td></tr>
+          <tr><td>6.1_<code>_iii</code></td><td><code>jdbcTemplate.update(INSERT_SQL, ps -&gt; prepareStatement(ps, vehicle))</code> — a <code>PreparedStatementSetter</code></td></tr>
+          <tr><td>6.1_<code>_iv</code></td><td><code>jdbcTemplate.update(INSERT_SQL, color, wheel, seat, vehicleNo)</code> — positional varargs, no setter at all</td></tr>
+          <tr><td>6.1_<code>_v</code></td><td><code>jdbcTemplate.batchUpdate(INSERT_SQL, vehicles, vehicles.size(), this::prepareStatement)</code></td></tr>
+          <tr><td>6.2_<code>_i</code></td><td><code>query(sql, rs -&gt; { mutate one shared Vehicle }, vehicleNo)</code> — a <code>RowCallbackHandler</code></td></tr>
+          <tr><td>6.2_<code>_ii</code></td><td><code>queryForObject(sql, new VehicleRowMapper(), vehicleNo)</code> with the mapper as a private inner class</td></tr>
+          <tr><td>6.2_<code>_iii</code></td><td><code>BeanPropertyRowMapper.newInstance(Vehicle.class)</code></td></tr>
+          <tr><td>6.2_<code>_iv</code></td><td><code>queryForList(SELECT_ALL_SQL)</code> then stream over the maps</td></tr>
+          <tr><td>6.2_<code>_vi</code></td><td><code>queryForObject(SELECT_COLOR_SQL, String.class, vehicleNo)</code> and <code>queryForObject(COUNT_ALL_SQL, Integer.class)</code></td></tr>
+          <tr><td>6.3_<code>_ii</code></td><td>identical calls, reached through <code>getJdbcTemplate()</code> from <code>JdbcDaoSupport</code></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="namedparams">
+      <h2>Named parameters</h2>
+      <p>Recipes 6.4_<code>_i</code> to <code>_iv</code>
+      (<span class="path">ch06/recipe_6_4_i/src/main/java/com/apress/spring6recipes/vehicle/NamedJdbcVehicleDao.java</span>)
+      all use the same statement, which is positional JDBC underneath:</p>
+      <pre><code>INSERT INTO VEHICLE (COLOR, WHEEL, SEAT, VEHICLE_NO)
+VALUES (:color, :wheel, :seat, :vehicleNo)</code></pre>
+      <p>What differs is only how the four values are supplied: a <code>HashMap</code> with string
+      keys (<code>_i</code>), that map wrapped in a <code>MapSqlParameterSource</code>
+      (<code>_ii</code>), a <code>BeanPropertySqlParameterSource</code> built from the
+      <code>Vehicle</code> itself (<code>_iii</code>), and in <code>_iv</code> an array of
+      <code>BeanPropertySqlParameterSource</code> passed to <code>batchUpdate</code> so a whole
+      collection is inserted in one named batch. The <code>SELECT</code>, <code>UPDATE</code> and
+      <code>DELETE</code> statements in these modules are still written with
+      <code>?</code>, because the DAO reaches for <code>getJdbcTemplate()</code> for those.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">How :color becomes the first positional placeholder</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+  a["Vehicle POJO, getters getColor, getWheel, getSeat, getVehicleNo"] --> b["BeanPropertySqlParameterSource, recipe 6.4_iii"]
+  a2["HashMap with keys color, wheel, seat, vehicleNo"] --> b2["MapSqlParameterSource, recipe 6.4_ii"]
+  a2 --> b3["raw Map, recipe 6.4_i"]
+  b --> c["NamedParameterJdbcTemplate.update with named SQL"]
+  b2 --> c
+  b3 --> c
+  c --> d["Parse the SQL, collect names in order of first appearance"]
+  d --> e["JDBC statement, four positional placeholders"]
+  e --> f["setString 1 color, setInt 2 wheel, setInt 3 seat, setString 4 vehicleNo"]
+  f --> g[("PostgreSQL, table VEHICLE")]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> <code>NamedJdbcVehicleDao.insert</code>
+      calls <code>getNamedParameterJdbcTemplate().update(INSERT_SQL, source)</code>. The template
+      parses <code>INSERT_SQL</code>, records <code>color</code>, <code>wheel</code>,
+      <code>seat</code>, <code>vehicleNo</code> in the order their <code>:name</code> tokens appear,
+      and rewrites the statement to the four <code>?</code> placeholders PostgreSQL actually
+      accepts. For each placeholder it resolves the name: <code>Map</code> and
+      <code>MapSqlParameterSource</code> do a key lookup, while
+      <code>BeanPropertySqlParameterSource</code> invokes the matching getter — which is why the
+      names in the SQL must be <em>property</em> names (<code>vehicleNo</code>), never column names
+      (<code>VEHICLE_NO</code>). The order of the columns in the
+      <code>INSERT</code> list is irrelevant; only the order of first appearance of the names
+      matters, and that is the safety this buys over 6.1_<code>_iv</code>'s positional varargs,
+      where a swapped argument compiles fine and corrupts a row.</p>
+    </section>
+
+    <section id="mapping">
+      <h2>Objects, tables and the one entity</h2>
+      <p><code>Course</code> is the chapter's only mapped entity, and its mapping is deliberately
+      flat. Every column name is stated explicitly with <code>@Column(name = ...)</code>, so nothing
+      depends on an implicit naming strategy; the id is DB-generated, so
+      <code>course.getId()</code> is <code>null</code> before <code>store</code> and populated
+      afterwards — which is exactly what every <code>Main</code> in 6.6 to 6.10 prints to
+      demonstrate.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Course, Vehicle and the tables behind them</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Course {
+        Long id
+        String title
+        LocalDate beginDate
+        LocalDate endDate
+        int fee
+        getId()
+        setId(Long)
+    }
+    class TABLE_COURSE {
+        ID
+        TITLE
+        BEGIN_DATE
+        END_DATE
+        FEE
+    }
+    class Vehicle {
+        String vehicleNo
+        String color
+        int wheel
+        int seat
+    }
+    class TABLE_VEHICLE {
+        VEHICLE_NO
+        COLOR
+        WHEEL
+        SEAT
+    }
+    Course --> TABLE_COURSE : Entity, Table, Id, GeneratedValue IDENTITY, Column
+    Vehicle --> TABLE_VEHICLE : mapped by hand-written SQL in every DAO
+    Course .. Vehicle : no relationship of any kind exists in ch06
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The solid edge from
+      <code>Course</code> is metadata read once at factory build time:
+      <code>@Entity</code> plus <code>@Table(name = "COURSE")</code> pick the table,
+      <code>@Id</code> with <code>@GeneratedValue(strategy = GenerationType.IDENTITY)</code> makes
+      <code>ID</code> a database-assigned identity column, <code>@Column(name = "TITLE", length =
+      100, nullable = false)</code> constrains the title, and <code>beginDate</code>/<code>endDate</code>
+      of type <code>LocalDate</code> map onto <code>BEGIN_DATE</code>/<code>END_DATE</code>. Because
+      the id is generated, the DAOs branch on it: <code>HibernateCourseDao.store</code> calls
+      <code>session.persist(course)</code> when <code>course.getId() == null</code> and
+      <code>session.merge(course)</code> otherwise. The <code>Vehicle</code> edge is the opposite
+      world — no annotations at all, a natural key the caller types by hand
+      (<code>new Vehicle("TEM0031", "Red", 4, 4)</code>), and the mapping split across
+      <code>prepareStatement</code> on the way in and a <code>RowMapper</code> on the way out. The
+      dotted edge is the point: the two domains never meet, so there is no cascade, fetch mode or
+      collection-valued end anywhere in this chapter.</p>
+
+      <table>
+        <thead><tr><th>Object member</th><th>Column</th><th>Declared in</th><th>Who supplies the value</th></tr></thead>
+        <tbody>
+          <tr><td><code>Course.id</code> : <code>Long</code></td><td><code>ID</code></td>
+            <td><code>@Id</code> + <code>@GeneratedValue(strategy = GenerationType.IDENTITY)</code> + <code>@Column(name = "ID")</code></td>
+            <td>The database, on insert. Java-side it is a nullable <code>Long</code> so "unsaved" can be represented.</td></tr>
+          <tr><td><code>Course.title</code> : <code>String</code></td><td><code>TITLE</code></td>
+            <td><code>length = 100, nullable = false</code></td><td><code>Main</code> via <code>setTitle</code>.</td></tr>
+          <tr><td><code>Course.beginDate</code> : <code>LocalDate</code></td><td><code>BEGIN_DATE</code></td>
+            <td><code>@Column(name = "BEGIN_DATE")</code></td>
+            <td><code>Main</code>. Note the constructor parameter is called <code>startDate</code> but the field is <code>beginDate</code>.</td></tr>
+          <tr><td><code>Course.endDate</code> : <code>LocalDate</code></td><td><code>END_DATE</code></td>
+            <td><code>@Column(name = "END_DATE")</code></td><td><code>Main</code>.</td></tr>
+          <tr><td><code>Course.fee</code> : <code>int</code></td><td><code>FEE</code></td>
+            <td><code>@Column(name = "FEE")</code></td><td><code>Main</code>; primitive, so it defaults to 0 rather than null.</td></tr>
+          <tr><td><code>Vehicle.vehicleNo</code> : <code>String</code></td><td><code>VEHICLE_NO</code></td>
+            <td><code>vehicle.sql</code>, <code>VARCHAR(10) NOT NULL PRIMARY KEY</code></td>
+            <td>The caller, always. In <code>recipe_6_11_iii</code> only, <code>vehicleNo</code> carries
+              <code>@Id</code> from <code>org.springframework.data.annotation</code>.</td></tr>
+          <tr><td><code>Vehicle.color</code>, <code>wheel</code>, <code>seat</code></td>
+            <td><code>COLOR</code> <code>VARCHAR(10)</code>, <code>WHEEL</code> <code>INT</code>, <code>SEAT</code> <code>INT</code></td>
+            <td><code>vehicle.sql</code></td>
+            <td>Positional binding in <code>prepareStatement</code>, or <code>BeanPropertyRowMapper</code> reading them back.</td></tr>
+        </tbody>
+      </table>
+      <p>Because <code>BeanPropertyRowMapper</code> matches columns to properties by
+      <em>relaxed name</em> rules, <code>VEHICLE_NO</code> resolves to <code>vehicleNo</code> and
+      <code>BEGIN_DATE</code> to <code>beginDate</code>. That is why 6.2_<code>_iii</code> works with
+      zero mapping code, and it is the same convention Spring Data relies on later.</p>
+    </section>
+
+    <section id="exceptions">
+      <h2>Exception translation</h2>
+      <p>Recipes 6.5_<code>_i</code>, <code>_ii</code> and <code>_iii</code> ship the
+      <em>same</em> <code>NamedJdbcVehicleDao</code>. Only <code>Main</code> and the classpath
+      change, and the failure is reproducible by construction: each <code>Main</code> inserts
+      <code>VEHICLE_NO</code> = <code>EX0001</code>, which is the primary key, so the first run
+      succeeds and every later run violates it.</p>
+      <table>
+        <thead><tr><th>Variant</th><th>What is added</th><th>What you see</th></tr></thead>
+        <tbody>
+          <tr><td>6.5_<code>_i</code></td><td>nothing — <code>Main</code> has no <code>try</code></td>
+            <td>A Spring <code>DataAccessException</code> subtype escapes and kills the JVM, instead of
+              a raw <code>SQLException</code>. That is the win: the DAO never mentions
+              <code>SQLException</code>.</td></tr>
+          <tr><td>6.5_<code>_ii</code></td><td><code>catch (DataAccessException e)</code> then
+            <code>(SQLException) e.getCause()</code></td>
+            <td>Prints <code>getErrorCode()</code> and <code>getSQLState()</code> — vendor detail is
+              still reachable, it is just no longer mandatory.</td></tr>
+          <tr><td>6.5_<code>_iii</code></td><td><code>src/main/resources/sql-error-codes.xml</code>
+            declaring <code>SQLErrorCodes</code> for product <code>PostgreSQL</code> with
+            <code>useSqlStateForTranslation=true</code> and a
+            <code>CustomSQLErrorCodesTranslation</code> for code <code>23505</code></td>
+            <td>The stack trace names <code>MyDuplicateKeyException</code>, which extends
+              <code>DataIntegrityViolationException</code> — a type of your own, thrown by Spring's
+              translator.</td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">One duplicate-key insert, translated three ways</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+  start["Main inserts VEHICLE_NO EX0001 a second time"] --> viol["PostgreSQL refuses, SQL state 23505, unique violation"]
+  viol --> sqlex["Driver raises SQLException"]
+  sqlex --> tpl["JdbcTemplate and NamedParameterJdbcTemplate catch it before propagating"]
+  tpl --> fact["Look up SQLErrorCodes for product PostgreSQL, from sql-error-codes.xml"]
+  fact -->|"default mapping, recipes 6.5_i and 6.5_ii"| std["DataIntegrityViolationException"]
+  fact -->|"customTranslations entry for 23505, recipe 6.5_iii only"| custom["MyDuplicateKeyException extends DataIntegrityViolationException"]
+  std -->|"6.5_i, no catch clause"| up["escapes to the caller as a DataAccessException"]
+  std -->|"6.5_ii, catch DataAccessException"| unwrap["getCause cast to SQLException, print getErrorCode and getSQLState"]
+  custom -->|"6.5_iii, no catch clause"| trace["stack trace shows your own exception type"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> The translation happens
+      <em>inside the template</em>, which is why 6.5 changes no DAO code: the template catches the
+      <code>SQLException</code> and asks for an <code>SQLErrorCodes</code> definition for the
+      database product it is talking to. <code>recipe_6_5_iii</code>
+      (<span class="path">ch06/recipe_6_5_iii/src/main/resources/sql-error-codes.xml</span>) places
+      its own <code>sql-error-codes.xml</code> on the classpath with a bean literally named
+      <code>PostgreSQL</code>, sets <code>useSqlStateForTranslation</code> true, and adds one
+      <code>CustomSQLErrorCodesTranslation</code> mapping code <code>23505</code> to
+      <code>com.apress.spring6recipes.vehicle.MyDuplicateKeyException</code>. Everything downstream
+      of the template keeps coding against the unchecked
+      <code>DataAccessException</code> hierarchy, so a <code>catch</code> written for 6.5_<code>_ii</code>
+      would also catch 6.5_<code>_iii</code>'s custom type — it is a subtype, not a sibling.</p>
+    </section>
+
+    <section id="ormbootstrap">
+      <h2>SessionFactory and EntityManagerFactory bootstrap</h2>
+      <p>Recipes 6.6 and 6.7 are the same program with the construction phase moved. In
+      <code>recipe_6_6_i</code> <code>HibernateCourseDao</code>'s <em>constructor</em> builds a
+      <code>SessionFactory</code> from <code>org.hibernate.cfg.Configuration</code> — URL, user,
+      password, <code>show_sql</code>, <code>hbm2ddl.auto=update</code> — and
+      <code>recipe_6_6_iii</code> instead calls <code>Persistence.createEntityManagerFactory("course")</code>
+      against <span class="path">ch06/recipe_6_6_iii/src/main/resources/META-INF/persistence.xml</span>.
+      Neither has a container; <code>Main</code> does <code>new HibernateCourseDao()</code>.</p>
+      <table>
+        <thead><tr><th>Variant</th><th>Factory bean or call</th><th>Entity discovery</th><th>Connection source</th></tr></thead>
+        <tbody>
+          <tr><td>6.6_<code>_i</code> / <code>_ii</code></td><td>Hibernate <code>Configuration.buildSessionFactory()</code></td>
+            <td><code>addClass(Course.class)</code> vs <code>addAnnotatedClass(Course.class)</code> — the only difference between the two</td>
+            <td><code>AvailableSettings.URL/USER/PASS</code> properties, Hikari not involved</td></tr>
+          <tr><td>6.6_<code>_iii</code></td><td><code>Persistence.createEntityManagerFactory("course")</code></td>
+            <td><code>&lt;class&gt;</code> element in <code>persistence.xml</code>, plus the
+              <code>HibernatePersistenceProvider</code> element</td>
+            <td><code>jakarta.persistence.jdbc.url</code> properties</td></tr>
+          <tr><td>6.7_<code>_i</code></td><td><code>LocalSessionFactoryBuilder(null)</code></td>
+            <td><code>addAnnotatedClasses(Course.class)</code></td>
+            <td>Hibernate properties carry the JDBC URL; no <code>DataSource</code> bean</td></tr>
+          <tr><td>6.7_<code>_ii</code></td><td><code>LocalSessionFactoryBuilder(dataSource)</code></td>
+            <td><code>addAnnotatedClasses(Course.class)</code></td>
+            <td>a <code>HikariDataSource</code> bean pointed at <code>.../5432/course</code></td></tr>
+          <tr><td>6.7_<code>_iii</code></td><td><code>LocalEntityManagerFactoryBean</code>, <code>setPersistenceUnitName("course")</code></td>
+            <td><code>persistence.xml</code> still required</td>
+            <td>properties inside that <code>persistence.xml</code></td></tr>
+          <tr><td>6.7_<code>_iv</code></td><td><code>LocalContainerEntityManagerFactoryBean</code> + <code>HibernateJpaVendorAdapter</code></td>
+            <td><code>persistence.xml</code> present and the unit name is still set</td>
+            <td>container <code>DataSource</code> overrides the file's connection settings</td></tr>
+          <tr><td>6.7_<code>_v</code></td><td>as <code>_iv</code>, plus <code>setPackagesToScan("com.apress.spring6recipes.course")</code></td>
+            <td>classpath scan; no <code>persistence.xml</code> in the module at all</td>
+            <td>container <code>DataSource</code>, <code>setGenerateDdl(true)</code></td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Container start-up in recipe_6_7_v / 6_10</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main
+    participant C as AnnotationConfigApplicationContext
+    participant D as HikariDataSource bean
+    participant F as LocalContainerEntityManagerFactoryBean
+    participant V as HibernateJpaVendorAdapter
+    participant P as PostgreSQL, database course
+    M->>C: new AnnotationConfigApplicationContext(CourseConfiguration)
+    C->>D: instantiate dataSource, jdbc url 5432 course
+    C->>F: setDataSource, setPackagesToScan, setJpaVendorAdapter
+    F->>V: ask the vendor for a native EntityManagerFactory
+    V->>P: open connections through the injected DataSource
+    P-->>V: product name and metadata
+    V->>P: run schema update because generateDdl is true
+    F-->>C: EntityManagerFactory object from the FactoryBean
+    C->>C: bind EntityManagerFactory into courseDao and transactionManager
+    C-->>M: context ready
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> <code>LocalContainerEntityManagerFactoryBean</code>
+      is a FactoryBean, so the object other beans receive is the <code>EntityManagerFactory</code> it
+      produces, not the bean itself — which is why <code>courseDao(EntityManagerFactory)</code> and
+      <code>transactionManager(EntityManagerFactory)</code> can both declare the JPA interface. The
+      <code>HibernateJpaVendorAdapter</code> is where the vendor-specific knowledge lives: in
+      6.7_<code>_iv</code> and <code>_v</code> <code>setShowSql(true)</code> and
+      <code>setGenerateDdl(true)</code> replace both the <code>hibernate.show_sql</code> property and
+      the <code>hbm2ddl.auto=update</code> property of 6.6/6.7_<code>_i</code>-<code>_iii</code>, and
+      the dialect is resolved from the live connection rather than named. <code>_v</code> adds
+      <code>setPackagesToScan</code> and is the only 6.7 variant with no
+      <code>META-INF/persistence.xml</code> at all — the last step before recipe 6.10's pure
+      Spring Data configuration.</p>
+      <div class="callout danger"><h4>Two real traps in this ladder</h4>
+      <p>The <code>persistence.xml</code> files under <code>recipe_6_6_iii</code> and
+      <code>recipe_6_7_iii</code>/<code>recipe_6_7_iv</code> are not consistent: 6.6_<code>_iii</code>
+      uses <code>jakarta.persistence.jdbc.url</code>, while the two 6.7 files still use the
+      <code>javax.persistence.jdbc.*</code> keys against a <code>version="3.1"</code> persistence
+      unit under Hibernate 6. Expect to correct those keys before 6.7_<code>_iii</code> can connect;
+      6.7_<code>_iv</code> is less exposed because its <code>DataSource</code> is supplied by the
+      container.</p>
+      <p><code>recipe_6_9_i</code> and <code>recipe_6_9_ii</code> scan
+      <code>"com.apress.springrecipes.course"</code> — no <code>6</code> in the package name. The
+      entities live in <code>com.apress.spring6recipes.course</code>, so those two variants declare a
+      scan that finds nothing, and <code>recipe_6_10</code> has the corrected string.</p></div>
+    </section>
+
+    <section id="transactions">
+      <h2>Declarative transactions</h2>
+      <p>Recipes 6.8 and 6.9 are where the chapter finally declares a transaction, and the code
+      change is subtractive: three <code>try/catch/finally</code> blocks in
+      <code>recipe_6_7_i</code>'s <code>store</code> become four lines. Compare
+      <span class="path">ch06/recipe_6_7_i/src/main/java/com/apress/spring6recipes/course/hibernate/HibernateCourseDao.java</span>
+      (open session, <code>getTransaction().begin()</code>, commit, rollback on
+      <code>RuntimeException</code>, close in <code>finally</code>) with the same class in
+      <code>recipe_6_8_i</code>: <code>@Transactional public Course store(Course course)</code>
+      calling <code>sessionFactory.getCurrentSession()</code> and nothing else.</p>
+      <table>
+        <thead><tr><th>Variant</th><th>Factory bean</th><th>Transaction manager</th><th>DAO discovery</th></tr></thead>
+        <tbody>
+          <tr><td>6.8_<code>_i</code></td><td><code>LocalSessionFactoryBuilder(dataSource)</code>, built eagerly in the <code>@Bean</code> method</td>
+            <td><code>HibernateTransactionManager(sf)</code></td><td>explicit <code>@Bean courseDao</code></td></tr>
+          <tr><td>6.8_<code>_ii</code></td><td><code>LocalSessionFactoryBean</code>, a FactoryBean with container-managed lifecycle</td>
+            <td><code>HibernateTransactionManager(sessionFactory)</code></td><td>explicit <code>@Bean courseDao</code></td></tr>
+          <tr><td>6.8_<code>_iii</code></td><td>as <code>_ii</code></td><td>as <code>_ii</code></td>
+            <td><code>@ComponentScan("com.apress.spring6recipes.course")</code> finds <code>@Repository("courseDao")</code></td></tr>
+          <tr><td>6.9_<code>_i</code></td><td><code>LocalContainerEntityManagerFactoryBean</code></td>
+            <td><code>JpaTransactionManager(emf)</code></td><td>explicit <code>@Bean courseDao</code>, DAO uses <code>@PersistenceContext</code></td></tr>
+          <tr><td>6.9_<code>_ii</code></td><td>as <code>_i</code></td><td>as <code>_i</code></td>
+            <td>component scan plus <code>@Repository("courseDao")</code></td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">store(course) through the transactional proxy</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main
+    participant X as proxy for the CourseDao bean
+    participant A as transaction advice from EnableTransactionManagement
+    participant T as JpaTransactionManager or HibernateTransactionManager
+    participant D as JpaCourseDao or HibernateCourseDao
+    participant P as PostgreSQL, database course
+    M->>X: courseDao.store(course) with id null
+    X->>A: intercept, read the TransactionAttribute
+    A->>T: propagate REQUIRED, readOnly false
+    T->>P: begin, bind EntityManager or Session to the thread
+    A->>D: proceed into store
+    D->>D: entityManager.merge, or getCurrentSession persist or merge
+    D-->>A: managed Course
+    A->>T: commit
+    T->>P: flush dirty state then commit, identity returns the generated ID
+    P-->>T: row written
+    T-->>X: transaction closed and unbound
+    X-->>M: Course whose getId is now populated
+    Note over A,T: An unchecked exception from proceed triggers rollback instead
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> <code>Main</code> never knows it holds a
+      proxy: <code>context.getBean(CourseDao.class)</code> returns one because
+      <code>@EnableTransactionManagement</code> turns the container's post-processor on and the DAO
+      has <code>@Transactional</code> methods. The advice asks the transaction manager for a
+      transaction before the DAO body runs, and the manager <em>binds the resource to the thread</em>.
+      That binding is the whole trick behind the two apparently magic lines in these recipes: in
+      6.8 <code>sessionFactory.getCurrentSession()</code> returns the session the manager just bound
+      rather than throwing, and in 6.9 the <code>@PersistenceContext</code> field is a shared,
+      thread-resolving <code>EntityManager</code> proxy instead of one you create and close. The
+      <code>readOnly = true</code> attribute on <code>findById</code> and <code>findAll</code> marks
+      the flush mode read-only for those calls. Note the version skew the recipes leave in place:
+      6.9_<code>_i</code>'s <code>delete</code> does <code>find</code> then <code>remove</code>,
+      while 6.9_<code>_ii</code> does <code>getReference</code> then <code>remove</code> — one
+      extra select versus one delete.</p>
+    </section>
+
+    <section id="repositories">
+      <h2>Spring Data repositories, imperative and reactive</h2>
+      <p>Recipe 6.10 is the end of the imperative ladder: the DAO class disappears.
+      <span class="path">ch06/recipe_6_10/src/main/java/com/apress/spring6recipes/course/CourseRepository.java</span>
+      is the entire persistence layer — an interface with an empty body — and
+      <code>@EnableJpaRepositories("com.apress.spring6recipes.course")</code> on
+      <code>CourseConfiguration</code> makes the container produce an implementation for it at
+      startup. Everything 6.9 wrote by hand (<code>merge</code>, <code>find</code>,
+      <code>createQuery</code>) now comes from generic methods declared on
+      <code>CrudRepository</code>.</p>
+      <p>Recipe 6.11 walks the same four rungs on R2DBC: <code>_i</code> manages
+      <code>io.r2dbc.spi.Connection</code> inside <code>Mono.usingWhen</code> with an explicit
+      <code>close</code> callback; <code>_ii</code> replaces that with
+      <code>DatabaseClient.create(cf)</code> and a fluent <code>sql(...).bind(...).map(...).one()</code>;
+      <code>_iii</code> moves to <code>R2dbcEntityTemplate</code> with
+      <code>query(where("vehicleNo").is(vehicleNo))</code>, requiring
+      <code>@Id</code> on <code>vehicleNo</code>; <code>_iv</code> deletes
+      <code>R2dbcVehicleDao</code> entirely and declares
+      <code>VehicleDao extends ReactiveCrudRepository&lt;Vehicle, String&gt;</code> under
+      <code>@EnableR2dbcRepositories</code> and <code>AbstractR2dbcConfiguration</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">Interfaces the container implements for you</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class CourseRepository {
+        &lt;&lt;interface&gt;&gt;
+    }
+    class CrudRepository {
+        &lt;&lt;interface&gt;&gt;
+        save(S)
+        findById(ID)
+        deleteById(ID)
+        existsById(ID)
+        findAll()
+        count()
+    }
+    class VehicleDao {
+        &lt;&lt;interface&gt;&gt;
+        save(Vehicle)
+        findByVehicleNo(String)
+        findAll()
+        delete(Vehicle)
+    }
+    class ReactiveCrudRepository {
+        &lt;&lt;interface&gt;&gt;
+        save(S)
+        findById(ID)
+        deleteById(ID)
+        findAll()
+    }
+    class R2dbcVehicleDao {
+        save(Vehicle)
+        insert(Vehicle)
+        toVehicle(Row)
+    }
+    class Course {
+        Long id
+        String title
+    }
+    class Vehicle {
+        String vehicleNo
+        String color
+    }
+    CourseRepository --|> CrudRepository : empty body, recipe 6.10
+    VehicleDao --|> ReactiveCrudRepository : recipe 6.11_iv only
+    VehicleDao <|.. R2dbcVehicleDao : recipes 6.11_i, 6.11_ii, 6.11_iii
+    CourseRepository ..> Course : element type of the generic
+    R2dbcVehicleDao ..> Vehicle : maps rows by hand
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the flow.</strong> Both solid edges mean "no class was
+      written". At startup <code>@EnableJpaRepositories</code> registers a
+      <code>RepositoryFactoryBean</code> for each interface found in the base package, and
+      <code>@EnableR2dbcRepositories</code> does the same for R2DBC; the bean
+      <code>Main</code> gets from <code>ctx.getBean(CourseRepository.class)</code> is a proxy that
+      dispatches <code>save</code>, <code>findById</code>, <code>deleteById</code> to Spring Data's
+      own store implementation. In 6.10 the transaction advice also wraps those calls, which is why
+      <code>CourseConfiguration</code> keeps <code>@EnableTransactionManagement</code>, a
+      <code>JpaTransactionManager</code> and a <code>LocalContainerEntityManagerFactoryBean</code> —
+      the repository still needs an <code>EntityManagerFactory</code> to sit on. In
+      <code>recipe_6_11_iv</code> <code>Main</code> is unchanged from <code>_i</code>: it still does
+      <code>ctx.getBean(VehicleDao.class)</code> and still calls <code>save</code>,
+      <code>findAll</code>, <code>delete</code>, returning <code>Flux</code>/<code>Mono</code> — the
+      name <code>VehicleDao</code> is re-declared in every 6.11 module, and only in
+      <code>_iv</code> does it extend a Spring Data interface.</p>
+
+      <h3>Derived query methods</h3>
+      <p>6.11_<code>_iv</code> contains the chapter's only derived query declaration. It is a
+      one-row method whose whole specification is its name:</p>
+      <table>
+        <thead><tr><th>Declared in source</th><th>Parsed into</th><th>Statement against the table</th></tr></thead>
+        <tbody>
+          <tr><td><code>Mono&lt;Vehicle&gt; findByVehicleNo(String vehicleNo)</code>
+            in <code>recipe_6_11_iv/.../vehicle/VehicleDao.java</code></td>
+            <td><code>find</code> + <code>By</code> + property <code>vehicleNo</code>, compared for
+              equality; the return type <code>Mono</code> says "zero or one"</td>
+            <td><code>SELECT * FROM VEHICLE WHERE VEHICLE_NO = $1</code> — the same text 6.11_<code>_i</code>
+              hard-codes as <code>SELECT_ONE_SQL</code></td></tr>
+          <tr><td><code>findByVehicleNo(String vehicleNo)</code> on
+            <code>VehicleDao</code> in <code>recipe_6_vehicle</code> (imperative, hand-written)</td>
+            <td>not derived — the DAO implements it with <code>SELECT_ONE_SQL</code></td>
+            <td><code>SELECT * FROM VEHICLE WHERE VEHICLE_NO = ?</code></td></tr>
+          <tr><td><code>template.selectOne(query(where("vehicleNo").is(vehicleNo)), Vehicle.class)</code>
+            in <code>recipe_6_11_iii</code></td>
+            <td>criteria built explicitly, so <code>vehicleNo</code> must be a mapped property</td>
+            <td>predicate on <code>VEHICLE_NO</code>, identical result</td></tr>
+          <tr><td><code>CrudRepository&lt;Course, Long&gt;</code> with no methods at all
+            in <code>recipe_6_10</code></td>
+            <td>only the inherited CRUD contract; <code>findById(courseId)</code> resolves to the
+              <code>ID</code> column from <code>@Id</code></td>
+            <td>lookup by <code>COURSE.ID</code></td></tr>
+        </tbody>
+      </table>
+      <p>Property names, not column names, are what the parser sees: the derived method must be
+      spelled <code>findByVehicleNo</code>, matching <code>Vehicle.vehicleNo</code>, and the store
+      mapping turns that into <code>VEHICLE_NO</code>. That is the same relaxed-name rule
+      <code>BeanPropertyRowMapper</code> applied in 6.2_<code>_iii</code>, and the same rule that
+      makes <code>@Id</code> on <code>vehicleNo</code> mandatory in <code>_iii</code>.</p>
+    </section>
+
+    <section id="running">
+      <h2>Building and running</h2>
+      <p>No module in <code>ch06/</code> applies the <code>application</code> plugin, so there is no
+      <code>run</code> task and no <code>Main-Class</code> in any manifest. The practical loop is
+      compile, then launch the <code>Main</code> class from your IDE, or build the uber jar the root
+      <code>build.gradle</code> registers:</p>
+      <pre><code># every module in the chapter, or one of them
+./gradlew :ch06:build
+./gradlew :ch06:recipe_6_3_i:build
+
+# an all-in-one jar per recipe, then launch Main yourself
+./gradlew :ch06:recipe_6_3_i:uberJar
+java -cp ch06/recipe_6_3_i/build/libs/recipe_6_3_i-all.jar \
+     com.apress.spring6recipes.vehicle.Main</code></pre>
+      <p>The toolchain is fixed to JDK 19 with <code>--enable-preview</code> (root
+      <code>build.gradle</code>), so a plain <code>java</code> of the same major version is needed
+      to run the output.</p>
+
+      <h3>Database prerequisites</h3>
+      <p>Every recipe in the chapter connects to a live PostgreSQL on
+      <code>localhost:5432</code> with user <code>postgres</code> and password
+      <code>password</code>. There is no embedded or in-memory database and no
+      <code>application.properties</code> anywhere in <code>ch06/</code> — the URL, user and
+      password are hard-coded in each <code>@Configuration</code>. Two databases are needed:</p>
+      <table>
+        <thead><tr><th>Database</th><th>Used by</th><th>Who creates it</th></tr></thead>
+        <tbody>
+          <tr><td><code>vehicle</code></td><td>6.0–6.5, 6.11</td>
+            <td><span class="path">bin/postgres.sh</span> or
+              <span class="path">bin/docker-compose-vehicle.yml</span> (postgres:14.5-alpine,
+              <code>POSTGRES_DB=vehicle</code>, port 5432). Note
+              <span class="path">bin/docker-compose-all.yml</span> creates a database named
+              <code>vehicles</code> with an <em>s</em> and mounts chapter 9's script — use the
+              vehicle-specific one for this chapter.</td></tr>
+          <tr><td><code>course</code></td><td>6.6–6.10</td>
+            <td>Nothing does. Create it once: <code>CREATE DATABASE course;</code> through
+              <span class="path">bin/psql.sh</span> or any client.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Who creates the tables</h3>
+      <ul>
+        <li><strong>VEHICLE, JDBC recipes (6.0–6.5): not created for you.</strong> The file
+          <span class="path">ch06/recipe_6_vehicle/src/main/resources/sql/vehicle.sql</span> and the
+          copies under <code>recipe_6_1_ii</code>, <code>recipe_6_1_iii</code>,
+          <code>recipe_6_1_iv</code>, <code>recipe_6_1_v</code>, <code>recipe_6_2_i</code>,
+          <code>recipe_6_2_ii</code>, <code>recipe_6_2_vi</code> and <code>recipe_6_4_iv</code> are
+          never referenced by any bean — there is no <code>DataSourceInitializer</code> or
+          <code>ResourceDatabasePopulator</code> in these modules. Run it yourself with
+          <code>psql -U postgres -d vehicle -f vehicle.sql</code> before the first insert.</li>
+        <li><strong>VEHICLE, R2DBC recipes (6.11_*): created automatically.</strong> Each
+          <code>VehicleConfiguration</code> declares a <code>ConnectionFactoryInitializer</code>
+          with a <code>ResourceDatabasePopulator(new ClassPathResource("/sql/vehicle.sql"))</code>,
+          so the schema runs on every container start. Those copies begin with
+          <code>DROP TABLE VEHICLE;</code>, which is why 6.11's <code>Main</code> can insert, print
+          and delete and still be re-runnable.</li>
+        <li><strong>COURSE: generated by Hibernate.</strong> 6.6 and 6.7_<code>_i</code> to
+          <code>_iii</code> and 6.8_* set <code>hbm2ddl.auto=update</code>
+          (<code>AvailableSettings.HBM2DDL_AUTO</code> or the <code>hibernate.hbm2ddl.auto</code>
+          property); 6.7_<code>_iv</code>/<code>_v</code>, 6.9_* and 6.10 use
+          <code>HibernateJpaVendorAdapter.setGenerateDdl(true)</code> instead. Either way the
+          <code>course</code> <em>database</em> must exist first — DDL generation does not create
+          it.</li>
+      </ul>
+
+      <h3>Reproducing the interesting behaviour</h3>
+      <ul>
+        <li>Recipe 6.5: run <code>Main</code> twice. The first insert of
+          <code>EX0001</code> succeeds silently; the second is what produces the
+          <code>DataAccessException</code>. Only on the second run does 6.5_<code>_iii</code> print
+          <code>MyDuplicateKeyException</code>.</li>
+        <li>Recipes 6.0–6.4 are insert-only against the same table and will violate the
+          <code>VEHICLE_NO</code> primary key on a second run for the same reason. Each variant uses
+          a different literal (<code>TEM0001</code>, <code>TEM0012</code>,
+          <code>TEM0021</code>, <code>TEM0031</code>, <code>TEM0041</code>,
+          <code>TEM0442</code>), and 6.11 drops and recreates the table, so they mostly avoid
+          colliding with one another.</li>
+        <li>Set <code>hibernate.show_sql</code> / <code>setShowSql(true)</code> output on the console
+          to watch the identity insert assign <code>COURSE.ID</code> — every
+          <code>Main</code> in 6.6 to 6.10 prints the object before and after
+          <code>store</code> precisely to show that.</li>
+      </ul>
+
+      <div class="callout info"><h4>Three variants that do not work exactly as committed</h4>
+      <ul>
+        <li><code>recipe_6_0_iii</code>: <code>Main</code> loads
+          <code>ClassPathXmlApplicationContext("vehicle-context.xml")</code>, but the module contains
+          no XML resource. Use its sibling <code>VehicleConfiguration</code> instead.</li>
+        <li><code>recipe_6_9_i</code> and <code>recipe_6_9_ii</code>:
+          <code>setPackagesToScan("com.apress.springrecipes.course")</code> names a package that
+          does not exist in the repo.</li>
+        <li><code>recipe_6_11_iv</code>: unlike <code>recipe_6_11_iii</code>, its
+          <code>Vehicle</code> carries no <code>@Id</code>, while
+          <code>ReactiveCrudRepository&lt;Vehicle, String&gt;</code> requires an id property. It also
+          imports <code>@Query</code> and <code>Flux</code> without using either.</li>
+        <li><code>recipe_6_2_v</code>: the top-level <code>VehicleRowMapper</code> is present but
+          unreferenced — the DAO in that module actually uses
+          <code>BeanPropertyRowMapper.newInstance(Vehicle.class)</code>. The class is only exercised
+          as a separate type in 6.2_<code>_ii</code>, where it is a private inner class.</li>
+        <li><code>recipe_6_4_iii</code> contains two DAOs, <code>NamedJdbcVehicleDao</code> and
+          <code>JdbcVehicleDao</code>, both extending
+          <code>NamedParameterJdbcDaoSupport</code>; the configuration wires
+          <code>NamedJdbcVehicleDao</code>.</li>
+      </ul></div>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch06/</code> &mdash; <a href="../index.html">all chapters</a>.
+</footer>
+</body>
+</html>

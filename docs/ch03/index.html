@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chapter 3 — Spring REST — Spring 6 Recipes</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script src="../assets/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true, securityLevel: 'loose', theme: 'base',
+    themeVariables: {
+      primaryColor: '#eef7e8', primaryBorderColor: '#6db33f', primaryTextColor: '#16202b',
+      lineColor: '#46586c', fontFamily: 'Segoe UI, Helvetica, Arial, sans-serif'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, useMaxWidth: true },
+    sequence: { useMaxWidth: true, showNotes: true }
+  });
+</script>
+</head>
+<body>
+<header class="masthead">
+  <div class="breadcrumb"><a href="../index.html">Spring 6 Recipes</a> &rsaquo; Chapter 3</div>
+  <h1>Chapter 3 — Spring REST</h1>
+  <p class="lede">Chapter 3 puts the tennis-club <code>Member</code> on the web and then refines one
+  detail per module: twenty-three web recipes plus a shared model, all built on the same in-memory
+  <code>MemberService</code>. The first half is a migration from view beans to message converters —
+  content negotiation, <code>produces</code>, <code>@RequestBody</code>, <code>@Valid</code> and
+  <code>ProblemDetail</code> error bodies. Recipe 3.4 ships three blocking <code>RestTemplate</code>
+  clients, and 3.6 finishes with chunked, asynchronous responses.</p>
+  <div class="chip-row">
+    <span class="chip">24 modules (23 recipes + recipe_3_shared)</span>
+    <span class="chip">spring-webmvc 6.0.3</span>
+    <span class="chip">@RestController / ResponseEntity / RestTemplate</span>
+    <span class="chip">Jackson 2.14.1, Gson 2.10, Rome 1.18.0, JAXB</span>
+    <span class="chip">no database: InMemoryMemberService</span>
+    <span class="chip">./gradlew :ch03:recipe_3_3_i:build</span>
+    <span class="chip">serving needs Docker or Tomcat 10 (court.war)</span>
+    <span class="chip">Java 19, --enable-preview</span>
+  </div>
+  <nav class="pager">
+    <a href="../ch02/index.html">&larr; Chapter 2 — Spring MVC</a>
+    <a href="../ch04/index.html">Chapter 4 — Spring Webflux &rarr;</a>
+  </nav>
+</header>
+<div class="shell">
+  <aside class="toc">
+    <h2>On this page</h2>
+    <ol>
+      <li><a href="#overview">Chapter map and module index</a></li>
+      <li><a href="#expose">3.1 — Putting a resource on the web</a></li>
+      <li><a href="#represent">3.2 — Choosing the representation</a></li>
+      <li><a href="#create">3.3 — Accepting a request body</a></li>
+      <li><a href="#errors">3.3.3–3.3.4 — Failures as responses</a></li>
+      <li><a href="#client">3.4 — Calling the API from Java</a></li>
+      <li><a href="#feeds">3.5 — One model, three documents</a></li>
+      <li><a href="#stream">3.6 — Streaming the response</a></li>
+      <li><a href="#running">Building and running</a></li>
+    </ol>
+  </aside>
+  <article>
+
+    <section id="overview">
+      <span class="kicker">Mental model</span>
+      <h2>Chapter map and module index</h2>
+      <p>Every web module in this chapter is the same application. <code>recipe_3_shared</code>
+      supplies the whole model layer — <code>Member</code>, <code>Members</code>,
+      <code>MemberService</code> and the <code>@Service</code>-annotated
+      <code>InMemoryMemberService</code> (three seeded members, an <code>AtomicLong</code> key
+      generator, no persistence) — and each <code>recipe_N_M_x</code> module adds only a
+      <code>RestMemberController</code> and a <code>CourtRestConfiguration</code>. Read it as a diff:
+      put two variants side by side and find the single annotation, bean or return type that
+      differs.</p>
+      <p>Two mechanisms compete through the first half of the chapter. A handler that returns a
+      <code>String</code> view name lets a <em>View</em> write the response (3.1.i, 3.2.i, 3.2.ii and
+      all of 3.5). A handler whose return value <em>is</em> the resource — through
+      <code>@ResponseBody</code>, <code>@RestController</code> or <code>ResponseEntity</code> — lets
+      an <code>HttpMessageConverter</code> write the response, and no view is resolved at all. The
+      run from 3.1.i to 3.1.iii is exactly that migration.</p>
+
+      <h3>Module Map</h3>
+      <table>
+        <thead>
+          <tr><th>Recipe</th><th>Modules</th><th>What it demonstrates</th><th>Key classes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="num">3.0</td>
+            <td><code>recipe_3_shared</code></td>
+            <td>Domain and service code shared by every web module; JAXB and Validation annotations
+            live on the domain so later recipes can use them without touching this module.</td>
+            <td><code>Member</code>, <code>Members</code>, <code>MemberService</code>,
+            <code>InMemoryMemberService</code></td>
+          </tr>
+          <tr>
+            <td class="num">3.1</td>
+            <td><code>recipe_3_1_i</code> … <code>recipe_3_1_vi</code></td>
+            <td>Exposing <code>GET /members</code>. i: <code>@Controller</code> returning the view
+            name <code>membertemplate</code>, rendered as XML by a <code>MarshallingView</code>.
+            ii: the same method with <code>@ResponseBody</code>. iii: <code>@RestController</code>.
+            iv: adds <code>GET /members/{memberid}</code> returning the bare <code>Member</code> or
+            <code>null</code>. v: <code>ResponseEntity</code> with an explicit 404 branch. vi:
+            <code>ResponseEntity.of(Optional)</code>.</td>
+            <td><code>RestMemberController</code>, <code>CourtRestConfiguration</code>,
+            <code>CourtRestApplicationInitializer</code></td>
+          </tr>
+          <tr>
+            <td class="num">3.2</td>
+            <td><code>recipe_3_2_i</code> … <code>recipe_3_2_v</code></td>
+            <td>JSON and XML side by side. i: <code>MappingJackson2JsonView</code> as a view bean.
+            ii: two handler methods for one URL separated only by <code>produces</code>. iii: no
+            views at all, and the missing-resource case written as <code>orElse(null)</code>. iv:
+            <code>notFound().build()</code>. v: <code>ResponseEntity.of</code>. iv and v are the only
+            modules with Gson on the classpath.</td>
+            <td><code>RestMemberController</code>, <code>CourtRestConfiguration</code></td>
+          </tr>
+          <tr>
+            <td class="num">3.3</td>
+            <td><code>recipe_3_3_i</code> … <code>recipe_3_3_iv</code></td>
+            <td>Writing resources. i: class-level <code>@RequestMapping("/members")</code> plus
+            <code>POST</code> with <code>@RequestBody</code>. ii: adds <code>@Valid</code>. iii: a
+            local <code>@ExceptionHandler</code> returning a field-to-message map with 400. iv: error
+            handling moves to a <code>@ControllerAdvice</code> extending
+            <code>ResponseEntityExceptionHandler</code>, which enriches the
+            <code>ProblemDetail</code> in place.</td>
+            <td><code>RestMemberController</code>, <code>CourtExceptionHandlers</code></td>
+          </tr>
+          <tr>
+            <td class="num">3.4</td>
+            <td><code>recipe_3_4_i</code> … <code>recipe_3_4_iii</code></td>
+            <td>Client side; one <code>Main</code> each, no web classes. i:
+            <code>getForObject</code> into <code>String</code>. ii: URI template variable
+            <code>memberId</code> supplied from a <code>Map</code>. iii: the response bound straight
+            onto the shared <code>Members</code> type.</td>
+            <td><code>Main</code>, <code>RestTemplate</code></td>
+          </tr>
+          <tr>
+            <td class="num">3.5</td>
+            <td><code>recipe_3_5_i</code></td>
+            <td>Feed documents produced through the view mechanism: Atom, RSS and a JSON view that
+            shares the same model key.</td>
+            <td><code>FeedController</code>, <code>AtomFeedView</code>,
+            <code>RSSFeedView</code>, <code>TournamentContent</code></td>
+          </tr>
+          <tr>
+            <td class="num">3.6</td>
+            <td><code>recipe_3_6_i</code> … <code>recipe_3_6_iv</code></td>
+            <td>Asynchronous, chunked responses driven from a <code>TaskExecutor</code>. i:
+            <code>ResponseBodyEmitter</code>. ii: the emitter returned inside a
+            <code>ResponseEntity</code> with status <code>I_AM_A_TEAPOT</code> and a
+            <code>Custom-Header</code>. iii: swapped to <code>SseEmitter</code>. iv: SSE events built
+            with an id and a data part.</td>
+            <td><code>RestMemberController</code>, <code>AsyncConfiguration</code>,
+            <code>CourtExceptionHandlers</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Variant progression across the recipe families</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    subgraph FAM31["Recipe 3.1 - put the list on the web"]
+        A1["3_1_i: Controller returns view name membertemplate"] --> A2["3_1_ii: ResponseBody on the same method"]
+        A2 --> A3["3_1_iii: RestController on the class"]
+        A3 --> A4["3_1_iv: adds GET by memberid path variable"]
+        A4 --> A5["3_1_v: ResponseEntity with a notFound branch"]
+        A5 --> A6["3_1_vi: ResponseEntity.of on the Optional"]
+    end
+    subgraph FAM32["Recipe 3.2 - representations"]
+        B1["3_2_i: MappingJackson2JsonView bean"] --> B2["3_2_ii: two mappings split on produces"]
+        B2 --> B3["3_2_iii: ResponseBody only, orElse null"]
+        B3 --> B4["3_2_iv: notFound().build(), Gson on classpath"]
+        B4 --> B5["3_2_v: ResponseEntity.of, Gson on classpath"]
+    end
+    subgraph FAM33["Recipe 3.3 - write a resource"]
+        C1["3_3_i: PostMapping with RequestBody"] --> C2["3_3_ii: adds Valid"]
+        C2 --> C3["3_3_iii: local ExceptionHandler returns a map"]
+        C3 --> C4["3_3_iv: ControllerAdvice enriches ProblemDetail"]
+    end
+    subgraph FAM36["Recipe 3.6 - asynchronous body"]
+        E1["3_6_i: ResponseBodyEmitter"] --> E2["3_6_ii: emitter inside a ResponseEntity"]
+        E2 --> E3["3_6_iii: SseEmitter"]
+        E3 --> E4["3_6_iv: SSE event with id and data"]
+    end
+    A6 --> B1
+    B5 --> C1
+    C4 --> D1["3_4 RestTemplate clients and 3_5 feeds branch off here"]
+    C4 --> E1
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the progression.</strong> Inside a box, each arrow is a
+      one-line diff. <code>3_1_i</code> hands a view name to <code>DispatcherServlet</code>;
+      <code>3_1_ii</code> changes the return type to <code>Members</code> and adds
+      <code>@ResponseBody</code>, which is why <code>BeanNameViewResolver</code>,
+      <code>MarshallingView</code> and <code>Jaxb2Marshaller</code> all vanish from
+      <code>CourtRestConfiguration</code> from that module onwards. <code>3_1_iv</code> through
+      <code>3_1_vi</code> is purely the missing-resource case: a raw <code>Member</code> return type
+      cannot express 404, <code>ResponseEntity.notFound().build()</code> can, and
+      <code>ResponseEntity.of</code> is the shorthand for mapping an <code>Optional</code> onto
+      exactly those two outcomes. (<code>3_2_iii</code> is the near-miss: its
+      <code>orElse(null)</code> returns a null <em>ResponseEntity</em>, not a null body, so there is
+      no 404 to be found.) The two arrows leaving <code>3_3_iv</code> are deliberate: 3.4 and 3.5
+      stand apart from the chain, while 3.6 keeps the 3.3 controller shape and replaces only its
+      return type.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Class</span>
+          <span class="dtitle">The model every web module compiles against</span></figcaption>
+        <pre class="mermaid">
+classDiagram
+    class Member {
+        String name
+        String phone
+        String email
+        getName() String
+        getPhone() String
+        getEmail() String
+    }
+    class Members {
+        List members
+        getMembers() List
+        setMembers(List)
+        addMembers(Iterable)
+    }
+    class MemberService {
+        findAll()
+        findById(long)
+        save(Member)
+    }
+    class InMemoryMemberService {
+        AtomicLong sequence
+        Map members
+        init()
+        findAll()
+        findById(long)
+        save(Member)
+    }
+    class RestMemberController {
+        MemberService memberService
+        getRestMembers()
+        getMember(long)
+        newMember(Member)
+    }
+    class CourtRestConfiguration {
+        jaxb2Marshaller()
+        viewResolver()
+    }
+    class CourtRestApplicationInitializer {
+        getServletConfigClasses()
+        getServletMappings()
+    }
+    Members o-- Member : collection element
+    InMemoryMemberService ..> MemberService : implements, single Service bean
+    RestMemberController --> MemberService : constructor injection
+    CourtRestConfiguration ..> RestMemberController : component scan finds it
+    CourtRestConfiguration ..> Members : bound by Jaxb2Marshaller
+    CourtRestApplicationInitializer --> CourtRestConfiguration : passed as servlet config class
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the model.</strong> <code>InMemoryMemberService</code> is
+      package-private and reachable only through the interface, so the controller never names it;
+      its <code>@PostConstruct init()</code> is what seeds Marten Deinum, John Doe and Jane Doe at
+      keys 1, 2 and 3. <code>Member</code> carries both validation
+      (<code>@NotBlank</code> on name, <code>@NotBlank</code> and <code>@Email</code> on email) and
+      JAXB (<code>@XmlRootElement</code>); <code>Members</code> adds
+      <code>@XmlAccessorType(FIELD)</code> with <code>@XmlElement(name = "member")</code>, which is
+      what makes the XML element singular while the Java field stays plural — a detail Jackson
+      ignores completely. <code>CourtRestApplicationInitializer</code> extends
+      <code>AbstractAnnotationConfigDispatcherServletInitializer</code>, returns
+      <code>CourtRestConfiguration</code> from <code>getServletConfigClasses()</code> with a
+      <code>null</code> root context, and maps the servlet at <code>"/"</code>. There is no
+      <code>web.xml</code> anywhere under <code>ch03/</code>.</p>
+    </section>
+
+    <section id="expose">
+      <span class="kicker">Recipe 3.1</span>
+      <h2>3.1 — Putting a resource on the web</h2>
+      <p><code>ch03/recipe_3_1_i/src/main/java/com/apress/spring6recipes/court/web/RestMemberController.java</code>
+      is the starting point: a <code>@Controller</code> with one <code>@GetMapping("/members")</code>
+      method that takes a <code>Model</code>, puts a <code>Members</code> object into it under the
+      attribute name <code>members</code>, and returns the <code>String</code>
+      <code>"membertemplate"</code>. The XML comes from <code>CourtRestConfiguration</code>, which
+      declares three beans — a <code>MarshallingView</code> named exactly
+      <code>membertemplate</code>, a <code>Jaxb2Marshaller</code> bound to
+      <code>Member.class</code> and <code>Members.class</code> with
+      <code>JAXB_FORMATTED_OUTPUT</code>, and a <code>BeanNameViewResolver</code>. The view name is a
+      bean-name lookup, not a template path; that is the whole trick, and it is why no JSP or
+      template file exists in the module.</p>
+      <p><code>3_1_ii</code> deletes all three beans: the method returns <code>Members</code> and is
+      annotated <code>@ResponseBody</code>, so the body is written by a converter chosen per request.
+      <code>3_1_iii</code> moves the same semantics onto the type with <code>@RestController</code>.
+      <code>3_1_iv</code> onward add the single-resource endpoint and then the status handling.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">GET /members, both body-writing mechanisms in one pass</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant C as Browser or RestTemplate
+    participant DS as DispatcherServlet
+    participant HM as RequestMappingHandlerMapping
+    participant HC as RestMemberController
+    participant MS as InMemoryMemberService
+    participant VR as BeanNameViewResolver
+    participant MC as HttpMessageConverter
+    C->>DS: GET /court/members
+    DS->>HM: getHandler, GetMapping on members matches
+    HM-->>DS: HandlerMethod for getRestMembers
+    DS->>HC: invoke, Model argument resolved
+    HC->>MS: findAll
+    MS-->>HC: Iterable of Member
+    HC-->>DS: in 3_1_i, the view name membertemplate
+    DS->>VR: resolveViewName, treated as a bean name lookup
+    VR-->>DS: MarshallingView wrapping the Jaxb2Marshaller
+    DS->>DS: view marshals the members model attribute to XML
+    DS-->>C: 200 OK, application xml
+    Note over HC,MC: from 3_1_ii the method returns Members instead of a name
+    HC-->>DS: ResponseBody marked return value, no view name produced
+    DS->>MC: AbstractMessageConverterMethodProcessor writes the body
+    MC-->>C: 200 OK, application json, view resolution skipped entirely
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the exchange.</strong> The first six hops are identical in
+      all six variants: <code>DispatcherServlet</code> asks the
+      <code>RequestMappingHandlerMapping</code> installed by <code>@EnableWebMvc</code> for a
+      handler, and <code>Model</code> is filled in by a <code>HandlerMethodArgumentResolver</code>
+      before the method runs. The split is at the return value. A <code>String</code> is a view name,
+      so <code>DispatcherServlet</code> walks its <code>ViewResolver</code> beans —
+      <code>BeanNameViewResolver</code> participates because
+      <code>CourtRestConfiguration</code> declares one — and hands the whole model to
+      <code>MarshallingView</code>, which calls <code>Jaxb2Marshaller.marshal</code> on the
+      <code>members</code> attribute. A <code>@ResponseBody</code> return value never reaches view
+      resolution: <code>RequestResponseBodyMethodProcessor</code> writes it through a converter
+      instead. Keep the consequence in mind for 3.2: the view mechanism serialises the <em>model
+      map</em>, the converter mechanism serialises the <em>return value</em>.</p>
+      <div class="callout danger">
+        <h4>Two shipped defects to know before you run these</h4>
+        <p><code>recipe_3_1_v</code> and <code>recipe_3_1_vi</code> declare
+        <code>@ComponentScan(basePackages = "com.apress.springrecipes.court")</code> —
+        <code>springrecipes</code>, not <code>spring6recipes</code>. No such package exists in the
+        chapter, so no controller is registered and <code>/members</code> answers 404. Every other
+        module scans <code>com.apress.spring6recipes.court</code>.</p>
+        <p>Separately, <code>recipe_3_1_v</code>, <code>recipe_3_1_vi</code> and
+        <code>recipe_3_2_i</code> each carry a second initializer in
+        <code>com.apress.spring6recipes.reactive.court.web</code> whose import of
+        <code>reactive.court.web.config.CourtRestConfiguration</code> has no matching source file in
+        that module (only 3_2_iv and 3_2_v contain it). These are leftovers copied from the reactive
+        chapter; the <code>court.web</code> initializer is the live one.</p>
+      </div>
+    </section>
+
+    <section id="represent">
+      <span class="kicker">Recipe 3.2</span>
+      <h2>3.2 — Choosing the representation</h2>
+      <p>Recipe 3.2 asks "how do I offer JSON <em>and</em> XML from one endpoint?" and answers it
+      three different ways.</p>
+      <ul>
+        <li><strong>3.2.i — views.</strong> <code>jsonmembertemplate</code> is a
+        <code>MappingJackson2JsonView</code> bean with <code>setPrettyPrint(true)</code>, and the
+        handler returns that name.</li>
+        <li><strong>3.2.ii — <code>produces</code> plus views.</strong> Two view beans
+        (<code>xmlmembertemplate</code> as a <code>MarshallingView</code>,
+        <code>jsonmembertemplate</code> as a <code>MappingJackson2JsonView</code>) and two handler
+        methods for the same path, separated only by
+        <code>@GetMapping(value = "/members", produces = MediaType.APPLICATION_XML_VALUE)</code>
+        versus <code>APPLICATION_JSON_VALUE</code>. Both delegate to one
+        <code>prepareModel(Model)</code> helper, so the only difference is the returned name.</li>
+        <li><strong>3.2.iii to 3.2.v — converters only.</strong> No view beans at all. One method,
+        one return type, and the media type is settled by the converter list against the
+        <code>Accept</code> header. Because <code>Members</code> is
+        <code>@XmlRootElement</code>, <code>Accept: application/xml</code> yields XML with no
+        configuration whatsoever.</li>
+      </ul>
+      <p><strong>Swapping the JSON library.</strong> <code>ch03/build.gradle</code> adds
+      <code>com.google.code.gson:gson</code> to <code>recipe_3_2_iv</code> and
+      <code>recipe_3_2_v</code> and nowhere else — and those modules declare no converter bean at
+      all. Placing Gson on the classpath <em>is</em> the configuration:
+      <code>WebMvcConfigurationSupport.addDefaultHttpMessageConverters</code> probes the classpath
+      and appends <code>GsonHttpMessageConverter</code>. Note the honest consequence: it is appended
+      <em>after</em> <code>MappingJackson2HttpMessageConverter</code>, so unless Jackson is removed
+      from the list the JSON you see still comes from Jackson. That is the real difference between
+      "Gson is available" and "Gson is used".</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">How the body of GET /members is written, per module</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    R["getRestMembers returns"] --> Q{"String view name and no ResponseBody"}
+    Q -->|yes: 3_1_i, 3_2_i, 3_2_ii| VR["DispatcherServlet walks the ViewResolver beans"]
+    Q -->|no: 3_1_ii onward| CNV["AbstractMessageConverterMethodProcessor negotiates a converter"]
+    VR --> BN["BeanNameViewResolver treats the String as a bean name"]
+    BN --> MV["membertemplate, MarshallingView, 3_1_i"]
+    BN --> XJ["xmlmembertemplate, MarshallingView, 3_2_ii"]
+    BN --> JV["jsonmembertemplate, MappingJackson2JsonView, 3_2_i and 3_2_ii"]
+    JV --> NEST["the model map is serialised, so a members key wraps a members key"]
+    CNV --> ACC{"Accept header"}
+    ACC -->|json or wildcard| JAC["MappingJackson2HttpMessageConverter, first json capable converter in the list"]
+    ACC -->|xml| JAXB["Jaxb2RootElementHttpMessageConverter, works because Members is XmlRootElement"]
+    ACC -->|nothing compatible| EX["HttpMediaTypeNotAcceptableException, 406"]
+    CP["classpath probe in addDefaultHttpMessageConverters"] -.adds.-> JAC
+    CP -.adds in 3_2_iv and 3_2_v.-> GSON["GsonHttpMessageConverter, appended after Jackson"]
+    JAC --> DONE["body written, no view resolved"]
+    JAXB --> DONE
+    GSON --> DONE
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the decision.</strong> The upper branch is view-driven and
+      the lower is converter-driven; only one can fire for a given handler. Watch the JSON view
+      first: <code>MappingJackson2JsonView</code> serialises the model map, so
+      <code>model.addAttribute("members", members)</code> in <code>3_2_i</code> produces a JSON
+      object whose <code>members</code> property is the <code>Members</code> bean, which itself has a
+      <code>members</code> array — one key too deep. Recipe 3.5 repairs exactly this with
+      <code>setModelKey("feedContent")</code>. On the converter branch,
+      <code>produces</code> in <code>3_2_ii</code> is evaluated by
+      <code>RequestMappingInfoHandlerMapping</code> <em>before</em> the method is chosen — it is a
+      mapping condition, not a rendering hint — which is how two methods can own one path. If the
+      client's <code>Accept</code> matches neither, no candidate handler survives and you get 406
+      rather than a fallback representation.</p>
+      <table>
+        <thead><tr><th>Accept</th><th>3_2_ii (produces + view beans)</th><th>3_2_iii / iv / v (converters)</th></tr></thead>
+        <tbody>
+          <tr><td><code>application/json</code></td><td>200, <code>jsonmembertemplate</code> view — model-map JSON</td><td>200, Jackson (Gson is also a candidate in iv and v)</td></tr>
+          <tr><td><code>application/xml</code></td><td>200, <code>xmlmembertemplate</code> view</td><td>200, JAXB marshalling of <code>Members</code></td></tr>
+          <tr><td>absent or <code>*/*</code></td><td>the mapping that matches first wins</td><td>200 JSON — Jackson is registered ahead of the JAXB converter</td></tr>
+          <tr><td><code>text/html</code></td><td>406, no mapping declares it in <code>produces</code></td><td>406, no converter can write <code>Members</code> as HTML</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="create">
+      <span class="kicker">Recipe 3.3 i–ii</span>
+      <h2>3.3 — Accepting a request body</h2>
+      <p>From <code>recipe_3_3_i</code> the controller gains class-level
+      <code>@RequestMapping("/members")</code>, so method annotations carry relative paths:
+      <code>@GetMapping</code> with no value maps <code>GET /members</code>, and
+      <code>@GetMapping("/{memberid}")</code> maps the single resource. Writing arrives as
+      <code>newMember(@RequestBody Member newMember)</code> returning
+      <code>ResponseEntity.ok(memberService.save(newMember))</code>; <code>3_3_ii</code> changes that
+      signature by one token, <code>@Valid @RequestBody</code>.</p>
+
+      <h3>Resource and verb matrix</h3>
+      <table>
+        <thead><tr><th>Path</th><th>Verb</th><th>Handler method</th><th>Modules</th><th>Success</th><th>Missing or invalid</th></tr></thead>
+        <tbody>
+          <tr><td><code>/members</code></td><td>GET</td><td><code>getRestMembers</code></td>
+            <td>all of 3.1, 3.2, 3.3 and 3.6</td><td>200 + <code>Members</code></td><td>—</td></tr>
+          <tr><td><code>/members/{memberid}</code></td><td>GET</td><td><code>getMember</code></td>
+            <td>3.1 iv–vi, 3.2 iii–v, 3.3 i–iv, 3.6 i–iv</td><td>200 + <code>Member</code></td>
+            <td>3.1 iv and 3.2 iii give a null body; 3.1 v, 3.1 vi, 3.2 iv, 3.2 v and all of 3.3/3.6 give 404</td></tr>
+          <tr><td><code>/members</code></td><td>POST</td><td><code>newMember</code></td>
+            <td>3.3 i–iv, 3.6 i–iv</td><td>200 + saved <code>Member</code></td>
+            <td>3.3 i unvalidated, blank names accepted; 3.3 ii 400 with the standard error body;
+            3.3 iii 400 with a field-to-message map; 3.3 iv and 3.6 400 <code>ProblemDetail</code>
+            carrying an <code>errors</code> property</td></tr>
+          <tr><td><code>/atomfeed</code>, <code>/rssfeed</code>, <code>/jsontournament</code></td>
+            <td>GET</td><td><code>getAtomFeed</code>, <code>getRSSFeed</code>, <code>getJSON</code></td>
+            <td>3.5 i</td><td>200 + feed document</td><td>—</td></tr>
+        </tbody>
+      </table>
+      <p class="note">There is no <code>@PutMapping</code>, <code>@DeleteMapping</code> or
+      <code>@PatchMapping</code> anywhere in <code>ch03/</code>, and no <code>Location</code> header
+      is ever set: <code>InMemoryMemberService.save</code> calls
+      <code>sequence.getAndIncrement()</code> unconditionally, so POST is create-only and answers
+      200, not 201.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">The full client-to-store-and-back round trip for POST /members</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant C as RestTemplate client
+    participant T as Tomcat, court.war
+    participant DS as DispatcherServlet
+    participant HM as RequestMappingHandlerMapping
+    participant RP as RequestResponseBodyMethodProcessor
+    participant VB as Validator, hibernate validator
+    participant HC as RestMemberController
+    participant MS as InMemoryMemberService
+    C->>T: POST /court/members, Content-Type application json, Member body
+    T->>DS: service, the servlet is mapped at the root path
+    DS->>HM: getHandler, class level members path plus PostMapping
+    HM-->>DS: HandlerMethod newMember
+    DS->>RP: resolveArgument for the RequestBody parameter
+    RP->>RP: MappingJackson2HttpMessageConverter.read builds a Member
+    RP->>VB: Valid on the parameter triggers validation on the WebDataBinder
+    VB-->>RP: no ConstraintViolation for a well formed member
+    RP->>HC: invoke newMember with the converted Member
+    HC->>MS: save with the member
+    MS-->>HC: Member, sequence advanced to 4
+    HC-->>DS: ResponseEntity.ok wrapping the saved Member
+    DS->>RP: write the body through the json converter
+    DS-->>C: 200 OK, Member json
+        </pre>
+      </figure>
+      <p class="reading"><strong>Walking the hops.</strong> The client sends the body and its
+      <code>Content-Type</code>; <code>RequestMappingHandlerMapping</code> matches the class-level
+      <code>@RequestMapping("/members")</code> concatenated with the empty <code>@PostMapping</code>
+      path. <code>RequestResponseBodyMethodProcessor</code> — a
+      <code>HandlerMethodArgumentResolver</code> registered by <code>@EnableWebMvc</code> — asks the
+      converters to read the stream; a media type no converter supports fails here with 415, before
+      any user code runs. <code>@Valid</code> is honoured in the same resolver (from
+      <code>3_3_ii</code>), not in the controller body, because <code>@EnableWebMvc</code> wires an
+      <code>OptionalValidatorFactoryBean</code> when a Jakarta Validation provider is present — here
+      <code>hibernate-validator</code>, declared <code>runtimeOnly</code> in
+      <code>ch03/build.gradle</code>. On the happy path <code>save</code> stores the instance under
+      the next <code>AtomicLong</code> value and returns <em>the same object</em>; since
+      <code>Member</code> has no id field, the assigned key is invisible to the client — the reason
+      this chapter never demonstrates reading back what you just posted by URI.</p>
+    </section>
+
+    <section id="errors">
+      <span class="kicker">Recipe 3.3 iii–iv</span>
+      <h2>3.3.3 and 3.3.4 — Turning failures into responses</h2>
+      <p><code>recipe_3_3_iii</code> keeps error handling inside the controller:</p>
+      <pre><code>@ExceptionHandler
+@ResponseStatus(HttpStatus.BAD_REQUEST)
+public Map&lt;String, String&gt; handle(MethodArgumentNotValidException ex) {
+    return ex.getFieldErrors().stream()
+        .collect(Collectors.toMap(FieldError::getField, FieldError::getDefaultMessage));
+}</code></pre>
+      <p>The return type is a <code>Map</code> from a <code>@RestController</code>, so Jackson writes
+      it as a flat JSON object — <code>{"name":"must not be blank","email":"must be a well formatted
+      email address"}</code>. It is <em>not</em> a <code>ProblemDetail</code>: no
+      <code>type</code>, <code>title</code> or <code>status</code> member, and the keys come from
+      <code>FieldError.getField()</code>.</p>
+      <p><code>recipe_3_3_iv</code> removes that method and adds <code>CourtExceptionHandlers</code>,
+      a <code>@ControllerAdvice</code> extending <code>ResponseEntityExceptionHandler</code>. It
+      overrides <code>handleMethodArgumentNotValid(ex, headers, status, request)</code>, builds a map
+      keyed by <code>FieldError.getCode()</code> (falling back to
+      <code>ObjectError.getObjectName()</code> for object-level errors) with messages resolved
+      through <code>getMessageSource()</code> and <code>LocaleContextHolder.getLocale()</code>, then
+      performs the key move:</p>
+      <pre><code>ex.getBody().setProperty("errors", errors);
+return super.handleExceptionInternal(ex, null, headers, status, request);</code></pre>
+      <p>Passing <code>null</code> as the body tells the base class to fall back to the
+      <code>ProblemDetail</code> already attached to the exception — which is the very instance just
+      mutated. So the customisation happens <em>in place</em> on the standard RFC 7807 payload rather
+      than by replacing it. This class is present, unchanged, in <code>recipe_3_6_i</code> through
+      <code>recipe_3_6_iv</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">One invalid POST, two different failure responses</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant DS as DispatcherServlet
+    participant RP as RequestResponseBodyMethodProcessor
+    participant ER as ExceptionHandlerExceptionResolver
+    participant HC as RestMemberController, 3_3_iii
+    participant AD as CourtExceptionHandlers, 3_3_iv
+    C->>DS: POST /court/members, name blank and email malformed
+    DS->>RP: resolveArgument for the Valid RequestBody Member
+    RP-->>DS: throws MethodArgumentNotValidException
+    DS->>ER: doDispatch hands the exception to the resolver chain
+    alt 3_3_iii, handler level ExceptionHandler
+        ER->>HC: finds the ExceptionHandler method on this controller
+        HC->>HC: getFieldErrors mapped from field to defaultMessage
+        HC-->>C: 400 plus a flat json object, ResponseStatus supplies the code
+    else 3_3_iv, ControllerAdvice
+        ER->>AD: handleMethodArgumentNotValid override
+        AD->>AD: getAllErrors keyed by code, messages from MessageSource and locale
+        AD->>AD: ex.getBody().setProperty errors onto the ProblemDetail
+        AD-->>ER: super.handleExceptionInternal with a null body and status 400
+        ER-->>C: 400 problem json, ProblemDetail carrying the added errors member
+    end
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the failure path.</strong> The throw happens in the argument
+      resolver, so <code>newMember</code> is never entered — validation is not an <code>if</code>
+      statement in the controller. <code>DispatcherServlet.processHandlerException</code> then
+      iterates its <code>HandlerExceptionResolver</code> beans, and
+      <code>ExceptionHandlerExceptionResolver</code> looks first for an <code>@ExceptionHandler</code>
+      declared on the handler that threw, then for one on any <code>@ControllerAdvice</code> bean.
+      That lookup order <em>is</em> the difference between 3.3.iii and 3.3.iv: the advice is
+      reusable across every controller in the servlet context, the local method is not. In the advice
+      branch the status is not declared with <code>@ResponseStatus</code> but comes from
+      <code>ResponseEntityExceptionHandler</code> itself (400 for this exception), and the payload is
+      the framework <code>ProblemDetail</code> obtained through
+      <code>MethodArgumentNotValidException.getBody()</code>, extended with one property instead of
+      rebuilt. Note also that <code>getMessageSource()</code> is inherited from the base class and
+      can be <code>null</code> here, which is why the source guards it and falls back to
+      <code>getDefaultMessage()</code>.</p>
+    </section>
+
+    <section id="client">
+      <span class="kicker">Recipe 3.4</span>
+      <h2>3.4 — Calling the API from Java</h2>
+      <p>The three 3.4 modules contain exactly one file each, <code>Main.java</code>, and no server
+      code at all. They are plain-JVM clients pointed at a separately running server, which is why
+      <code>ch03/build.gradle</code> gives <code>recipe_3_4_*</code> a <code>Main-Class</code>
+      manifest entry. All three target <code>http://localhost:8080/court/...</code>:
+      <code>/court</code> is the context path Tomcat derives from the WAR, because every web module
+      in the chapter is built as <code>court.war</code>
+      (<code>war { archiveFileName = 'court.war' }</code>).</p>
+      <table>
+        <thead><tr><th>Module</th><th>Call</th><th>Response type</th><th>What it proves</th></tr></thead>
+        <tbody>
+          <tr><td class="num">3.4 i</td>
+            <td><code>getForObject("http://localhost:8080/court/members", String.class)</code></td>
+            <td><code>String</code></td>
+            <td>Raw body through <code>StringHttpMessageConverter</code>; no binding, so the client
+            needs no domain classes.</td></tr>
+          <tr><td class="num">3.4 ii</td>
+            <td><code>getForObject(uri, String.class, params)</code> over
+            <code>.../members/{memberId}</code> with <code>Map.of("memberId", "1")</code></td>
+            <td><code>String</code></td>
+            <td>URI template expansion; the map key must match the placeholder name, no string
+            concatenation.</td></tr>
+          <tr><td class="num">3.4 iii</td>
+            <td><code>getForObject("http://localhost:8080/court/members", Members.class)</code></td>
+            <td><code>Members</code></td>
+            <td>Binding onto the shared domain type, which only works if the server emitted a
+            converter-written body — the double-nested JSON of the 3.2.i view does not bind.</td></tr>
+        </tbody>
+      </table>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">Which module hosts the API and which consumes it</span></figcaption>
+        <pre class="mermaid">
+flowchart LR
+    subgraph CLIENT["Client JVM, gradle uberJar, no servlet container"]
+        M1["recipe_3_4_i Main"]
+        M2["recipe_3_4_ii Main"]
+        M3["recipe_3_4_iii Main, uses Members from recipe_3_shared"]
+    end
+    subgraph HOST["container s6r-court-rest, named after the module"]
+        TOM["Tomcat 10.1.4 on eclipse temurin 19, EXPOSE 8080 and 5005"]
+        WAR["court.war in webapps, context path /court"]
+        DS["DispatcherServlet, mapped at the root path"]
+        CTRL["RestMemberController, from any of 3_1, 3_2, 3_3, 3_6"]
+        SVC["InMemoryMemberService, HashMap plus AtomicLong"]
+    end
+    subgraph CONF["build time wiring"]
+        INIT["CourtRestApplicationInitializer"]
+        CFG["CourtRestConfiguration, EnableWebMvc plus ComponentScan"]
+    end
+    M1 -->|"GET court/members"| TOM
+    M2 -->|"GET court/members/1"| TOM
+    M3 -->|"GET court/members"| TOM
+    TOM --> WAR --> DS --> CTRL --> SVC
+    INIT -.registers.-> DS
+    CFG -.supplied to.-> INIT
+    CFG -.scan finds.-> CTRL
+    DOCK["ch03/Dockerfile, shared by every module"] -.built from the war.-> TOM
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the topology.</strong> The edge labels make the point that
+      one server satisfies all three clients: they differ only in how the response is bound, not in
+      what they send. <code>CourtRestApplicationInitializer</code> is found by Tomcat's
+      <code>SpringServletContainerInitializer</code> because there is no <code>web.xml</code>, and it
+      registers the <code>DispatcherServlet</code> with <code>CourtRestConfiguration</code> as the
+      servlet context configuration — there is no root context at all
+      (<code>getRootConfigClasses()</code> returns <code>null</code>). Everything right of the arrow
+      is in memory, so restarting the container resets the members to the three seeded rows; re-run
+      3.4.iii twice without a restart and you will see the list grow, which is the quickest way to
+      observe that <code>save</code> never overwrites. Port 5005 is the JDWP socket enabled by the
+      <code>JAVA_OPTS</code> line in <code>ch03/Dockerfile</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Inside RestTemplate for recipe_3_4_ii and _iii</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant M as Main
+    participant RT as RestTemplate
+    participant UT as RootUriTemplateHandler
+    participant RF as SimpleClientHttpRequestFactory
+    participant SRV as court.war
+    participant CV as converter list
+    M->>RT: getForObject with uri template, Members.class, params map
+    RT->>UT: expandUriTemplate, memberId equal to 1 substituted
+    UT-->>RT: finished URI, /court/members/1
+    RT->>RT: AcceptHeaderRequestCallback derives Accept from the converters that can read Members
+    RT->>RF: createRequest over a plain JDK HttpURLConnection
+    RF->>SRV: GET /court/members/1
+    SRV-->>RT: 200, Content-Type application json, Member body
+    RT->>CV: first converter that canRead Members and the returned media type
+    CV-->>RT: MappingJackson2HttpMessageConverter.read, object bound to Members
+    RT-->>M: the body alone, getForEntity would have kept status and headers
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the client.</strong> <code>getForObject</code> is
+      <code>execute</code> with <code>HttpMethod.GET</code> plus an extractor that discards the
+      envelope; the only difference from <code>getForEntity</code> is that you lose status and
+      headers. Three mechanisms sit on the path, in order: URI template expansion through
+      <code>RootUriTemplateHandler</code> (which is why 3.4.ii can hand over a map instead of building
+      the URL), the request factory (<code>SimpleClientHttpRequestFactory</code> from the no-arg
+      constructor, meaning no pooling and no read timeout — a hung server blocks the client
+      forever), and converter selection, driven by the <em>requested response type</em>. That last
+      one explains the table above: <code>String.class</code> in 3.4.i and ii makes
+      <code>StringHttpMessageConverter</code> the match and the Accept header accordingly, while
+      <code>Members.class</code> in 3.4.iii asks for a JSON-capable converter and then maps onto the
+      JAXB-annotated bean, which Jackson reads as an ordinary bean property. Nothing in this chapter
+      uses <code>WebClient</code>, and <code>RestClient</code> does not exist in Spring 6.0.3 —
+      blocking <code>RestTemplate</code> is the only client here.</p>
+    </section>
+
+    <section id="feeds">
+      <span class="kicker">Recipe 3.5</span>
+      <h2>3.5 — One model, three documents</h2>
+      <p><code>recipe_3_5_i</code> is the chapter's proof that the view mechanism still earns its
+      keep. It drops <code>Member</code> entirely and introduces <code>TournamentContent</code>, a
+      record with an <code>AtomicInteger</code> id counter and a static
+      <code>of(author, date, name, link)</code> factory. <code>FeedController</code> is a plain
+      <code>@Controller</code>, not a REST one, with three <code>@GetMapping</code> methods that build
+      a hard-coded list, store it under the fixed model key <code>feedContent</code>, and return a
+      view bean name. <code>CourtRestConfiguration</code> supplies the three views:
+      <code>atomfeedtemplate</code> is an <code>AtomFeedView</code> extending
+      <code>AbstractAtomFeedView</code>, <code>rssfeedtemplate</code> an <code>RSSFeedView</code>
+      extending <code>AbstractRssFeedView</code> (Rome 1.18.0), and
+      <code>jsontournamenttemplate</code> a <code>MappingJackson2JsonView</code> with
+      <code>setModelKey("feedContent")</code>.</p>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Flowchart</span>
+          <span class="dtitle">FeedController view-name fan-out and what each view emits</span></figcaption>
+        <pre class="mermaid">
+flowchart TD
+    REQ["GET /court/atomfeed, /rssfeed or /jsontournament"] --> FC["FeedController, a plain Controller"]
+    FC --> LIST["TournamentContent.of called four times, ids from an AtomicInteger"]
+    LIST --> KEY["model.addAttribute with key feedContent"]
+    KEY --> NAME["method returns a view name String"]
+    NAME --> RES["BeanNameViewResolver, declared in CourtRestConfiguration"]
+    RES --> A1["atomfeedtemplate, AtomFeedView"]
+    RES --> R1["rssfeedtemplate, RSSFeedView"]
+    RES --> J1["jsontournamenttemplate, MappingJackson2JsonView"]
+    A1 --> AM["buildFeedMetadata sets id tag tennis.org and title Grand Slam Tournaments"]
+    A1 --> AE["buildFeedEntries maps records to Entry, id from date plus record id"]
+    R1 --> RM["buildFeedMetadata sets title, description, link and lastBuildDate"]
+    R1 --> RI["buildFeedItems maps records to Item with author, title, pubDate, link"]
+    J1 --> JO["modelKey feedContent emits the list itself instead of a wrapper object"]
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the fan-out.</strong> Hops one to four are shared; only the
+      returned name differs, and <code>BeanNameViewResolver</code> resolves it by looking up a bean
+      with that exact name, so the correspondence between the <code>String</code> and the
+      <code>@Bean</code> method is the entire configuration. The Rome views invert control:
+      <code>AbstractAtomFeedView</code> and <code>AbstractRssFeedView</code> build and write the
+      document, calling back into the two overridden methods, which read the model map and cast
+      <code>feedContent</code> back to a list of <code>TournamentContent</code>. Both feed views
+      derive their timestamp by sorting the publication dates and taking
+      <code>findFirst()</code> — the <em>earliest</em> date, used as the feed's
+      <code>updated</code> or <code>lastBuildDate</code> — and convert the
+      <code>LocalDate</code> through <code>atStartOfDay(systemDefault)</code> because Rome still
+      speaks <code>java.util.Date</code>. And observe <code>setModelKey("feedContent")</code> on the
+      JSON view: it selects one model attribute to serialise, which is precisely what the 3.2.i view
+      failed to do.</p>
+    </section>
+
+    <section id="stream">
+      <span class="kicker">Recipe 3.6</span>
+      <h2>3.6 — Streaming the response</h2>
+      <p>Recipe 3.6 keeps the 3.3 controller and replaces only the return type of
+      <code>getRestMembers</code>, so the response stays open while another thread produces chunks.
+      All four modules add <code>AsyncConfiguration</code>, a <code>WebMvcConfigurer</code> whose
+      <code>configureAsyncSupport</code> sets the async default timeout to five seconds and installs
+      <code>mvcTaskExecutor()</code>, a <code>ThreadPoolTaskExecutor</code> with thread group name
+      <code>mvcTaskExecutor</code>. Because <code>@Configuration</code> defaults to
+      <code>proxyBeanMethods = true</code>, the call from <code>configureAsyncSupport</code> returns
+      the same singleton the controller constructor injects as <code>TaskExecutor</code> — one pool
+      doing both async dispatch and production.</p>
+      <ul>
+        <li><strong>3_6_i</strong> returns a bare <code>ResponseBodyEmitter</code>; the worker sends
+        one <code>Member</code> every 25 ms then <code>complete()</code>, with
+        <code>completeWithError(ex)</code> if an <code>IOException</code> surfaces.</li>
+        <li><strong>3_6_ii</strong> wraps the same emitter in a <code>ResponseEntity</code> with
+        <code>HttpStatus.I_AM_A_TEAPOT</code> and a <code>Custom-Header</code> — demonstrating that
+        status and headers are committed up front, while the body keeps streaming.</li>
+        <li><strong>3_6_iii</strong> is a one-word change, <code>new SseEmitter()</code>, so each
+        <code>send</code> is framed as a server-sent-events block; the sleep becomes 50 ms.</li>
+        <li><strong>3_6_iv</strong> keeps <code>SseEmitter</code> and sends
+        <code>SseEmitter.event().id(String.valueOf(member.hashCode())).data(member)</code>, adding a
+        per-event id.</li>
+      </ul>
+
+      <figure class="diagram">
+        <figcaption><span class="tag">Sequence</span>
+          <span class="dtitle">Async dispatch: who holds the response while chunks arrive</span></figcaption>
+        <pre class="mermaid">
+sequenceDiagram
+    participant C as Client reading the stream
+    participant DS as DispatcherServlet
+    participant RV as ResponseBodyEmitterReturnValueHandler
+    participant HC as RestMemberController
+    participant TE as ThreadPoolTaskExecutor, mvcTaskExecutor
+    participant MS as InMemoryMemberService
+    C->>DS: GET /court/members
+    DS->>HC: getRestMembers
+    HC->>HC: new ResponseBodyEmitter, or SseEmitter from 3_6_iii
+    HC->>TE: execute a producer lambda capturing the emitter
+    HC-->>RV: emitter returned from the handler
+    RV->>DS: response switches to async mode under the five second timeout
+    RV-->>C: 200 plus the 3_6_ii status and header, body still open, container thread released
+    Note over TE,MS: the handler has already returned, this work is on another thread
+    TE->>MS: findAll
+    MS-->>TE: the three seeded Member rows
+    loop one chunk per member, 25 ms apart in i and ii, 50 ms in iii and iv
+        TE->>DS: emitter.send, the member runs through the message converters
+        DS-->>C: one json object appended to the open body
+    end
+    TE->>DS: emitter.complete
+    DS->>DS: async dispatch ends and the response is closed
+        </pre>
+      </figure>
+      <p class="reading"><strong>Reading the stream.</strong> <code>DispatcherServlet</code> sees a
+      <code>ResponseBodyEmitter</code> return value and routes it to
+      <code>ResponseBodyEmitterReturnValueHandler</code> rather than to a converter, because a single
+      converter call cannot express "many writes over time". The handler binds the emitter to the live
+      response, starts async processing with the <code>AsyncTaskExecutor</code> chosen in
+      <code>configureAsyncSupport</code>, and lets the container thread go; <code>findAll()</code> may
+      still be running when the handler returns. Each <code>send</code> serialises one
+      <code>Member</code> through the same converter list as an ordinary response — which is why the
+      switch from <code>ResponseBodyEmitter</code> to <code>SseEmitter</code> changes the framing,
+      not the conversion. Two arithmetic facts: three seeded members at 25 or 50 ms is under 150 ms,
+      so the five-second timeout never trips as written; and if you POST members first, the stream can
+      exceed it and the exchange ends in an async timeout instead of completing cleanly.
+      <code>CourtExceptionHandlers</code> is present unchanged in all four modules, so validation
+      errors on POST keep producing the 3.3.iv <code>ProblemDetail</code>.</p>
+    </section>
+
+    <section id="running">
+      <span class="kicker">Practice</span>
+      <h2>Building and running</h2>
+      <h3>Build a module</h3>
+      <pre><code>./gradlew :ch03:recipe_3_3_i:build     # compiles and packages court.war
+./gradlew :ch03:build                  # the whole chapter, including recipe_3_shared</code></pre>
+      <p>Gradle 7.6 (wrapper in the repo root) and a Java 19 toolchain. <code>build.gradle</code>
+      adds <code>--enable-preview</code> to <code>JavaCompile</code>, <code>Test</code> and
+      <code>JavaExec</code>, so anything you launch by hand needs the same flag.</p>
+      <h3>Serve the WARs — the path the build ships</h3>
+      <pre><code>./gradlew :ch03:recipe_3_3_i:docker       # image s6r/court-rest:recipe_3_3_i
+./gradlew :ch03:recipe_3_3_i:dockerRun    # container s6r-court-rest-recipe_3_3_i, -p 8080:8080</code></pre>
+      <p><code>defaultTasks 'build', 'docker'</code> means a bare
+      <code>./gradlew :ch03:recipe_3_3_i</code> also builds the image. One
+      <code>ch03/Dockerfile</code> is shared by all modules:
+      <code>eclipse-temurin:19-jdk-alpine</code>, Tomcat 10.1.4 fetched at build time, ROOT and the
+      sample webapps deleted, <code>court.war</code> copied into <code>webapps</code>, and
+      <code>EXPOSE 8080 5005</code> with JDWP switched on. So the API lives at
+      <code>http://localhost:8080/court/members</code> — <code>/court</code> comes from the WAR name,
+      not from a configured context path. Docker must be running: unlike chapter 2,
+      <code>ch03/build.gradle</code> applies <code>war</code>, <code>com.palantir.docker</code> and
+      <code>com.palantir.docker-run</code> but <em>no</em> embedded-server plugin, so the alternative
+      is copying <code>build/libs/court.war</code> into your own Servlet 6 container (Tomcat 10.1 or
+      Jetty 11). There are no <code>application.properties</code>, JSPs, SQL scripts or credentials
+      anywhere in <code>ch03/</code> — the only data store is a <code>HashMap</code>.</p>
+      <h3>Run the 3.4 clients</h3>
+      <pre><code># server first, in another shell
+./gradlew :ch03:recipe_3_3_i:dockerRun
+
+./gradlew :ch03:recipe_3_4_iii:uberJar
+java --enable-preview -jar ch03/recipe_3_4_iii/build/libs/recipe_3_4_iii-all.jar</code></pre>
+      <p><code>recipe_3_4_*</code> sets <code>Main-Class</code> in the plain <code>jar</code>
+      manifest, but that jar carries no dependencies; the root build's <code>uberJar</code> task
+      (classifier <code>all</code>) is the one that actually runs. <code>recipe_3_4_iii</code> needs
+      <code>recipe_3_shared</code> on the classpath for <code>Members</code>, which the build already
+      wires.</p>
+      <h3>Requests worth trying</h3>
+      <pre><code>curl -i -H "Accept: application/xml" http://localhost:8080/court/members   # 3_2_ii vs 3_2_iv
+curl -i -H "Accept: text/html"       http://localhost:8080/court/members   # 406
+curl -i          http://localhost:8080/court/members/99                    # 404, except 3_1_iv and 3_2_iii
+curl -i -X POST -H "Content-Type: application/json" \
+     -d '{"name":"","email":"nope"}' http://localhost:8080/court/members   # 400, diff 3_3_iii against 3_3_iv
+curl -N          http://localhost:8080/court/members                       # 3_6_*: chunked, watch the frames</code></pre>
+      <div class="callout">
+        <h4>Prerequisites and gotchas found in the source</h4>
+        <ul>
+          <li>Docker is the only external dependency of the chapter (for serving); nothing needs a
+          database or broker.</li>
+          <li><code>recipe_3_1_v</code> and <code>recipe_3_1_vi</code> scan
+          <code>com.apress.springrecipes.court</code>, a package that does not exist here, so
+          <code>/members</code> 404s until corrected to <code>spring6recipes</code>.</li>
+          <li><code>recipe_3_1_v</code>, <code>recipe_3_1_vi</code> and <code>recipe_3_2_i</code>
+          each contain an extra initializer in
+          <code>com.apress.spring6recipes.reactive.court.web</code> importing a configuration class
+          absent from that module; even in 3_2_iv and 3_2_v, where it exists, it registers a second
+          <code>DispatcherServlet</code> also mapped at <code>"/"</code>.</li>
+          <li>Only 3_2_iv and 3_2_v have Gson on the classpath, so their converter list differs from
+          3_2_iii's although the Java sources look identical.</li>
+          <li>Two <code>AbstractAnnotationConfigDispatcherServletInitializer</code> classes in one
+          WAR would both be picked up by Tomcat's <code>SpringServletContainerInitializer</code>; if
+          a module fails to start, delete or fix the <code>reactive</code> one first.</li>
+        </ul>
+      </div>
+    </section>
+
+  </article>
+</div>
+<footer class="pagefoot">
+  Generated from source in <code>ch03/</code> — 24 Gradle modules, Spring Framework 6.0.3.
+  <a href="../index.html">All chapters</a>
+</footer>
+</body>
+</html>
